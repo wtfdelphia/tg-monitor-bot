@@ -1,0 +1,43 @@
+# 本地开发环境。定义处是 docs/design/eng/02-本地环境与迁移.md §一，本文件是它的可执行形式。
+# 失败处置见同文 §3.2：本地一律 docker compose down -v 从零重建，不写 down 迁移。
+services:
+  postgres:
+    image: postgres:17-alpine          # 实测 = 17.11，满足 CVE-2026-14666 下限
+    environment:
+      POSTGRES_PASSWORD: pw
+      POSTGRES_DB: tgm
+    ports: ["55432:5432"]
+    volumes:
+      - ./scripts/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # 必须用真实查询，不能用 pg_isready —— 见 eng/02 §零 坑 3
+      test: ["CMD-SHELL", "psql -U postgres -d tgm -c 'SELECT 1' || exit 1"]
+      interval: 2s
+      retries: 30
+
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.25.2-p0   # ≥1.25.1（CVE-2025-12819）
+    environment:
+      DB_HOST: postgres
+      DB_NAME: tgm
+      POOL_MODE: transaction              # 硬要求
+      SERVER_RESET_QUERY_ALWAYS: 1        # 硬要求，是安全配置不是调优
+      MAX_PREPARED_STATEMENTS: 200        # ≥1.21 才支持预编译语句
+      # 补 eng/02 §一 缺的两项，实测缺了就 "password authentication failed"：
+      AUTH_TYPE: scram-sha-256            # 镜像默认 md5，但 PG 17 存的是 SCRAM 验证子
+      AUTH_FILE: /etc/pgbouncer/userlist.txt
+    volumes:
+      - ./scripts/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports: ["56432:5432"]
+    depends_on: { postgres: { condition: service_healthy } }
+
+  redis:
+    image: redis:8-alpine
+    ports: ["56379:6379"]
+
+  minio:                                  # 媒体中转目标
+    # 偏离 eng/02 §一：该文写的 minio/minio 在 Docker Hub 已不存在
+    # （pull access denied / repository does not exist），官方现发布于 quay.io
+    image: quay.io/minio/minio
+    command: server /data
+    ports: ["59000:9000"]

@@ -1,0 +1,11 @@
+; PgBouncer 认证文件。auth_type = scram-sha-256 时这里放明文口令：
+; 明文既能验证客户端、又能用来登录 PG。
+; 走 auth_query 反查 pg_shadow 只能拿到 SCRAM 验证子，PgBouncer 用它验得了客户端、
+; 却登录不了服务端 —— 这就是本地必须显式列出四个角色的原因。
+;
+; 这里的口令与 docs/design/eng/02-本地环境与迁移.md §二 的本地开发口令一致，
+; 不是新增凭据。生产不用本文件（见同文 §一：首发形态由部署方注入）。
+"postgres" "pw"
+"app_user" "apw"
+"auth_lookup" "lpw"
+"platform_ops" "ppw"
