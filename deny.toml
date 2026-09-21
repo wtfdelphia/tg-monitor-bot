@@ -1,0 +1,63 @@
+# cargo deny 配置。eng/00 §二 钉死了依赖版本，所以下面的 licenses 白名单是从
+# 真实依赖图反推的（194 个包，`cargo metadata` 全枚举），不是抄通用模板 ——
+# 模板里的宽松清单等于预先批准了还没进来的协议。
+#
+# 本仓自身是 MIT（见 LICENSE）。首发形态是自运营的服务，不分发二进制
+# （ops/00），所以 copyleft 的实际风险低于常规。但白名单仍按「分发」写，
+# 因为「不分发」是当前的部署选择，不是一条能长期依赖的前提。
+
+[graph]
+all-features = true
+
+[licenses]
+# 缺失许可证一律报错，不给「未知视为通过」的口子。
+unused-allowed-license = "warn"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",  # wasi
+    "Unicode-3.0",                     # unicode-ident 等 18 个包，宽松许可
+    "Unlicense",                       # aho-corasick / memchr / byteorder 的双许可之一
+    "Zlib",                            # foldhash（唯一单一 Zlib 的包）、tinyvec
+    "BSL-1.0",                         # whoami 三选一之一
+]
+
+# 刻意不列入的项，写清楚免得下次有人「顺手加上」：
+#   LGPL-2.1-or-later   r-efi 的三选一之一。MIT 已能满足，取 LGPL 那支等于
+#                       无理由引入动态链接义务。deny 是为了让它哪天变成唯一
+#                       选项时会报错，而不是静默继续。
+#   GPL-*/AGPL-*        服务端 copyleft，与闭源自运营冲突，一旦出现必须人来决定
+#   SSPL/BUSL/Elastic   非 OSI，MinIO 生态里常见（MinIO 自身是 AGPL），
+#                       但我们只用它的 S3 协议端，不链它的代码
+
+[bans]
+multiple-versions = "warn"
+# 为什么是 warn 不是 deny：194 个包里传递依赖重复版本是常态，
+# 一律 deny 会让卡口变成噪音源。真正要防的那一个单独钉在下面。
+deny = []
+
+# eng/00 §2.3 的版本错配靠这里变成机器可判的：opentelemetry 若同时链入
+# 0.32 与 0.33，类型不互通、span 父子关系丢失、而且编译能过。
+# 依赖引入后把下面两行取消注释（现在写上会报 unmatched skip 噪音）。
+# [[bans.skip]] 不适用 —— 要的是「只允许一份」，不是「忽略重复」。
+#   [[bans.deny]]
+#   name = "opentelemetry"
+#   wrappers = []
+
+[advisories]
+# unmaintained 在 cargo-deny 0.20 不是 lint 级别，而是取值范围
+# ["all","workspace","transitive","none"] —— 它选的是「查哪一圈依赖」，
+# 不是「查到了怎么办」。取 workspace：只判我们直接声明的依赖。
+# 理由是 eng/00 §2.1 已逐个核过直接选型（grammers 在 Codeberg、fred 已弃用），
+# 而 transitive 那一圈我们改不动，标记了也只能 ignore，等于噪音。
+# 漏洞（vulnerability）不在此项管辖内，默认 deny，没有放宽。
+unmaintained = "workspace"
+yanked = "deny"
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# grammers 走 crates.io（0.10 已发布），不需要 git 源 —— 它托管在 Codeberg
+# 这件事影响的是求助与镜像路径，不影响依赖声明（eng/00 §2.1）。
+allow-git = []

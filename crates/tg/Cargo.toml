@@ -1,0 +1,12 @@
+[package]
+name = "tgm-tg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tgm-core = { workspace = true }
+thiserror = { workspace = true }

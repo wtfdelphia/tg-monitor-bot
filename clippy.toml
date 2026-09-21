@@ -1,0 +1,11 @@
+# clippy.toml 只能配 lint 的阈值参数，不能在这里开关 lint ——
+# 开关走 workspace root 的 [workspace.lints.clippy]（见 Cargo.toml）。
+# 这个分工不明显，写在这里免得下次找错地方。
+
+# 默认 7。本项目的函数参数天然多一个 TenantId（eng/00 §4.1 要求它是每个 Repo
+# 方法的第一个参数），若按默认值，Repo 层会被 too_many_arguments 普遍命中，
+# 而那是纪律要求的形状，不是坏味道。放宽一位，不是放宽到无。
+too-many-arguments-threshold = 8
+
+# 默认 250。disallowed-names 默认含 foo/bar/baz，保留。
+# 不配 msrv：rust-toolchain.toml 已钉死 1.98.1，两处写版本会漂。

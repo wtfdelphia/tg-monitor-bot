@@ -1,0 +1,22 @@
+[package]
+name = "tgm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tgm-core = { workspace = true }
+tgm-db = { workspace = true }
+tgm-app = { workspace = true }
+# clap 不在 eng/00 §二 的依赖清单里 —— 那份清单没有任何 CLI 解析库，
+# 而 eng/04 §四 的卡口要求 `tgm audit-rls`、`tgm openapi --check`、
+# `tgm serve --role ...` 这些子命令存在。选 clap 4.6（derive）而非 argh：
+# 需要 subcommand 嵌套 + 长短选项 + --help，argh 在这三项上都要手写补。
+# 这是本步骤唯一一个新增的依赖决定，登记在 docs/pre-do/03-文档待更正.md。
+clap = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

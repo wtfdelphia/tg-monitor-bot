@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/db", "crates/tg", "crates/app", "bins/tgm"]
+
+# 五个 crate 共享的元数据。license 必须写：不写则 cargo deny check licenses 报
+# 五条 error[unlicensed]（实测）—— 它对本仓自己的 crate 与第三方一视同仁。
+# 可以用 [licenses] private.ignore 让它跳过，但仓库本来就是 MIT（见 LICENSE），
+# 补真实值比让卡口对自己睁眼更对。
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# 版本号的唯一落点（eng/00 §6.3）。各 crate 写 `x = { workspace = true }`。
+# 理由是 §2.3 那个 opentelemetry 版本错配：两份不同版本同时链入且编译能过，
+# 这种问题只有在版本声明集中时才能靠读一个文件排除。
+[workspace.dependencies]
+# 核心运行时
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+
+# 错误类型（eng/00 §三：thiserror 给库层，anyhow 只给 bins）
+thiserror = "2.0"
+anyhow = "1.0"
+
+# 存储
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "macros", "migrate", "chrono", "json"] }
+
+# 可观测性（eng/00 §5.1 的 subscriber 形态首发就要落地）
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+# CLI。eng/00 §二 没有钉 CLI 解析库，但 eng/04 的卡口要求 tgm 有子命令 ——
+# 见 bins/tgm/Cargo.toml 同处的注释。
+clap = { version = "4.6", features = ["derive"] }
+
+# 本仓 crate
+tgm-core = { path = "crates/core" }
+tgm-db = { path = "crates/db" }
+tgm-tg = { path = "crates/tg" }
+tgm-app = { path = "crates/app" }
+
+# lint 开关集中在这里，各 crate 写 [lints] workspace = true。
+# 放 workspace 而不是各 crate 的 #![deny]：流水线是 `cargo clippy -- -D warnings`，
+# 而 -D warnings 只管命令行那一层，crate 内的 allow 会静默抵消它。
+[workspace.lints.rust]
+unsafe_code = "forbid"          # 本项目没有需要 unsafe 的地方，forbid 不留 allow 后门
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# 这两条对应 eng/00 §三 纪律 3（sqlx::Error 不得透给客户端）与 §五（脱敏）：
+# 隐式的 panic 与 unwrap 会把内部细节抖到日志或响应里。
+unwrap_used = "deny"
+expect_used = "warn"            # 启动期配置校验里 expect 是合理的，故只 warn
+panic = "warn"
+todo = "deny"                   # 骨架阶段容易留下，而它会在运行时炸
+dbg_macro = "deny"              # dbg! 走 Debug，绕过 Secret<T> 之外的脱敏约定

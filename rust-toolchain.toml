@@ -1,0 +1,7 @@
+# 本机实测 1.98.1（eng/00 §零）。钉住是因为 clippy 的 lint 集合随工具链变动，
+# 而流水线里是 `cargo clippy -- -D warnings` —— 不钉版本等于把卡口的严格程度
+# 交给工具链更新决定，升一次就可能凭空多出一批 error。
+# 用 1.98.1 而非 "stable"：CI 与本机必须是同一份 lint 集合。
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
