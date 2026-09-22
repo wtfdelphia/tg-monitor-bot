@@ -7,3 +7,6 @@
 //!
 //! 迁移文件在仓库根的 `migrations/`，不在本 crate 内 —— `tgm migrate`
 //! 与 `sqlx migrate run --source migrations` 指向同一份。
+
+/// RLS 静态审计。`tgm audit-rls` 的实现体，断言全文见 `audit/queries.sql`。
+pub mod audit;

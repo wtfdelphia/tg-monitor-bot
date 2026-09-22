@@ -11,15 +11,35 @@
 SET ROLE tgm_owner;
 
 -- ── app_user：业务运行时 ─────────────────────────────────────────
--- 甲类 19 张里的 16 张给全量 DML。剩下三张在下面单独处理：
+-- 甲类 19 张里的 15 张给全量 DML。剩下四张在下面单独处理：
+--   identities           UPDATE 收窄到列级，不含 tenant_id（CI 断言 §三-2）
 --   tenant_consents      只 SELECT, INSERT（凭证不可改）
 --   bot_console_sessions / web_sessions   REVOKE ALL（补偿唯一约束侧信道）
 GRANT SELECT, INSERT, UPDATE, DELETE ON
-  tenant_members, identities, credential_keys, source_subscriptions,
+  tenant_members, credential_keys, source_subscriptions,
   target_channels, keywords, rules, rule_versions, rule_replacements,
   tenant_events, notify_dedup, delivery_tasks, audit_logs, login_sessions,
   system_logs, bot_console_updates
   TO app_user;
+
+-- identities 的 UPDATE 收窄到列级，不给 tenant_id。
+-- eng/02 §二 的矩阵这一格写的是「甲类 19 张：SELECT/INSERT/UPDATE/DELETE」，
+-- 按字面照写会让 eng/04 §三-2 的补充断言直接报红 —— 那条断言查的正是
+-- has_column_privilege(..., 'identities', 'tenant_id', 'UPDATE')。
+-- 依据是 spec/06 §2.5「不提供把身份转给别的租户的端点」。
+--
+-- 写法上有个实测过的陷阱：**列级 REVOKE 减不掉表级 GRANT**。
+--   GRANT UPDATE ON identities → has_column_privilege 对每一列都为 t
+--   再 REVOKE UPDATE (tenant_id) ON identities → 仍然是 t（实测）
+-- 所以必须先 REVOKE 表级再逐列 GRANT，顺序反了不报错、权限照旧。
+-- 两条都幂等，本段可重入。
+REVOKE UPDATE ON identities FROM app_user;
+GRANT SELECT, INSERT, DELETE ON identities TO app_user;
+-- 逐列列举而非「除 tenant_id 之外全部」—— PG 没有后者的语法，
+-- 且逐列列举会在将来加列时暴露出来（新列默认不可写），这是想要的方向。
+-- id 是 GENERATED ALWAYS，本就不可写，故不在列表里。
+GRANT UPDATE (kind, tg_user_id, display_name, status, proxy_url, updated_at)
+  ON identities TO app_user;
 
 -- 乙类 2 张。它们没有 tenant_id 列，隔离靠 0010 的 EXISTS 策略
 GRANT SELECT, INSERT, UPDATE, DELETE ON rule_conditions, delivery_logs TO app_user;

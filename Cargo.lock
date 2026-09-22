@@ -1370,6 +1370,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "sqlx",
  "tgm-app",
  "tgm-core",
  "tgm-db",

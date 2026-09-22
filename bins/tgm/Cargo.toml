@@ -11,6 +11,9 @@ workspace = true
 tgm-core = { workspace = true }
 tgm-db = { workspace = true }
 tgm-app = { workspace = true }
+# audit-rls 直接用 PgPool::connect，不经 tgm-db 的连接池封装 ——
+# 那两个池（tenant_tx / admin_tx）还没落地，且审计不该走它们（见 main.rs 的注释）
+sqlx = { workspace = true }
 # clap 不在 eng/00 §二 的依赖清单里 —— 那份清单没有任何 CLI 解析库，
 # 而 eng/04 §四 的卡口要求 `tgm audit-rls`、`tgm openapi --check`、
 # `tgm serve --role ...` 这些子命令存在。选 clap 4.6（derive）而非 argh：
