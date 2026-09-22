@@ -228,10 +228,22 @@ SELECT q::text FROM (
 --   bot_console_updates），且七条 FK 全是单列的；
 --   而 A9 的父表侧要求 tenant_id NOT NULL，identities 的 tenant_id 恰好可空，
 --   于是这七条全部自动落选 —— 「由 A9 独立校验」是空的。
--- 跨租户边确实可建，实测 target_channels.tenant=21 指向 identities.tenant=20。
--- 但那是共享身份池的设计后果（策略 shared_identity_read USING tenant_id IS NULL），
--- 不是漏洞：池里的身份本就跨租户可见。约束靠 spec/06 §2.5 的写入路径唯一，
--- 不靠库层的 FK 形状 —— 这里不该声称有一道自动校验。
+--
+-- 这段注释自己也订正过一次：先前写「那是共享身份池的设计后果，池里的身份
+-- 本就跨租户可见」，也是错的。实测那条边指向的是**他租户的私有身份**，
+-- 不是池里 tenant_id IS NULL 的共享身份 —— 攻击者甚至看不见那一行：
+--   tenant 21 上下文下 SELECT ... WHERE id=900 → 0 行（RLS 挡住）
+--   INSERT target_channels(21, -1, 900)        → INSERT 0 1（边建成了）
+-- 「读不到却能引用」，因为 FK 检查不过 RLS。
+-- 另外两个后果也实测了：
+--   填存在的他租户 id → INSERT 0 1；填不存在的 → FK violation，两者可区分
+--     = 一个跨租户 id 枚举 oracle
+--   建边之后 tenant 20 删自己的身份 900 → ERROR: still referenced
+--     = 攻击者可单方面钉住他租户的数据
+-- 这三条与 A9 在复合 FK 下关掉的后果同形，只是这里没有断言可依。
+-- 缺口只能靠应用层的身份归属校验兜（spec/06 §2.5 第 1 条），不靠库层的 FK 形状
+-- —— 这里不该声称有一道自动校验。R19 也不覆盖这个形状（它测共享身份，
+-- 上面实测的是他租户的私有身份），登记在 pre-do/03 十九。
 SELECT q::text FROM (
   SELECT c.relname FROM pg_attribute a
   JOIN pg_class c ON c.oid = a.attrelid
