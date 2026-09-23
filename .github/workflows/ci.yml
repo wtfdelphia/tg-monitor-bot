@@ -1,0 +1,159 @@
+# eng/04 §四 那份卡口清单的可执行形式。**清单是定义处，本文件是它的落地**，
+# 两边必须同步 —— 少一条就是那条卡口不存在，而流水线照样全绿。
+#
+# 分两个 job 的理由不是提速：不连库的五条与连库的两条失败方向不同。
+# 前者红是代码问题，后者红可能是库没起来 —— 混在一个 job 里，
+# 一次 compose 启动失败会长得像审计断言报红。
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # 工具链由 rust-toolchain.toml 钉死在 1.98.1，这里不再指定版本 ——
+  # 写两遍就会有对不上的那天，而 clippy 的 lint 集合随版本变动（见该文件注释）。
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ── 不连库的五条（eng/04 §四 前五条）────────────────────────────────
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 装工具链（components 来自 rust-toolchain.toml）
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # --offline 是这一步的全部意义：.sqlx/ 已提交（eng/00 §6.1），
+      # 所以编译期 SQL 校验在没有数据库的 job 里也能跑。
+      # 不加它，sqlx 会去连 DATABASE_URL 而这个 job 没有库。
+      - name: 编译期 SQL 校验（离线，用已提交的 .sqlx/）
+        run: cargo build --workspace --all-targets
+        env:
+          SQLX_OFFLINE: "true"
+
+      - name: cargo deny
+        run: |
+          cargo install cargo-deny --locked --version 0.19.1
+          cargo deny check
+
+      # 负向卡口：这条 grep 保证 newtype 约束的静态检查自己没被绕过。
+      # 它内含三条自检探针（坏副本必须被抓到），所以不需要在这里另加反证。
+      - name: 池 newtype 的负向约束
+        run: scripts/check-newtype.sh
+
+  # ── 连库的两条 + 全部测试 ────────────────────────────────────────
+  database:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 装工具链
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      # R7（crates/db/tests/backup.rs）要起 pg_dump，而**版本必须 ≥ 服务端**：
+      # pg_dump 对更高版本的服务端直接拒绝（"server version: 17.x;
+      # pg_dump version: 16.x"）。runner 自带的客户端版本不受我们控制，
+      # 所以显式装 17 而不是指望默认值。
+      #
+      # 不装会怎样：R7 的反证（owner 必须 dump 成功）先红 —— 那是刻意的。
+      # 若只有 R7 正向那条，版本不匹配会让它**因为错误的原因变绿**。
+      # /usr/bin/pg_dump 是 postgresql-client-common 的 pg_wrapper，
+      # 它选已装的最高版本，所以装完不需要改 PATH。
+      - name: 装 postgresql-client 17（R7 需要，且须与服务端同版本）
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          pg_dump --version
+
+      # 复用 compose.yaml —— 与本地开发同一份编排（eng/02 §一）。
+      # 不在这里手写 services: postgres，因为那会变成第二份真相：
+      # 四角色种子在 scripts/init/01-roles.sql 里，PgBouncer 的
+      # SERVER_RESET_QUERY_ALWAYS 是安全配置而非调优（R3/R4 依赖它）。
+      - name: 起 compose（postgres + pgbouncer + redis + minio）
+        run: docker compose up -d --wait
+
+      # 用 `tgm migrate` 而不是 `sqlx migrate run`，尽管下一步的脚本仍要 sqlx-cli。
+      # 理由：生产路径是 `tgm migrate`（ops/00 §2.1 第 1 步），它嵌入的是
+      # 编译期的那份 migrations/。如果这里只跑 CLI，「嵌入的那份能不能跑」
+      # 在 CI 里永远没验过 —— 而两者不一致的方式是存在的（改了文件没重新编译，
+      # 或 include 路径写错却恰好编过）。先跑 tgm migrate 就把这条路径覆盖了。
+      - name: 跑迁移（走生产路径 tgm migrate）
+        run: cargo run --bin tgm -- migrate
+        env:
+          # tgm_owner 是 NOLOGIN（实测 rolcanlogin=f），所以这里用 postgres 连。
+          # 每个 DDL 文件自己 SET ROLE tgm_owner —— 表的 owner 由文件保证，
+          # 不靠连接身份碰巧对（见 migrations/0002 开头的注释）。
+          TGM_DB_URL_OWNER: postgres://postgres:pw@127.0.0.1:55432/tgm
+
+      # sqlx-cli 供下面两步用：migrate-idempotent.sh 内部要 `sqlx migrate run`
+      # 来强制重跑（它先 DELETE 掉版本记录），以及 `cargo sqlx prepare --check`。
+      # 装在这里而不是「跑迁移」那步里，是为了让「那步验的是 tgm migrate」
+      # 这件事在 yml 里看得出来。
+      - name: 装 sqlx-cli
+        run: cargo install sqlx-cli --locked --version 0.9.0 --no-default-features -F postgres
+
+      # eng/04 §四 清单里那条 `cargo sqlx prepare --check --workspace`。
+      # **必须在这个 job 而不是 static job**：无库时它报 error 但 rc=0（实测），
+      # 放进没有库的 job 会让它永远绿 —— 正是 §五 说的那个形状。
+      # 与上面 static job 的 `SQLX_OFFLINE=true cargo build` 不重复：
+      # 那条验「.sqlx/ 够用现有 SQL」，这条给出可操作的报错
+      # （`.sqlx is missing one or more queries`）而不是一句编译错误。
+      # 注意它对**多余**条目只 warning 且 rc=0（实测），所以「.sqlx 有陈旧条目」
+      # 这件事两条都拦不住 —— 目前没有卡口管它。
+      - name: .sqlx/ 与 SQL 一致（清单第 4 条）
+        run: cargo sqlx prepare --workspace --check
+        env:
+          DATABASE_URL: postgres://postgres:pw@127.0.0.1:55432/tgm
+
+      # 迁移可重入（WP-1 出口判据第一条）。第二遍必须是 no-op：
+      # sqlx 按文件记版本，但每个 DDL 文件内部也得幂等 ——
+      # 部分成功的状态是真实存在的（ADR-0021）。
+      - name: 迁移可重入（第二遍必须无新增版本）
+        run: scripts/migrate-idempotent.sh
+        env:
+          DATABASE_URL: postgres://postgres:pw@127.0.0.1:55432/tgm
+
+      # L1+L2+L3。DATABASE_URL 给 sqlx::test 用（它按此建每测试一库），
+      # TGM_DB_URL_OWNER 给审计侧的测试用。
+      - name: 测试
+        run: cargo test --workspace
+        env:
+          DATABASE_URL: postgres://postgres:pw@127.0.0.1:55432/tgm
+          TGM_DB_URL_OWNER: postgres://postgres:pw@127.0.0.1:55432/tgm
+
+      - name: RLS 静态审计
+        run: cargo run --bin tgm -- audit-rls
+        env:
+          TGM_DB_URL_OWNER: postgres://postgres:pw@127.0.0.1:55432/tgm
+
+      # ADR-0022：不是「再跑一遍」。判据是逐条破坏后恰好那一条红，
+      # 且撤销后库状态快照逐字节相同。只会全绿的断言等于没有断言。
+      - name: 审计断言双遍自检
+        run: scripts/audit-double-pass.sh
+        env:
+          TGM_DB_URL_OWNER: postgres://postgres:pw@127.0.0.1:55432/tgm
+
+# ── eng/04 §四 清单里**故意不在本文件**的一条 ──────────────────────
+#
+# tgm openapi --check
+#   契约导出随 WP-5 落地，`openapi.json` 还不存在。该命令现在 exit 1
+#   （main.rs 里那段注释写了为什么不是 exit 0）—— 所以它现在放进 CI
+#   会让每次 PR 都红。列在这里而不是静默省掉：一条漏掉的卡口和一条
+#   不存在的卡口在 yml 里长得一样，而前者是事故。
+#   WP-5 落地时把上面 static job 里加回这一步，并删掉本段注释。
