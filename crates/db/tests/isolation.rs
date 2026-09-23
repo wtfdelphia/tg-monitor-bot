@@ -686,3 +686,112 @@ async fn r18_concurrent_answers_only_one_advances(admin: PgPool) {
         "落库的应答者是后到的那个 —— 说明第二个 UPDATE 实际写进去了"
     );
 }
+
+/// R16 成员被移出后会话**立即**失效。
+///
+/// 定义处 `../spec/07-接口契约.md` §五-3，理由在 §1.5：不用 JWT 就是为了这个。
+///
+/// **这条在 DB 层只覆盖一半，另一半必须由应用层出。** 库里的机制是
+/// `web_sessions` 与 `bot_console_sessions` 上那道
+/// `FOREIGN KEY (tenant_id, user_id) REFERENCES tenant_members ON DELETE CASCADE`
+/// —— `DELETE FROM tenant_members` 会把两张表的会话行一并清掉。
+/// 这里验的是**会话行确实消失**。
+///
+/// 而 §1.5 要的是「每次请求查库」：行消失了，但如果鉴权中间件把会话缓存在
+/// 进程内或 Redis 里且不校验成员关系，会话照样能用。那半条归应用层，
+/// 本测试拦不住 —— 与 R19 同形（§3.2），把它写成「DB 全包」才是假绿。
+///
+/// **两张表的会话行只能用 admin 灌。** `auth_lookup` 在它们上面虽有全量 GRANT，
+/// 但 0010 只给了 `FOR SELECT` 策略，INSERT 找不到可匹配的策略会被 RLS 拒
+/// （那个迁移的注释已预先记下这个后果，并把写入路径的形态留给实现期）。
+/// 所以这里灌用 admin、查用 `auth_lookup` —— 查那一步同时验了
+/// `session_self_lookup` / `console_self_lookup` 两条策略真的让鉴权域读得到。
+/// 用 admin 查会绕过 RLS，那样连「会话对鉴权域可见」都没验到。
+#[sqlx::test(migrations = "../../migrations")]
+async fn r16_member_removal_kills_sessions(admin: PgPool) {
+    let (_app, admin) = support::pools(admin).await;
+    let auth = support::auth_pool(&admin).await;
+    support::assert_role(&auth, "auth_lookup").await;
+    let (a, _b) = seed_two_tenants(&admin).await;
+
+    const UID: i64 = 8001;
+    const SID: &[u8] = b"r16-session-id-32-bytes-padding!";
+    sqlx::query("INSERT INTO tenant_members (tenant_id, user_id) VALUES ($1, $2)")
+        .bind(a)
+        .bind(UID)
+        .execute(admin.raw())
+        .await
+        .expect("建成员关系失败");
+
+    // 两条入口各一个会话。用 admin 灌 —— 理由见上面的文档注释。
+    sqlx::query(
+        "INSERT INTO web_sessions (tenant_id, id, user_id, csrf_token, expires_at)
+         VALUES ($1, $2, $3, '\\xbb', now() + interval '30 days')",
+    )
+    .bind(a)
+    .bind(SID)
+    .bind(UID)
+    .execute(admin.raw())
+    .await
+    .expect("建 web 会话失败");
+    sqlx::query("INSERT INTO bot_console_sessions (tg_user_id, tenant_id) VALUES ($1, $2)")
+        .bind(UID)
+        .bind(a)
+        .execute(admin.raw())
+        .await
+        .expect("建 bot 会话失败");
+
+    // 前置：两个会话都在。少了这一句，下面的「清零」可能只是从来没建成功。
+    let before = session_counts(&auth, UID, SID).await;
+    assert_eq!(before, (1, 1), "会话没建起来，后面的断言会空转：{before:?}");
+
+    // 有效期是 30 天，所以下面的清零只可能来自 CASCADE，不是过期。
+    sqlx::query("DELETE FROM tenant_members WHERE tenant_id = $1 AND user_id = $2")
+        .bind(a)
+        .bind(UID)
+        .execute(admin.raw())
+        .await
+        .expect("移出成员失败");
+
+    let after = session_counts(&auth, UID, SID).await;
+    assert_eq!(
+        after,
+        (0, 0),
+        "成员被移出后会话还在（web={}, bot={}）—— 那道复合外键的 ON DELETE CASCADE \
+         没生效，会话要等 30 天过期才失效，spec/07 §1.5 不用 JWT 的理由就落空了",
+        after.0,
+        after.1
+    );
+}
+
+/// 以鉴权域的身份数会话行，返回 (web_sessions, bot_console_sessions)。
+///
+/// 两条策略的谓词各不相同 —— `session_self_lookup` 用 `app.session_id`（会话 id），
+/// `console_self_lookup` 用 `app.auth_user_id`（tg_user_id）—— 所以两个变量都要设。
+/// 这正是鉴权路径的真实形态：按 cookie 查会话时还不知道租户（spec/07 §1.4）。
+async fn session_counts(auth: &PgPool, uid: i64, sid: &[u8]) -> (i64, i64) {
+    let mut tx = auth.begin().await.expect("开鉴权事务失败");
+    sqlx::query("SELECT set_config('app.session_id', $1, true)")
+        .bind(format!("\\x{}", hex(sid)))
+        .execute(&mut *tx)
+        .await
+        .expect("设 app.session_id 失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', $1, true)")
+        .bind(uid.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设 app.auth_user_id 失败");
+    let web: i64 = sqlx::query_scalar("SELECT count(*) FROM web_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("数 web 会话失败");
+    let bot: i64 = sqlx::query_scalar("SELECT count(*) FROM bot_console_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("数 bot 会话失败");
+    (web, bot)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
