@@ -19,6 +19,15 @@ set -uo pipefail
 : "${TGM_DB_URL_OWNER:?需要 TGM_DB_URL_OWNER，例如 postgres://postgres:pw@127.0.0.1:55432/tgm}"
 cd "$(dirname "$0")/.."
 
+# psql 不在非交互 shell 的 PATH 里。同 migrate-idempotent.sh ——
+# eng/00 §零 那句「✓ 已装」只对会读 ~/.bashrc 的 shell 成立，
+# 而 `bash -c` 既不读 ~/.profile 也不读 ~/.bashrc（实测 command not found）。
+if ! command -v psql >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  [ -f "$HOME/opt/pgdg17/env.sh" ] && source "$HOME/opt/pgdg17/env.sh"
+fi
+command -v psql >/dev/null 2>&1 || { echo "✗ 找不到 psql"; exit 1; }
+
 # 破坏用例。选择标准是「只碰一处」—— 碰得越少，第 2 条判据才越有意义。
 # 大部分落在 keywords 上：它是最普通的甲类表，没有任何破例，改它不会牵动别的断言。
 declare -A BREAK=(
@@ -219,8 +228,11 @@ WHERE n.nspname NOT LIKE 'pg\_%' AND n.nspname<>'information_schema'
 SQL
 )"
   rc=$?
-  # psql 对单条语句报错不会置非零退出码（ON_ERROR_STOP 只管脚本级），
-  # 所以既查退出码也查输出里有没有 ERROR，再查行数下限 —— 三道都为「段落静默消失」设
+  # 三道检查（退出码 / 输出里的 ERROR / 逐段查在不在）都为「段落静默消失」设。
+  # 退出码那道并非多余但也不是唯一可靠的一道：实测 ON_ERROR_STOP=1 下
+  # `-c` 形式报错 rc=1、这里用的 stdin 形式 rc=3，两者都非零 ——
+  # 所以它拦得住 psql 缺失与 SQL 报错。留着 grep ERROR 是因为它拦的是另一件事：
+  # 报错文本会落进快照文件本身（见下面那段注释），那种情形退出码不一定告警
   if [ $rc -ne 0 ] || grep -q 'ERROR' <<<"$out"; then
     echo "快照 SQL 报错，快照不可信：" >&2
     grep 'ERROR' <<<"$out" >&2

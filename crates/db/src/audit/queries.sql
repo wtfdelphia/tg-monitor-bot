@@ -243,7 +243,8 @@ SELECT q::text FROM (
 -- 这三条与 A9 在复合 FK 下关掉的后果同形，只是这里没有断言可依。
 -- 缺口只能靠应用层的身份归属校验兜（spec/06 §2.5 第 1 条），不靠库层的 FK 形状
 -- —— 这里不该声称有一道自动校验。R19 也不覆盖这个形状（它测共享身份，
--- 上面实测的是他租户的私有身份），登记在 pre-do/03 十九。
+-- 上面实测的是他租户的私有身份）；这条现已登记为 eng/03 §3.3 的 R23（→ 404），
+-- 仍未实现，它是 L4 而应用层代码还没有。原产地在 pre-do/03 十九。
 SELECT q::text FROM (
   SELECT c.relname FROM pg_attribute a
   JOIN pg_class c ON c.oid = a.attrelid

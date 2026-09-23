@@ -8,6 +8,19 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# core 依赖 sqlx 只为 `#[derive(sqlx::Type)]`（spec/05 §二 的 newtype 定义里就带着它）。
+# 方向上不违反 ADR-0020：db 依赖 core，core 不依赖 db。
+sqlx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# 信封加密（eng/01 §三）。KmsKek 不在本 crate ——
+# 它要 aws-sdk-kms，而 trait 与 EnvKek 不该为此拖进 AWS 依赖树。
+aes-gcm = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -11,3 +11,9 @@ workspace = true
 tgm-core = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# 隔离测试要自己另开受限角色池（tests/support/mod.rs），
+# 所以 dev 侧要 runtime 与 tokio 宏，而 src 侧不需要。
+sqlx = { workspace = true, features = ["migrate"] }
+tokio = { workspace = true }

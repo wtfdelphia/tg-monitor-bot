@@ -27,6 +27,15 @@ anyhow = "1.0"
 # 存储
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "macros", "migrate", "chrono", "json"] }
 
+# 信封加密（ADR-0011/0012，落地形态见 eng/01 §三）。eng/00 §二 没有钉这四个，
+# 版本是 2026-09-22 从 sparse index 核的当时最新稳定版。
+# aes-gcm 取 0.11（2026-08-21）而非网上示例常见的 0.10：0.11 起 aead 升到 0.6，
+# Nonce 与 Key 的构造路径变了，照 0.10 的示例写编译不过。
+aes-gcm = { version = "0.11", features = ["zeroize"] }
+zeroize = "1.9"
+async-trait = "0.1"          # eng/01 §三 的 trait 签名是 async fn
+base64 = "0.23"              # TGM_LOCAL_KEK 是 base64 的 32 字节
+
 # 可观测性（eng/00 §5.1 的 subscriber 形态首发就要落地）
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
