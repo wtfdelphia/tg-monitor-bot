@@ -48,6 +48,24 @@ async fn app_pool(admin: &PgPool) -> PgPool {
     connect_as("app_user", "apw", 55432, &db).await
 }
 
+/// 以 `auth_lookup` 连到 `sqlx::test` 刚建出来的那个库。
+///
+/// 三张会话表（`bot_console_sessions` / `web_sessions` /
+/// `console_login_challenges`）对 `app_user` 是零权限（0011），
+/// 所以碰它们的测试只能走这个角色 —— 不是「换个池更方便」，
+/// 是 `app_user` 在那三张表上拿到的只会是 permission denied（R13 验的正是这个）。
+///
+/// `max_connections` 给 3：R18 要两个事务同时持连接、外加一条探测锁状态的查询。
+/// 给 2 的话第二个事务会阻塞在**取连接**而不是行锁上，那条测试就测不到并发了。
+pub async fn auth_pool(admin: &AdminOnlyPool) -> PgPool {
+    let db = current_database(admin.raw()).await;
+    PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&format!("postgres://auth_lookup:lpw@127.0.0.1:55432/{db}"))
+        .await
+        .unwrap_or_else(|e| panic!("以 auth_lookup 连 {db} 失败：{e}"))
+}
+
 /// 经 PgBouncer 的受限角色池。R3/R4 必须走这条（eng/03 §四）。
 ///
 /// PgBouncer 的 `DB_NAME` 固定指向 `tgm`，连不到 `sqlx::test` 建的临时库 ——

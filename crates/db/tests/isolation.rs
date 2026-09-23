@@ -576,3 +576,113 @@ async fn r11_replayed_update_id_has_one_effect(admin: PgPool) {
          控制 Bot 的命令会被误判成数据 Bot 的重投（spec/02 §6.7）"
     );
 }
+
+/// R18 两个应答并发打到 `pending` → 只一个推进。
+///
+/// 定义处 `../spec/07-接口契约.md` §五 附：`UPDATE ... WHERE state = 'pending'`
+/// 看影响行数。这是 spec 里写明「另需一条并发测试」的那条。
+///
+/// **走 `auth_lookup` 而不是 `app_user`**：`console_login_challenges` 对
+/// `app_user` 是零权限（0011），用 `app_user` 写这条只会拿到 permission denied
+/// —— 那是 R13 的形状，不是这条要验的。
+///
+/// 两个事务必须**真的同时在场**才测到并发。先各自开事务、第一个 UPDATE 成功
+/// 但**不提交**，此时第二个 UPDATE 会阻塞在行锁上 —— 这个阻塞是被测机制的
+/// 一部分，所以测试里显式断言它发生（`pg_stat_activity` 查等锁），
+/// 再提交第一个、放第二个过去。顺序执行两次 UPDATE 也会得到 1/0，
+/// 但那证明不了并发下成立。
+#[sqlx::test(migrations = "../../migrations")]
+async fn r18_concurrent_answers_only_one_advances(admin: PgPool) {
+    let (_app, admin) = support::pools(admin).await;
+    let auth = support::auth_pool(&admin).await;
+    support::assert_role(&auth, "auth_lookup").await;
+    support::assert_not_bypassrls(&auth).await;
+
+    let nonce = vec![7_u8; 32];
+    sqlx::query(
+        "INSERT INTO console_login_challenges (nonce, confirm_code, origin_ip, expires_at)
+         VALUES ($1, '1234', '10.0.0.1', now() + interval '2 minutes')",
+    )
+    .bind(&nonce)
+    .execute(admin.raw())
+    .await
+    .expect("建挑战失败");
+
+    // 两个应答者。state='pending' 是初始态，两人都看得见那一行。
+    const SQL: &str = "UPDATE console_login_challenges
+                       SET state = 'awaiting_confirm', tg_user_id = $2
+                       WHERE nonce = $1 AND state = 'pending'";
+
+    let mut t1 = auth.begin().await.expect("开事务 1 失败");
+    let first = sqlx::query(SQL)
+        .bind(&nonce)
+        .bind(5001_i64)
+        .execute(&mut *t1)
+        .await
+        .expect("应答 1 失败")
+        .rows_affected();
+    assert_eq!(first, 1, "第一个应答没推进状态");
+
+    // 事务 1 未提交，行锁还在。事务 2 的同一句应当阻塞。
+    let auth2 = auth.clone();
+    let nonce2 = nonce.clone();
+    let second = tokio::spawn(async move {
+        let mut t2 = auth2.begin().await.expect("开事务 2 失败");
+        let n = sqlx::query(SQL)
+            .bind(&nonce2)
+            .bind(5002_i64)
+            .execute(&mut *t2)
+            .await
+            .expect("应答 2 失败")
+            .rows_affected();
+        t2.commit().await.expect("提交事务 2 失败");
+        n
+    });
+
+    // 断言它真的在等锁。没有这一句，`second` 可能在事务 1 提交之后才开始跑 ——
+    // 那就退化成顺序执行，而顺序执行同样得到 1/0，测试照绿。
+    let mut waited = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'
+               AND query LIKE '%awaiting_confirm%'",
+        )
+        .fetch_one(admin.raw())
+        .await
+        .expect("查等锁失败");
+        if blocked > 0 {
+            waited = true;
+            break;
+        }
+    }
+    assert!(
+        waited,
+        "第二个应答没有阻塞在行锁上 —— 它可能还没开始，或者 UPDATE 没锁住那一行。\
+         两种情况下这条测试都退化成顺序执行，测不到并发"
+    );
+
+    t1.commit().await.expect("提交事务 1 失败");
+
+    // 事务 1 提交后，事务 2 的 UPDATE 在 READ COMMITTED 下重新检查 WHERE ——
+    // state 已不是 'pending'，于是影响 0 行。这就是「只一个推进」的机制。
+    let n = second.await.expect("事务 2 的 task 崩了");
+    assert_eq!(
+        n, 0,
+        "两个应答都推进了状态（影响行数 1 和 {n}）—— \
+         条件更新没挡住并发应答，后到的那个会覆盖先到的 tg_user_id"
+    );
+
+    // 最终态：应答者必须是先到的那个，不是后到的。
+    let winner: i64 =
+        sqlx::query_scalar("SELECT tg_user_id FROM console_login_challenges WHERE nonce = $1")
+            .bind(&nonce)
+            .fetch_one(admin.raw())
+            .await
+            .expect("查最终应答者失败");
+    assert_eq!(
+        winner, 5001,
+        "落库的应答者是后到的那个 —— 说明第二个 UPDATE 实际写进去了"
+    );
+}
