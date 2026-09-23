@@ -17,12 +17,31 @@ env:
   # 写两遍就会有对不上的那天，而 clippy 的 lint 集合随版本变动（见该文件注释）。
   RUSTFLAGS: -D warnings
 
+# ── 两条 runner 侧告警的处置（2026-09-23 首跑后）──────────────────────
+#
+# ① Node.js 20 deprecated（actions/checkout@v4 target node20）
+#    已修：checkout 升到 v7。checkout 从 v5 起就是 node24
+#    （v5=单纯切 node24、v6=凭据改存独立文件、v7=ESM + 拦 fork PR 的
+#    pull_request_target/workflow_run 检出）。本仓库只用默认检出，
+#    无 submodule、无自定义 token，三个版本行为一致，所以取当前线 v7。
+#    Swatinem/rust-cache@v2 不用动 —— 那个浮动标签已经指向 node24 的
+#    2.9.2（实测 action.yml 里 using: "node24"），所以告警没点它。
+#
+# ② ubuntu-latest 将于 2026-10-19 起迁到 Ubuntu 26
+#    **这不是能「修掉」的告警，是预告**，故意不钉死 ubuntu-24.04：
+#    钉版本只是把「迁移那天出问题」换成「某天没人记得升」，而后者更安静。
+#    真正受影响的是下面装 postgresql-client-17 那步（它用
+#    $(lsb_release -cs)-pgdg 拼源）。已查：Ubuntu 26.04 代号 resolute，
+#    pgdg 已有 resolute-pgdg，且含 client-15/16/17/18 —— 那条源不会断。
+#    风险落在硬编码的 /usr/lib/postgresql/17/bin：若镜像自带 18，
+#    /usr/bin/pg_dump 会指向 18，但我们显式前置 17 的路径，仍然对。
+#    **兜底是那句版本断言**：它不对就红在装机那一步，而不是红在 R7。
 jobs:
   # ── 不连库的五条（eng/04 §四 前五条）────────────────────────────────
   static:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: 装工具链（components 来自 rust-toolchain.toml）
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -55,7 +74,7 @@ jobs:
   database:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: 装工具链
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -128,10 +147,23 @@ jobs:
       # 与上面 static job 的 `SQLX_OFFLINE=true cargo build` 不重复：
       # 那条验「.sqlx/ 够用现有 SQL」，这条给出可操作的报错
       # （`.sqlx is missing one or more queries`）而不是一句编译错误。
-      # 注意它对**多余**条目只 warning 且 rc=0（实测），所以「.sqlx 有陈旧条目」
-      # 这件事两条都拦不住 —— 目前没有卡口管它。
+      # 它对**多余**条目只 warning 且 rc=0（实测：往 .sqlx/ 塞一个改了 query
+      # 字段的条目，输出 "potentially unused queries found in .sqlx"，rc 仍是 0）。
+      # 所以这里把那句 warning 转成失败 —— 陈旧条目不是洁癖问题：
+      # .sqlx/ 是 static job 里 SQLX_OFFLINE 编译的唯一事实来源，
+      # 留着一条指向已删除列的缓存，下一个改这块的人会拿到一份
+      # 编译期通过、运行时报 column does not exist 的代码。
+      #
+      # 用 tee + grep 而不是 `--check` 的 rc：rc 在这条路径上不携带信息。
+      # set -o pipefail 让 prepare 自己的失败不被 tee 吃掉。
       - name: .sqlx/ 与 SQL 一致（清单第 4 条）
-        run: cargo sqlx prepare --workspace --check
+        run: |
+          set -o pipefail
+          cargo sqlx prepare --workspace --check 2>&1 | tee /tmp/prepare.log
+          if grep -q "unused queries found" /tmp/prepare.log; then
+            echo "::error::.sqlx/ 有陈旧条目 —— 跑 cargo sqlx prepare --workspace 重新生成"
+            exit 1
+          fi
         env:
           DATABASE_URL: postgres://postgres:pw@127.0.0.1:55432/tgm
 
