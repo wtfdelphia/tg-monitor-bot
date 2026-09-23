@@ -388,3 +388,60 @@ async fn r13_console_sessions_denied(admin: PgPool) {
         );
     }
 }
+
+/// R24 `ensure_rls` 不得把 FORCE RLS 打到临时表上。
+///
+/// 这条的来历与清单里其余各条不同：它不是照设计推出来的，是被一条无关探针
+/// 撞出来的（想用 `CREATE TEMP TABLE` 存两个 id，结果写入被 RLS 拒了）。
+///
+/// **它为什么能潜伏过全套验证：超级用户 bypass RLS，而迁移、`tgm audit-rls`、
+/// 双遍脚本全都以 `postgres` 跑。** 以超级用户建临时表能正常写入，
+/// 换成 `tgm_owner` 或 `app_user` 才被拒 —— 对现有每条验证路径都是隐形的。
+/// 所以这条测试必须用**非超级用户**的池，用 `admin` 跑会永远绿。
+///
+/// 反向那半条（普通表仍须被开 FORCE）也在这里：只验临时表能写的话，
+/// 把 0013 的判断放宽成「全都跳过」同样会绿 —— 那正是 0012 想防的形状。
+#[sqlx::test(migrations = "../../migrations")]
+async fn r24_event_trigger_skips_temp_tables(admin: PgPool) {
+    let (app, _admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+
+    let mut tx = app.begin().await.expect("开事务失败");
+    sqlx::query("CREATE TEMP TABLE r24_probe (a int)")
+        .execute(&mut *tx)
+        .await
+        .expect("建临时表失败");
+    sqlx::query("INSERT INTO r24_probe VALUES (1)")
+        .execute(&mut *tx)
+        .await
+        .expect(
+            "临时表写入被拒 —— ensure_rls 又把 FORCE RLS 打到临时表上了（迁移 0013）。\
+             注意本条不会在以超级用户跑的任何检查里报红",
+        );
+    let forced: bool =
+        sqlx::query_scalar("SELECT relforcerowsecurity FROM pg_class WHERE relname = 'r24_probe'")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("查临时表的 relforcerowsecurity 失败");
+    assert!(!forced, "临时表被打上了 FORCE RLS");
+
+    // 反向：普通表仍须被 ensure_rls 开上 ENABLE + FORCE。
+    // 用 admin 建 —— app_user 没有 public schema 的 CREATE 权限（0001）。
+    let mut atx = _admin.raw().begin().await.expect("开 admin 事务失败");
+    sqlx::query("CREATE TABLE r24_perm_probe (a int)")
+        .execute(&mut *atx)
+        .await
+        .expect("建普通表失败");
+    let (enabled, forced): (bool, bool) = sqlx::query_as(
+        "SELECT relrowsecurity, relforcerowsecurity FROM pg_class
+         WHERE relname = 'r24_perm_probe'",
+    )
+    .fetch_one(&mut *atx)
+    .await
+    .expect("查普通表的 RLS 标志失败");
+    assert!(
+        enabled && forced,
+        "普通表没被 ensure_rls 开上 RLS（enabled={enabled} forced={forced}）—— \
+         0013 的临时表判断放得太宽，把持久表也跳过了"
+    );
+}
