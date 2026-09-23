@@ -67,8 +67,18 @@ jobs:
       #
       # 不装会怎样：R7 的反证（owner 必须 dump 成功）先红 —— 那是刻意的。
       # 若只有 R7 正向那条，版本不匹配会让它**因为错误的原因变绿**。
-      # /usr/bin/pg_dump 是 postgresql-client-common 的 pg_wrapper，
-      # 它选已装的最高版本，所以装完不需要改 PATH。
+      #
+      # 装完必须把 17 的 bin 显式前置到 PATH。**首跑实测（run 35821544704）：
+      # 装完 17.11 之后 `pg_dump --version` 仍然是 16.15**，R7 反证报
+      # "server version: 17.11; pg_dump version: 16.15" 而红。
+      # 本段原先的注释写着「/usr/bin/pg_dump 是 pg_wrapper，它选已装的最高版本，
+      # 所以装完不需要改 PATH」—— 那句话在 runner 上不成立：
+      # 镜像自带的 postgresql-client-16 把 /usr/bin/pg_dump 占住了，
+      # 装 client-17 只往 /usr/lib/postgresql/17/bin/ 放文件，不动 /usr/bin。
+      #
+      # 所以这里写死 17 的路径而不是再赌一次解析顺序，并且把版本从「打印」
+      # 改成「断言」：只 `pg_dump --version` 的话，版本不对也照样绿到下一步，
+      # 真正的失败推迟到测试里，报错指向 backup.rs 而不是这一步。
       - name: 装 postgresql-client 17（R7 需要，且须与服务端同版本）
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
@@ -79,7 +89,11 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
           sudo apt-get install -y postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          export PATH="/usr/lib/postgresql/17/bin:$PATH"
           pg_dump --version
+          pg_dump --version | grep -q "PostgreSQL) 17\." || {
+            echo "::error::pg_dump 不是 17.x，R7 会因为版本不匹配而红"; exit 1; }
 
       # 复用 compose.yaml —— 与本地开发同一份编排（eng/02 §一）。
       # 不在这里手写 services: postgres，因为那会变成第二份真相：

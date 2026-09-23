@@ -18,18 +18,40 @@ const APP_URL: &str = "postgres://app_user:apw@127.0.0.1:55432/tgm";
 /// 找 pg_dump。它不在非交互 shell 的 PATH 里（eng/00 §零 那句「✓ 已装」
 /// 对脚本和 CI 都是假的），所以这里按 env.sh 里那个前缀兜一次。
 /// 找不到就**响亮地失败** —— 一条静默跳过的测试与一条通过的测试同形。
+///
+/// **「能起」不够，必须是 17.x。** 原先这里只看 `--version` 能不能执行成功，
+/// 于是 CI 首跑挑中了 runner 自带的 16.15（装了 client-17 但 /usr/bin 被 16 占住），
+/// pg_dump 对更高版本的服务端直接拒绝。这对反证那条只是报红，
+/// 但对 **R7 正向那条是危险的**：它的判据是「退出码非 0 且没吐出数据」，
+/// 而版本不匹配恰好满足两者 —— 那条会因为错误的原因变绿。
+/// 所以版本在挑选阶段就断言，不留给调用方。
 fn pg_dump() -> String {
-    if Command::new("pg_dump").arg("--version").output().is_ok() {
-        return "pg_dump".into();
+    let mut tried = Vec::new();
+    for cand in ["pg_dump", "/usr/lib/postgresql/17/bin/pg_dump"] {
+        match version_of(cand) {
+            Some(v) if v.contains("PostgreSQL) 17.") => return cand.into(),
+            Some(v) => tried.push(format!("{cand} → {}", v.trim())),
+            None => tried.push(format!("{cand} → 起不来")),
+        }
     }
     let home = std::env::var("HOME").expect("HOME 未设");
     let p = format!("{home}/opt/pgdg17/usr/lib/postgresql/17/bin/pg_dump");
-    assert!(
-        std::path::Path::new(&p).exists(),
-        "找不到 pg_dump（PATH 里没有，{p} 也不存在）—— 这条测试需要它，\
-         不能当成通过。装法见 docs/design/eng/00-工程约定.md §零"
-    );
-    p
+    match version_of(&p) {
+        Some(v) if v.contains("PostgreSQL) 17.") => p,
+        other => panic!(
+            "找不到 17.x 的 pg_dump —— 这条测试需要它，不能当成通过。\n\
+             试过：{}\n{p} → {}\n装法见 docs/design/eng/00-工程约定.md §零",
+            tried.join("；"),
+            other.as_deref().unwrap_or("不存在或起不来").trim()
+        ),
+    }
+}
+
+fn version_of(bin: &str) -> Option<String> {
+    let out = Command::new(bin).arg("--version").output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// R7 本体。判据是**两件事同时成立**：退出码非 0，且 stdout 里没有业务数据。
