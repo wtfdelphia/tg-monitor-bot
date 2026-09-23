@@ -445,3 +445,134 @@ async fn r24_event_trigger_skips_temp_tables(admin: PgPool) {
          0013 的临时表判断放得太宽，把持久表也跳过了"
     );
 }
+
+/// R11 同 `update_id` 重投三次 → 一次副作用。
+///
+/// 定义处 `../spec/02-总体架构.md` §6.7。幂等键是 `bot_console_updates` 的主键
+/// `(tenant_id, bot_id, update_id)`，这条测它真的挡得住重投。
+///
+/// **副作用落在 `audit_logs` 而不是 `rules`。** 后者有 `uq_rule_conflict`
+/// （`tenant_id, keyword_id, COALESCE(source_ref,0), COALESCE(media_type,'ANY'), target_ref`
+/// WHERE enabled），而那个约束存在的目的正是给 API 判 409 —— 也就是说
+/// 应用层本来就会吞掉它的冲突。实测同一条 `/addrule` 跑三遍：
+/// 裸 INSERT 报 `duplicate key ... uq_rule_conflict`，
+/// 走 409 语义（`ON CONFLICT DO NOTHING`）则 `INSERT 0 0` 两次、最终 1 行。
+/// 于是幂等键**完全删掉**这条测试仍然绿。`audit_logs` 没有任何业务唯一约束
+/// （主键是 `GENERATED ALWAYS` 的 `id`，每次插入都是新行），
+/// 是这库里能真的数出「三次副作用」的落点。
+///
+/// 三次重投的形态按 §6.7 那段 SQL 注释分开写：裸 INSERT 拿 `duplicate key`
+/// 是「发现重投」的机制，`ON CONFLICT DO NOTHING` 的 `INSERT 0 0` 是
+/// 「据此判定已处理，直接返回」的机制。两者都要验 —— 只验后者的话，
+/// 主键退化成 `(tenant_id, update_id)` 仍然会绿。
+#[sqlx::test(migrations = "../../migrations")]
+async fn r11_replayed_update_id_has_one_effect(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let (a, _b) = seed_two_tenants(&admin).await;
+
+    // 两个 Bot 身份。第二个用来验 bot_id 真在键里（§6.7：update_id 按 Bot 独立计数）。
+    let mut bots = Vec::new();
+    for name in ["bot-ctl", "bot-data"] {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO identities (kind, tenant_id, display_name)
+             VALUES ('bot', $1, $2) RETURNING id",
+        )
+        .bind(a)
+        .bind(name)
+        .fetch_one(admin.raw())
+        .await
+        .expect("建 Bot 身份失败");
+        bots.push(id);
+    }
+    let (ctl, data) = (bots[0], bots[1]);
+    const UPD: i64 = 9001;
+
+    // 一次「处理一个 update」：先占幂等键，占到了才写副作用。
+    // 返回是否真的处理了（false = 已处理过，直接返回）。
+    async fn handle(pool: &PgPool, tenant: i64, bot: i64, upd: i64) -> bool {
+        let mut tx = pool.begin().await.expect("开事务失败");
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(tenant.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("设租户上下文失败");
+        let claimed = sqlx::query(
+            "INSERT INTO bot_console_updates (tenant_id, bot_id, update_id)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(tenant)
+        .bind(bot)
+        .bind(upd)
+        .execute(&mut *tx)
+        .await
+        .expect("占幂等键失败")
+        .rows_affected();
+        if claimed == 1 {
+            sqlx::query(
+                "INSERT INTO audit_logs (tenant_id, action, resource, source)
+                 VALUES ($1, 'rule.create', 'rules', 'bot')",
+            )
+            .bind(tenant)
+            .execute(&mut *tx)
+            .await
+            .expect("写副作用失败");
+        }
+        tx.commit().await.expect("提交失败");
+        claimed == 1
+    }
+
+    // 同一个 update 投三次。
+    assert!(handle(&app, a, ctl, UPD).await, "第一次投递没被处理");
+    assert!(
+        !handle(&app, a, ctl, UPD).await,
+        "第二次重投被当成新 update"
+    );
+    assert!(
+        !handle(&app, a, ctl, UPD).await,
+        "第三次重投被当成新 update"
+    );
+
+    let effects: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE tenant_id = $1")
+        .bind(a)
+        .fetch_one(admin.raw())
+        .await
+        .expect("数副作用失败");
+    assert_eq!(
+        effects, 1,
+        "同一个 update_id 投三次产生了 {effects} 条副作用 —— \
+         bot_console_updates 的主键没挡住重投"
+    );
+
+    // 裸 INSERT 的那半条：`ON CONFLICT DO NOTHING` 只报 0 行，
+    // 而 §6.7 记的是「重投同一 update_id → duplicate key」。两种形态都要在。
+    let mut tx = app.begin().await.expect("开事务失败");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(a.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设租户上下文失败");
+    let err = sqlx::query(
+        "INSERT INTO bot_console_updates (tenant_id, bot_id, update_id) VALUES ($1, $2, $3)",
+    )
+    .bind(a)
+    .bind(ctl)
+    .bind(UPD)
+    .execute(&mut *tx)
+    .await
+    .expect_err("裸 INSERT 重投竟然成功 —— 主键不在那三列上");
+    assert!(
+        err.to_string().contains("duplicate key"),
+        "重投被拒了，但不是唯一约束拒的：{err}"
+    );
+    drop(tx);
+
+    // 另一个 Bot 的同号 update_id 必须能插进去。
+    // 这半条是 bot_id 在键里的唯一证据：主键退化成 (tenant_id, update_id) 时，
+    // 上面每一条断言都仍然会绿，只有这一条会红。
+    assert!(
+        handle(&app, a, data, UPD).await,
+        "另一个 Bot 的同号 update_id 被当成重投 —— bot_id 不在幂等键里，\
+         控制 Bot 的命令会被误判成数据 Bot 的重投（spec/02 §6.7）"
+    );
+}
