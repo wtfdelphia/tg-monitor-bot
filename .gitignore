@@ -1,5 +1,8 @@
 /target
 **/*.rs.bk
 .env
+# AI 驱动循环的运行日志（提示词、执行器对话、卡口输出）—— 量大且含环境细节，
+# 见 scripts/ai-driver/README.md 已知边界第 6 条
+scripts/ai-driver/logs/
 # 注意：Cargo.lock 对 bin 项目必须提交，不要 ignore
 # 注意：.sqlx/ 必须提交（见 docs/design/eng/00-工程约定.md §6.1），不要 ignore
