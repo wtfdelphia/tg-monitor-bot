@@ -767,6 +767,166 @@ async fn r16_member_removal_kills_sessions(admin: PgPool) {
 /// 以鉴权域的身份数会话行，返回 (web_sessions, bot_console_sessions)。
 ///
 /// 两条策略的谓词各不相同 —— `session_self_lookup` 用 `app.session_id`（会话 id），
+/// R12 `auth_lookup` 只见自己成员关系；不设即报错；`INSERT` 被拒。
+///
+/// 定义处 `../spec/05-安全与租户隔离.md` §3.7 的五项实测表。
+///
+/// **清单标题里的三条断言由不同机制拦住，测的时候不能混**：
+/// 「只见自己」是 `member_self_lookup` 策略（RLS 层），
+/// 「不设即报错」是 `current_setting` 的 fail-loud（PG 行为，不是我们写的），
+/// 「`INSERT` 被拒」是 GRANT 层 —— 0011 只给了这张表 `SELECT`。
+/// 实测那三种拒绝的报错文本各不相同（`permission denied for table` /
+/// `unrecognized configuration parameter`），所以断言逐条对文本，
+/// 不写成「反正会 Err」—— 后者在权限被误放宽成全量 DML 时照样绿。
+///
+/// **多出来的那条断言（`app_user` 不受自查策略影响）是这条测试的承重部分。**
+/// §3.7 列的三条错误解法里，第一条就是「加自查策略但不限定角色」，
+/// 而它的危害正是 `app_user` 借道那条策略读到跨租户行。实测把
+/// `member_self_lookup` 的 `TO auth_lookup` 改成 `TO app_user, auth_lookup`：
+/// `app_user` 在单一租户上下文里从 2 行变成 3 行（横跨两个租户），
+/// 而 `tgm audit-rls` 的 16 条**一条都不报红** —— A6 的判据是
+/// 「PUBLIC 策略或 qual 恒真」，这条策略两者都不是。
+/// 也就是说清单里那三条断言全绿时，这个洞仍然开着，只有这一条能抓到它。
+#[sqlx::test(migrations = "../../migrations")]
+async fn r12_auth_lookup_sees_only_own_membership(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let auth = support::auth_pool(&admin).await;
+    support::assert_role(&auth, "auth_lookup").await;
+    support::assert_not_bypassrls(&auth).await;
+    let (a, b) = seed_two_tenants(&admin).await;
+
+    // 777 同时属于两个租户 —— 鉴权反查的真实形态就是「一个 tg 用户多个租户」。
+    // 888 只属于 A，用来验谓词真的按 user_id 过滤而不是「全放行」。
+    const SELF: i64 = 777;
+    const OTHER: i64 = 888;
+
+    // 「不设变量 → fail-loud」必须**第一个**跑，在灌数据之前，而这个位置是承重的。
+    // 两个实测理由：
+    //
+    // 一、`set_config(..., true)` 的事务级设置在提交或回滚之后参数并不消失，
+    //    而是在该连接上变成**空串** —— 再读拿到的报错换成
+    //    `invalid input syntax for type bigint: ""`，不再是
+    //    `unrecognized configuration parameter`（R3 测的就是这个残留；
+    //    实测 `RESET` 也救不回来，参数一旦存在就回不到「不存在」）。
+    //    池里的连接会被复用，所以这条断言排在别的步骤之后会红在错误的理由上。
+    //
+    // 二、这条断言**不依赖表里有行**，因为报错发生在**规划期**：
+    //    `current_setting` 要被折叠成常量才能和 `user_id` 比较，
+    //    实测连 `EXPLAIN` 都过不去。反过来说，若有人把谓词改成
+    //    `current_setting(...)::bigint IS NOT NULL` 那种不引用列的形状，
+    //    它就只留在 Filter 里、空表上一行都不求值 —— fail-loud 静默消失。
+    //    所以这条断言也顺带守着「谓词必须真的和列比较」。
+    let err = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tenant_members")
+        .fetch_one(&auth)
+        .await
+        .expect_err("没设 app.auth_user_id 也能查成员表 —— fail-loud 没了");
+    assert!(
+        err.to_string()
+            .contains("unrecognized configuration parameter"),
+        "拒是拒了，但不是 current_setting 的 fail-loud：{err}"
+    );
+
+    for (tenant, uid) in [(a, SELF), (b, SELF), (a, OTHER)] {
+        sqlx::query("INSERT INTO tenant_members (tenant_id, user_id) VALUES ($1, $2)")
+            .bind(tenant)
+            .bind(uid)
+            .execute(admin.raw())
+            .await
+            .expect("建成员关系失败");
+    }
+
+    // 1) 设自己的 id 全表查 → 只见自己那两行，且两个租户都在。
+    let mut tx = auth.begin().await.expect("开鉴权事务失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', $1, true)")
+        .bind(SELF.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设 app.auth_user_id 失败");
+    let mine: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT tenant_id, user_id FROM tenant_members ORDER BY tenant_id")
+            .fetch_all(&mut *tx)
+            .await
+            .expect("反查成员关系失败");
+    assert_eq!(
+        mine,
+        vec![(a, SELF), (b, SELF)],
+        "反查看到的不是「自己在哪些租户」：{mine:?} —— \
+         member_self_lookup 的谓词没按 user_id 过滤，或把别人的行也放了进来"
+    );
+
+    // 2) 同一个连接里查别人 → 0 行。不是报错，是查得到表但看不见行。
+    let others: i64 = sqlx::query_scalar("SELECT count(*) FROM tenant_members WHERE user_id = $1")
+        .bind(OTHER)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("查他人成员关系失败");
+    assert_eq!(
+        others, 0,
+        "鉴权域能看到别人的成员关系（{others} 行）—— 反查凭一个 tg_user_id \
+         就能枚举出全平台的租户成员表"
+    );
+    drop(tx);
+
+    // 3) 写操作被 GRANT 层拦住，三种都拦。
+    //    0011 只给这张表 SELECT，所以报的是 permission denied 而不是
+    //    42501 那种「找不到匹配策略」—— 与三张会话表的形状不同（见 R16 的注释）。
+    //
+    //    **三条必须各开一个事务。** 第一条被拒之后事务进入 aborted 状态，
+    //    同一事务里后两条拿到的是 `current transaction is aborted`，
+    //    那既不是 permission denied 也不是 RLS 拒 —— 首跑就红在这里。
+    //    共用事务的话，真正的形态一条都没量到，而失败信息会指向错误的方向。
+    for (what, sql) in [
+        (
+            "INSERT",
+            "INSERT INTO tenant_members (tenant_id, user_id) VALUES (1, 999)",
+        ),
+        ("UPDATE", "UPDATE tenant_members SET role = 'TENANT_OWNER'"),
+        ("DELETE", "DELETE FROM tenant_members"),
+    ] {
+        let mut tx = auth.begin().await.expect("开鉴权事务失败");
+        sqlx::query("SELECT set_config('app.auth_user_id', $1, true)")
+            .bind(SELF.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("设 app.auth_user_id 失败");
+        let err = sqlx::query(sql)
+            .execute(&mut *tx)
+            .await
+            .expect_err(&format!("鉴权域的 {what} 竟然成功了 —— 它只该有 SELECT"));
+        assert!(
+            err.to_string().contains("permission denied"),
+            "{what} 被拒了，但不是 GRANT 层拒的：{err} —— \
+             若是 RLS 拒的，说明写权限已被授出，只剩策略在挡"
+        );
+    }
+
+    // 4) 业务角色不得借道自查策略。理由见上面的文档注释：
+    //    这一条是 §3.7 三条错误解法里第一条的反向断言，而 audit-rls 抓不到它。
+    let mut tx = app.begin().await.expect("开业务事务失败");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(a.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设租户上下文失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', $1, true)")
+        .bind(SELF.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设 app.auth_user_id 失败");
+    let seen: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT tenant_id, user_id FROM tenant_members ORDER BY user_id")
+            .fetch_all(&mut *tx)
+            .await
+            .expect("业务角色查成员表失败");
+    assert_eq!(
+        seen,
+        vec![(a, SELF), (a, OTHER)],
+        "业务角色看到的行不止自己租户的：{seen:?} —— \
+         member_self_lookup 少了 TO auth_lookup 限定，它与租户策略构成 OR（spec/05 §3.7）。\
+         注意 audit-rls 全绿也不代表这条成立"
+    );
+}
+
 /// `console_self_lookup` 用 `app.auth_user_id`（tg_user_id）—— 所以两个变量都要设。
 /// 这正是鉴权路径的真实形态：按 cookie 查会话时还不知道租户（spec/07 §1.4）。
 async fn session_counts(auth: &PgPool, uid: i64, sid: &[u8]) -> (i64, i64) {
