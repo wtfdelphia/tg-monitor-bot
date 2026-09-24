@@ -23,7 +23,7 @@ use tgm_db::admin::{AdminPool, admin_tx};
 /// 那个白名单只对本文件用的测试侧 `AdminOnlyPool` 生效）。
 /// 这里只保证 `admin_tx` 这条正路是通的，
 /// 否则「唯一入口」可能是一个谁都用不了的入口。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn admin_tx_is_the_usable_path(admin: sqlx::PgPool) {
     let (_app, injected) = support::pools(admin).await;
 

@@ -141,6 +141,13 @@ jobs:
       - name: 装 sqlx-cli
         run: cargo install sqlx-cli --locked --version 0.9.0 --no-default-features -F postgres
 
+      # 为 cargo sqlx prepare 单独准备 schema 库；它不使用生产库，也不让任务代码
+      # 拿到 owner 连接。迁移仍走生产路径，但目标是测试 schema 库。
+      - name: 初始化测试 schema 库
+        run: cargo run --bin tgm -- migrate
+        env:
+          TGM_DB_URL_OWNER: postgres://postgres:pw@127.0.0.1:55432/tgm_test_schema
+
       # eng/04 §四 清单里那条 `cargo sqlx prepare --check --workspace`。
       # **必须在这个 job 而不是 static job**：无库时它报 error 但 rc=0（实测），
       # 放进没有库的 job 会让它永远绿 —— 正是 §五 说的那个形状。
@@ -165,7 +172,7 @@ jobs:
             exit 1
           fi
         env:
-          DATABASE_URL: postgres://postgres:pw@127.0.0.1:55432/tgm
+          DATABASE_URL: postgres://app_user:apw@127.0.0.1:55432/tgm_test_schema
 
       # 迁移可重入（WP-1 出口判据第一条）。第二遍必须是 no-op：
       # sqlx 按文件记版本，但每个 DDL 文件内部也得幂等 ——
@@ -175,13 +182,14 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:pw@127.0.0.1:55432/tgm
 
-      # L1+L2+L3。DATABASE_URL 给 sqlx::test 用（它按此建每测试一库），
-      # TGM_DB_URL_OWNER 给审计侧的测试用。
+      # L1+L2+L3。DATABASE_URL 使用 tgm_test 控制库；它不是超级用户，
+      # 仅负责 SQLx 创建/删除临时测试库。隔离查询仍由 support/mod.rs 换成
+      # app_user / auth_lookup 受限连接。
       - name: 测试
         run: cargo test --workspace
         env:
-          DATABASE_URL: postgres://postgres:pw@127.0.0.1:55432/tgm
-          TGM_DB_URL_OWNER: postgres://postgres:pw@127.0.0.1:55432/tgm
+          DATABASE_URL: postgres://tgm_test:tpw@127.0.0.1:55432/tgm_test_control
+          SQLX_OFFLINE: "true"
 
       - name: RLS 静态审计
         run: cargo run --bin tgm -- audit-rls

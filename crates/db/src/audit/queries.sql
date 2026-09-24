@@ -576,6 +576,9 @@ SELECT q::text FROM (
 -- 所以这里换个方向：不去追认继承来的权限，而是禁掉「登录角色持有组成员身份」
 -- 这件事本身。派生的前提（权限都是直授的）从此由断言来维持，而不是靠假设。
 --
+-- 只检查能连接当前审计数据库的登录角色。tgm_test 是 SQLx 控制角色，
+-- 故意被 REVOKE CONNECT ON DATABASE tgm 排除；它只为测试临时库使用
+-- tgm_owner 的 SET ROLE 权限，不是生产库运行时角色。
 -- 豁免只有 postgres → tgm_owner 这一对，而不是豁免 postgres 整个角色。
 -- 它是 scripts/init/01-roles.sql:7 故意建的：tgm_owner 是 NOLOGIN，
 -- 审计与迁移都靠 postgres 继承它的 owner 身份才能跑。写成「一对」而不是
@@ -595,6 +598,7 @@ SELECT q::text FROM (
   JOIN pg_roles m ON m.oid = am.member
   JOIN pg_roles g ON g.oid = am.roleid
   WHERE m.rolcanlogin
+    AND has_database_privilege(m.oid, current_database(), 'CONNECT')
     AND NOT (m.rolname = 'postgres' AND g.rolname = 'tgm_owner')
   ORDER BY 1, 2
 ) q;

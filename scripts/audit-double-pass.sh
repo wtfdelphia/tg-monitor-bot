@@ -74,7 +74,7 @@ declare -A BREAK=(
   # 这正是它能绕过 runtime_role 派生的原因。组带 BYPASSRLS，
   # 于是 probe_worker 实际上 RLS 全免，而 A2a 因为派生里没有它而保持绿。
   # 用 IN ROLE 一句建完，不额外发 GRANT：这两种写法在 pg_auth_members 里等价
-  [C5]="CREATE ROLE probe_g2 NOLOGIN BYPASSRLS; GRANT SELECT ON keywords TO probe_g2; CREATE ROLE probe_worker LOGIN PASSWORD 'wpw' IN ROLE probe_g2;"
+  [C5]="CREATE ROLE probe_g2 NOLOGIN BYPASSRLS; GRANT SELECT ON keywords TO probe_g2; CREATE ROLE probe_worker LOGIN PASSWORD 'wpw' IN ROLE probe_g2; GRANT CONNECT ON DATABASE tgm TO probe_worker;"
 )
 
 declare -A UNDO=(
@@ -106,7 +106,7 @@ declare -A UNDO=(
   # DROP ROLE 要求该角色不再持有任何权限，所以先 REVOKE 表级授权 ——
   # 漏了就是 ERROR: role "probe_g2" cannot be dropped because some objects depend on it。
   # 成员关系随 DROP ROLE 自动消失，不用单独 REVOKE；MBR 段就是用来证实这一点的
-  [C5]="DROP ROLE probe_worker; REVOKE SELECT ON keywords FROM probe_g2; DROP ROLE probe_g2;"
+  [C5]="REVOKE CONNECT ON DATABASE tgm FROM probe_worker; DROP ROLE probe_worker; REVOKE SELECT ON keywords FROM probe_g2; DROP ROLE probe_g2;"
 )
 
 # 需要超级用户而不是 tgm_owner 的三例：
@@ -186,16 +186,22 @@ WHERE rolname NOT LIKE 'pg\_%' ORDER BY 1;
 -- 成员关系要单独一段，它不在 pg_roles 里。漏了它，C5 的破坏用例
 -- （GRANT 组身份给登录角色）撤销时只 DROP 了角色而漏掉 REVOKE 的话，
 -- 快照 diff 照样干净 —— 与 COLACL/MV 缺段是同一类失效。
--- 第一行是计数哨兵：干净库上这一段只有 postgres→tgm_owner 一条（实测 count=1），
--- 将来那条 GRANT 若被改掉，本段会变成 0 行而触发下面的缺段检查（误报）
+-- 第一行是计数哨兵：干净库上这一段只有能连接当前库的登录角色成员关系，
+-- 当前实测为 postgres→tgm_owner 一条；将来那条 GRANT 若被改掉，本段会变成
+-- 0 行而触发下面的缺段检查（误报）
 SELECT 'MBR|count|'||count(*) FROM pg_auth_members am
 JOIN pg_roles m ON m.oid=am.member JOIN pg_roles g ON g.oid=am.roleid
-WHERE m.rolname NOT LIKE 'pg\_%' AND g.rolname NOT LIKE 'pg\_%';
+WHERE m.rolname NOT LIKE 'pg\_%' AND g.rolname NOT LIKE 'pg\_%'
+  AND m.rolcanlogin
+  AND has_database_privilege(m.oid, current_database(), 'CONNECT');
 SELECT 'MBR|'||m.rolname||'|'||g.rolname||'|'||am.inherit_option||'|'||am.set_option
        ||'|'||am.admin_option
 FROM pg_auth_members am
 JOIN pg_roles m ON m.oid=am.member JOIN pg_roles g ON g.oid=am.roleid
-WHERE m.rolname NOT LIKE 'pg\_%' AND g.rolname NOT LIKE 'pg\_%' ORDER BY 1;
+WHERE m.rolname NOT LIKE 'pg\_%' AND g.rolname NOT LIKE 'pg\_%'
+  AND m.rolcanlogin
+  AND has_database_privilege(m.oid, current_database(), 'CONNECT')
+ORDER BY 1;
 -- FUN 与 MV 两段都不限定 public，与断言侧的范围保持一致。
 -- 限定了的话，A8 的破坏用例（建在 probe_ns 里的 SECURITY DEFINER 函数）
 -- 撤销漏掉时快照 diff 照样干净 —— 又一次「快照看不见的地方就验不了撤销」。

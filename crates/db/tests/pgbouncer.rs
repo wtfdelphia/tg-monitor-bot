@@ -193,6 +193,11 @@ async fn sample(pool: &PgPool, tenant: TenantId) -> (Vec<String>, i32, i64) {
 /// **三条自检缺一不可**，因为这条测试的失败方式主要是「什么都没测到」：
 /// 单连接池（否则第二次可能走一条没有缓存的新连接）、两轮落在同一 server 连接、
 /// 以及那条连接上确实已经有缓存的预编译语句。
+///
+/// 「两轮落在同一 server 连接」这一条不是必然的：transaction 模式下客户端连接
+/// 与 server 连接解耦，本文件里 R3 与本条同时在跑（同一进程并发），它们共享
+/// PgBouncer 的 server 池，第二轮取样可能落到另一条连接上 —— 与 R3 同形，
+/// 所以这里也循环到真的命中复用为止，而不是一次取样就断言（见 §四 第 2 条）。
 #[tokio::test]
 async fn r4_prepared_statement_reuse_returns_the_second_tenant() {
     let admin = PgPoolOptions::new()
@@ -217,10 +222,28 @@ async fn r4_prepared_statement_reuse_returns_the_second_tenant() {
     support::assert_role(&pool, "app_user").await;
     support::assert_not_bypassrls(&pool).await;
 
-    let (first, pid1, cached1) = sample(&pool, a).await;
-    let (second, pid2, cached2) = sample(&pool, b).await;
-    // 第三次回到 A：证明这不是「只有第一次对」，也不是某种一次性的切换。
-    let (third, _, _) = sample(&pool, a).await;
+    // 循环到两轮取样真的落在同一条 server 连接上。没命中的那一轮看起来和
+    // 通过没有区别，所以「命中复用」本身要断言（文件头第 2 条）。
+    // 取样都是只读查询，重跑无副作用。
+    const ROUNDS: usize = 20;
+    let mut hit = None;
+    for _ in 0..ROUNDS {
+        let (first, pid1, cached1) = sample(&pool, a).await;
+        let (second, pid2, cached2) = sample(&pool, b).await;
+        if pid1 != pid2 {
+            continue; // 落在别的 server 连接上，这一轮不算数
+        }
+        // 第三次回到 A：证明这不是「只有第一次对」，也不是某种一次性的切换。
+        let (third, _, _) = sample(&pool, a).await;
+        hit = Some((first, second, third, cached1, cached2));
+        break;
+    }
+    let (first, second, third, cached1, cached2) = hit.unwrap_or_else(|| {
+        panic!(
+            "{ROUNDS} 轮都没让两轮取样落在同一条 server 连接上 —— \
+                本测试没验到语句复用（检查是否有别的连接在和它抢 server 池）"
+        )
+    });
 
     pool.close().await;
     sqlx::query("DELETE FROM tenants WHERE name LIKE 'r4-%'")
@@ -233,12 +256,6 @@ async fn r4_prepared_statement_reuse_returns_the_second_tenant() {
     // 下面的 assert_ne 会因为「两边都是空」而无意义地绿。
     assert_eq!(first, vec!["kw-r4-a".to_string()], "A 看到的不对");
     assert_eq!(second, vec!["kw-r4-b".to_string()], "B 看到的不对");
-    // 自检：两轮真的落在同一条 server 连接上。不同连接的话「语句缓存被跨租户
-    // 复用」这个前提根本不成立，测试测的是别的东西。
-    assert_eq!(
-        pid1, pid2,
-        "两轮落在了不同的 server 连接上（{pid1} vs {pid2}）—— 本测试没验到语句复用"
-    );
     // 自检：那条连接上确实有缓存下来的预编译语句。实测第二轮起 PgBouncer
     // 会把 `PGBOUNCER_*` 那些留在 server 连接上，所以这个数不会是 0；
     // 若哪天它变成 0（比如 MAX_PREPARED_STATEMENTS 被改掉），这条测试

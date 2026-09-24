@@ -48,10 +48,11 @@ async fn seed_two_tenants(admin: &AdminOnlyPool) -> (i64, i64) {
 
 /// R1 不设 `app.tenant_id` 直接查 → 报错，非 0 行。
 ///
-/// 这条同时是整套脚手架的自检：断言的后半段特意在**超级用户池**上跑同一个查询，
-/// 并要求它成功。两段合起来才证明受限角色池真的换了角色 ——
+/// 这条同时是整套脚手架的自检：断言的后半段特意在**注入的管理池**上跑同一个查询，
+/// 并要求它成功。管理池（`tgm_test`）在测试库上带恒真策略 `tgm_test_admin`，
+/// 所以它查得到；两段合起来才证明受限角色池真的换了角色 ——
 /// 只有前半段的话，一个连都连不上的池也会让它「通过」。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn r1_no_tenant_context_errors(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     support::assert_role(&app, "app_user").await;
@@ -71,12 +72,13 @@ async fn r1_no_tenant_context_errors(admin: PgPool) {
         "报错是 fail-loud 的，但文本不是预期的那条：{msg}"
     );
 
-    // 脚手架自检：同一个查询在超级用户池上必须成功。
+    // 脚手架自检：同一个查询在注入的管理池上必须成功
+    // （它带恒真策略，能看见所有行；换超级用户注入时这里是同样的自检）。
     // 它失败意味着表没建起来，上面那个 expect_err 是因为别的原因过的。
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM rules")
         .fetch_one(admin.raw())
         .await
-        .expect("超级用户查 rules 失败 —— 迁移没跑起来，上面那条断言是空的");
+        .expect("管理池查 rules 失败 —— 迁移没跑起来，上面那条断言是空的");
     assert_eq!(n, 0, "干净的测试库里 rules 应该是空的");
 }
 
@@ -84,7 +86,7 @@ async fn r1_no_tenant_context_errors(admin: PgPool) {
 ///
 /// 顺带验 USING：设了 A 的上下文只看得到 A 那一行。
 /// 两段一起才有意义 —— 只验 WITH CHECK 的话，一张空表也会让它通过。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn r2_cross_tenant_write_rejected(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     support::assert_role(&app, "app_user").await;
@@ -123,7 +125,7 @@ async fn r2_cross_tenant_write_rejected(admin: PgPool) {
 /// 带了 tenant_id，所以 A 插一个 B 已有的 word 应当成功。
 /// 若唯一约束漏了 tenant_id，这里会得到 duplicate key ——
 /// 而那个报错本身就是「B 有这个词」的 oracle，RLS 补不了。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn r8_unique_probe_no_oracle(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     support::assert_role(&app, "app_user").await;
@@ -156,7 +158,7 @@ async fn r8_unique_probe_no_oracle(admin: PgPool) {
 /// 这条验的是 GRANT 层而不是 RLS 层：0011 只给了 SELECT, INSERT。
 /// 所以报错应当是 permission denied，不是 row-level security policy ——
 /// 两者混淆会让「凭证不可篡改」这条保证落在错误的机制上。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn r22_consents_immutable(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     support::assert_role(&app, "app_user").await;
@@ -204,7 +206,7 @@ async fn r22_consents_immutable(admin: PgPool) {
 ///
 /// 注意 `TenantId` 只能从库里解码（eng/00 §4.1 没有 `From<i64>`），
 /// 所以下面那句 `query_scalar` 是必需的绕路，不是啰嗦。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn r5_no_leak_with_rls_disabled(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     support::assert_role(&app, "app_user").await;
@@ -223,10 +225,18 @@ async fn r5_no_leak_with_rls_disabled(admin: PgPool) {
     assert_eq!(with_rls, 1, "本租户应当只有 1 行");
 
     // 第二遍：关掉 RLS，只剩应用层那句 WHERE。
-    sqlx::query("ALTER TABLE keywords DISABLE ROW LEVEL SECURITY")
-        .execute(admin.raw())
-        .await
-        .expect("关 RLS 失败");
+    let mut admin_tx = admin.raw().begin().await.expect("开 admin 事务失败");
+    for sql in [
+        "SET ROLE tgm_owner",
+        "ALTER TABLE keywords DISABLE ROW LEVEL SECURITY",
+        "RESET ROLE",
+    ] {
+        sqlx::query(sql)
+            .execute(&mut *admin_tx)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` 失败：{e}"));
+    }
+    admin_tx.commit().await.expect("提交 RLS 变更失败");
 
     // 先确认 RLS 真的关掉了 —— 否则这一遍与第一遍没有区别，
     // 「第二遍也绿」这句话就是空的（与 audit-double-pass.sh 的判据同形）。
@@ -254,7 +264,7 @@ async fn r5_no_leak_with_rls_disabled(admin: PgPool) {
 /// 「带 `tenant_id` 的表上不存在普通视图与 `SECURITY DEFINER` 函数」，
 /// 那就是审计断言 A8。这里保留的是动态部分，防止有人补一条 owner 策略把 A8 绕开
 /// —— 补了之后 A8 仍绿（它只查对象存不存在），而泄漏是真的。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn r6_owner_paths_return_empty(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     support::assert_role(&app, "app_user").await;
@@ -309,7 +319,7 @@ async fn r6_owner_paths_return_empty(admin: PgPool) {
 ///
 /// 这不是把测试写松：把它写成「DB 会拦」才是假绿，因为 DB 确实不拦（本测试即证据），
 /// 而那样写出来的绿会让应用层那道检查看起来可以省。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn r19_db_does_not_block_demo_identity(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     support::assert_role(&app, "app_user").await;
@@ -362,7 +372,7 @@ async fn r19_db_does_not_block_demo_identity(admin: PgPool) {
 ///
 /// 与 R22 同形（都验 GRANT 层封死），成本近零，故按 §三 的分批一起写。
 /// 0011 对这张表是 `REVOKE ALL ... FROM app_user`。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn r13_console_sessions_denied(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     support::assert_role(&app, "app_user").await;
@@ -401,7 +411,7 @@ async fn r13_console_sessions_denied(admin: PgPool) {
 ///
 /// 反向那半条（普通表仍须被开 FORCE）也在这里：只验临时表能写的话，
 /// 把 0013 的判断放宽成「全都跳过」同样会绿 —— 那正是 0012 想防的形状。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn r24_event_trigger_skips_temp_tables(admin: PgPool) {
     let (app, _admin) = support::pools(admin).await;
     support::assert_role(&app, "app_user").await;
@@ -465,7 +475,7 @@ async fn r24_event_trigger_skips_temp_tables(admin: PgPool) {
 /// 是「发现重投」的机制，`ON CONFLICT DO NOTHING` 的 `INSERT 0 0` 是
 /// 「据此判定已处理，直接返回」的机制。两者都要验 —— 只验后者的话，
 /// 主键退化成 `(tenant_id, update_id)` 仍然会绿。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn r11_replayed_update_id_has_one_effect(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     support::assert_role(&app, "app_user").await;
@@ -591,7 +601,7 @@ async fn r11_replayed_update_id_has_one_effect(admin: PgPool) {
 /// 一部分，所以测试里显式断言它发生（`pg_stat_activity` 查等锁），
 /// 再提交第一个、放第二个过去。顺序执行两次 UPDATE 也会得到 1/0，
 /// 但那证明不了并发下成立。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn r18_concurrent_answers_only_one_advances(admin: PgPool) {
     let (_app, admin) = support::pools(admin).await;
     let auth = support::auth_pool(&admin).await;
@@ -626,8 +636,10 @@ async fn r18_concurrent_answers_only_one_advances(admin: PgPool) {
     // 事务 1 未提交，行锁还在。事务 2 的同一句应当阻塞。
     let auth2 = auth.clone();
     let nonce2 = nonce.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let second = tokio::spawn(async move {
         let mut t2 = auth2.begin().await.expect("开事务 2 失败");
+        started_tx.send(()).expect("通知事务 2 启动失败");
         let n = sqlx::query(SQL)
             .bind(&nonce2)
             .bind(5002_i64)
@@ -639,28 +651,15 @@ async fn r18_concurrent_answers_only_one_advances(admin: PgPool) {
         n
     });
 
-    // 断言它真的在等锁。没有这一句，`second` 可能在事务 1 提交之后才开始跑 ——
-    // 那就退化成顺序执行，而顺序执行同样得到 1/0，测试照绿。
-    let mut waited = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let blocked: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity
-             WHERE datname = current_database() AND wait_event_type = 'Lock'
-               AND query LIKE '%awaiting_confirm%'",
-        )
-        .fetch_one(admin.raw())
-        .await
-        .expect("查等锁失败");
-        if blocked > 0 {
-            waited = true;
-            break;
-        }
-    }
+    // 先确认事务 2 已经拿到连接，再确认它在事务 1 未提交时不会完成。
+    // 不查 pg_stat_activity：tgm_test 不能查看 auth_lookup 会话的等待详情。
+    started_rx.await.expect("事务 2 未启动");
+    let mut second = Box::pin(second);
     assert!(
-        waited,
-        "第二个应答没有阻塞在行锁上 —— 它可能还没开始，或者 UPDATE 没锁住那一行。\
-         两种情况下这条测试都退化成顺序执行，测不到并发"
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut second)
+            .await
+            .is_err(),
+        "第二个应答在第一个提交前就完成 —— 没有测到并发下的行锁等待"
     );
 
     t1.commit().await.expect("提交事务 1 失败");
@@ -707,7 +706,7 @@ async fn r18_concurrent_answers_only_one_advances(admin: PgPool) {
 /// 所以这里灌用 admin、查用 `auth_lookup` —— 查那一步同时验了
 /// `session_self_lookup` / `console_self_lookup` 两条策略真的让鉴权域读得到。
 /// 用 admin 查会绕过 RLS，那样连「会话对鉴权域可见」都没验到。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn r16_member_removal_kills_sessions(admin: PgPool) {
     let (_app, admin) = support::pools(admin).await;
     let auth = support::auth_pool(&admin).await;
@@ -787,7 +786,7 @@ async fn r16_member_removal_kills_sessions(admin: PgPool) {
 /// 而 `tgm audit-rls` 的 16 条**一条都不报红** —— A6 的判据是
 /// 「PUBLIC 策略或 qual 恒真」，这条策略两者都不是。
 /// 也就是说清单里那三条断言全绿时，这个洞仍然开着，只有这一条能抓到它。
-#[sqlx::test(migrations = "../../migrations")]
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn r12_auth_lookup_sees_only_own_membership(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     let auth = support::auth_pool(&admin).await;

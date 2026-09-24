@@ -1,9 +1,9 @@
 //! 隔离测试的连接脚手架。定义处是 docs/design/eng/03-测试策略.md §二。
 //!
-//! 本模块存在的唯一理由是 §零 发现 1：`#[sqlx::test]` 注入的 `PgPool` 走
-//! `DATABASE_URL`，而它要 `CREATE DATABASE`，所以那必然是超级用户 ——
-//! 超级用户即使在 FORCE 的表上、且完全不设 `app.tenant_id`，也能看到全部行。
-//! 用它跑隔离测试会「全绿但什么都没测到」。
+//! 本模块存在的唯一理由是：SQLx 需要一个能创建临时库的控制连接，
+//! 但隔离断言必须使用 `app_user` / `auth_lookup` 受限连接。测试控制角色
+//! `tgm_test` 不是超级用户、没有 BYPASSRLS，且被禁止连接生产库；它只负责
+//! 临时测试库的管理与受控种子操作。
 
 // Rust 的每个 integration test 文件是独立 crate，本模块会被各自编译一遍，
 // 每个 target 只用得到其中一部分 —— 所以 dead_code 在这里不代表「没人用」。
@@ -16,7 +16,7 @@
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-/// `sqlx::test` 注入的超级用户池。
+/// `sqlx::test` 注入的测试管理池。
 ///
 /// 包成 newtype 且**不实现 `Deref`**（eng/03 §2.1）：两个池的类型本来一样，
 /// 误用靠评审拦不住，包起来能让它不可编译。取用要显式写 `.raw()`，
@@ -24,14 +24,14 @@ use sqlx::{PgPool, Row};
 pub struct AdminOnlyPool(PgPool);
 
 impl AdminOnlyPool {
-    /// 只允许两种用途：跑 DDL 前置、以及断言的**事前/事后**取数。
+    /// 只允许两种用途：跑测试 DDL 前置、以及断言的**事前/事后**取数。
     /// 任何验证隔离的查询都不得用它 —— 用 [`app_pool`] 换到受限角色。
     pub fn raw(&self) -> &PgPool {
         &self.0
     }
 }
 
-/// 把 `sqlx::test` 的池收进 newtype，同时开出一个受限角色池。
+/// 把 SQLx 的测试管理池收进 newtype，同时开出一个受限角色池。
 ///
 /// 返回顺序刻意是 (受限, 管理)：测试里先拿到的那个是该用的那个。
 pub async fn pools(injected: PgPool) -> (PgPool, AdminOnlyPool) {
