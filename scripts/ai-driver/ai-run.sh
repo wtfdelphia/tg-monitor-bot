@@ -103,15 +103,21 @@ allowed_path() {
 }
 
 check_protected() {
-  local hits="" p f tracked untracked
-  # 两条来源：对基线的已跟踪改动 + 未跟踪新文件（git diff 看不见后者，
-  # 而往 scripts/ 里塞一个新脚本同样是改卡口）。
+  local hits="" p f tracked committed untracked
+  # 三条来源，各挡一个形状：
+  # 1 工作区对基线的已跟踪改动（未提交的现场）；
+  # 2 提交树对基线（HEAD）—— 执行器把改动 commit 掉再把工作区还原回基线时，
+  #   来源 1 输出为空、检查静默放行，而恶意提交随分支推进 PR（实测 git 2.34）。
+  #   工作区来源保留，两条并集才管住「提交与否」两个状态；
+  # 3 未跟踪新文件（git diff 看不见，往 scripts/ 里塞一个新脚本同样是改卡口）。
   #
   # 不吞 stderr：ref 解析不了时 git 把 fatal 写到 stderr、stdout 为空，
   # 吞掉就等于「检查静默放行」—— 本仓记过多次「验证手段坏掉时表现为通过」。
   for p in "${PROTECTED[@]}"; do
     tracked="$(git -C "$wt" diff --name-only "$REMOTE/$BASE" -- "$p")" \
       || die "保护路径检查失败（git diff $REMOTE/$BASE -- $p）—— 不放行，先修环境"
+    committed="$(git -C "$wt" diff --name-only "$REMOTE/$BASE" HEAD -- "$p")" \
+      || die "保护路径检查失败（git diff $REMOTE/$BASE HEAD -- $p）—— 不放行，先修环境"
     # 不带 --exclude-standard：该开关会尊重 .gitignore —— 往 .gitignore 加一行
     # 就能把要藏的文件从检查里抹掉（实测）。.gitignore 也在清单里挡「改规则」
     # 这一层，这里挡「藏文件」那一层；宁可把新增的 ignored 文件也报出来让人看，
@@ -121,7 +127,7 @@ check_protected() {
     while IFS= read -r f; do
       [ -z "$f" ] && continue
       allowed_path "$f" || hits="$hits$f"$'\n'
-    done <<< "$tracked"$'\n'"$untracked"
+    done <<< "$tracked"$'\n'"$committed"$'\n'"$untracked"
   done
   printf '%s' "$hits" | sort -u
 }
@@ -301,10 +307,21 @@ run_executor() {
 record_leftovers() {
   local sha
   [ -n "$(git -C "$wt" status --porcelain)" ] || return 0
-  # 残局只有未跟踪文件时 stash create 输出空（实测 git 2.34）—— 此时没有快照，
-  # 但残局本来就留在 worktree 里，worktree 也不被清理，所以不补机制。
+  # 残局只有未跟踪文件时 `stash create -u` 输出空（实测 git 2.34）—— 此时没有快照，
+  # 而下一轮取件会 `worktree remove --force` 把残局连 worktree 一起抹掉，
+  # 「残局留在 worktree 里」并不构成兜底。兜底：全部入暂存区后不带 -u 再造一次
+  # （实测 2.34：快照完整含未跟踪文件）。暂存区被动没有副作用：卡口与检查
+  # 都在本函数之后跑，读的是工作区与提交树。
   sha="$(git -C "$wt" stash create -u 2>/dev/null)"
-  [ -n "$sha" ] || return 0
+  if [ -z "$sha" ]; then
+    git -C "$wt" add -A
+    sha="$(git -C "$wt" stash create 2>/dev/null)"
+    # 拍完快照把索引还原：add -A 会把未跟踪文件吞进索引，
+    # check_protected 的未跟踪来源（ls-files --others）就看不见它们了（实测），
+    # 而本函数跑在保护路径检查之前。reset 不动工作区，残局原样留着。
+    git -C "$wt" reset -q
+  fi
+  [ -n "$sha" ] || { log "✗ 残局快照失败（stash create 输出为空）—— 残局仍在 $wt，人工检查"; return 0; }
   git -C "$wt" update-ref "refs/ai-leftovers/$TASK_ID-$TS" "$sha"
   log "未提交残局已快照到 refs/ai-leftovers/$TASK_ID-$TS（查看：git -C $wt stash show -p $sha）"
 }
@@ -395,6 +412,17 @@ if [ "$path" = "ok" ] && [ "$commits_ahead" = 0 ]; then
   path="no-commit"
 fi
 
+# 判据跑在工作区、推送的是提交树：执行器提交了坏代码、只在工作区里修好时，
+# 卡口绿验证的是工作区，PR 携带的却是坏的 HEAD 树 —— 绿与交付物不是同一棵树。
+# path: ok 要求两棵树一致（工作区干净）；其余出口本来就推分支保现场，不受此限。
+# 实测：工作区比对与提交树比对在「已提交又还原」形状下输出一空一非空。
+dirty_block=0
+if [ "$path" = "ok" ] && [ -n "$(git -C "$wt" status --porcelain)" ]; then
+  log "✗ 自述 path: ok 但工作区不干净 —— 卡口验证的不是被推送的树，判 blocked"
+  dirty_block=1
+  path="dirty-tree"
+fi
+
 # ── 推分支与 PR ─────────────────────────────────────────────────
 push_and_pr() {
   local title="$1" label="$2"
@@ -413,6 +441,9 @@ push_and_pr() {
       echo "改过之后跑出来的绿不携带信息（AGENTS.md §五 的机器判据）。"
     elif [ "$gates_ok" = 1 ]; then
       echo "卡口：驱动脚本本地全绿（scripts/ai-driver/ai-gates.sh），以本 PR 的 CI 为准。"
+      if [ "$dirty_block" = 1 ]; then
+        echo "注意：工作区不干净 —— 卡口验证的树与分支携带的树不一致，请勿合并。"
+      fi
     else
       echo "卡口：**本地未全绿**（见 logs/$TASK_ID.$TS.gates-$attempt.log），请勿合并，先看失败原因。"
     fi
@@ -460,6 +491,10 @@ case "$path" in
   no-commit)
     log "零提交，不推分支（没有东西可推）"
     set_status blocked "(自述 ok 但零提交)"
+    ;;
+  dirty-tree)
+    push_and_pr "$TASK_ID：工作区与提交树不一致，待人工处理" "受阻" || log "推送失败 —— 分支 $branch 只在本地"
+    set_status blocked "(自述 ok 但工作区不干净, branch: $branch)"
     ;;
   *)
     push_and_pr "$TASK_ID：未完成，待人工处理" "受阻" || log "推送失败 —— 分支 $branch 只在本地"

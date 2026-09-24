@@ -39,9 +39,13 @@ scripts/ai-driver/ai-loop.sh --max 1 --executor codex      # cron/systemd 的入
          worktree 共享主仓 target/（CARGO_TARGET_DIR），一次一个任务所以安全
 4 执行   提示词 = 任务文件全文 + AGENTS.md 指引 + 升级边界；
          执行器在自己的 worktree 里全权限跑（--dangerously-*），有超时；
-         未提交残局用 `stash create -u` 快照到本地 ref（不推远端），
-         **残局本身留在 worktree**：卡口照它跑，保护路径检查看得见它
-5 验证   先跑保护路径检查（PROTECTED 清单 + 任务声明的 allow-paths）：
+         未提交残局用 `stash create -u` 快照到本地 ref（不推远端）——
+         纯未跟踪残局 `stash create -u` 输出为空（实测），兜底是全部入暂存区
+         后不带 -u 再造一次；**残局本身留在 worktree**：卡口照它跑，
+         保护路径检查看得见它
+5 验证   先跑保护路径检查（PROTECTED 清单 + 任务声明的 allow-paths），
+         对基线取三条来源的并集：工作区已跟踪改动、提交树（HEAD）、
+         未跟踪新文件 —— 「提交掉再还原工作区」只骗得过第一条：
          命中即强制升级、**不跑卡口** —— 卡口脚本本身在保护清单里，
          被改过之后跑出来的绿不携带信息。这是 AGENTS.md §五 硬边界的
          机器判据，不依赖提示词自觉。清单还含 AGENTS.md / CLAUDE.md /
@@ -53,6 +57,9 @@ scripts/ai-driver/ai-loop.sh --max 1 --executor codex      # cron/systemd 的入
          path: ok 且卡口绿 且分支相对基线有提交 → 推分支 + 开 PR，状态 done
          自述 ok 但零提交 → 不推分支，状态 blocked（卡口跑在基线上必绿，
            这个绿不携带信息 —— 判据是 rev-list --count，不是 agent 自述）
+         自述 ok 但工作区不干净 → 推分支保现场，状态 blocked：
+           卡口验证的是工作区，推送的是提交树，两棵树不一致时绿不携带
+           推送物的信息（工作区干净 ⇔ 验证的树 = 推送的树）
          path: escalated 或发现提案文件 → 推分支 + 开提案 PR，状态 escalated
          其余 → 推分支保住现场，状态 blocked，PR 标题明示勿合
 7 回写   任务文件 status/last-run 在**主仓的 base 分支**原地更新
@@ -89,7 +96,8 @@ scripts/ai-driver/ai-loop.sh --max 1 --executor codex      # cron/systemd 的入
 7 本地工具链与 CI 的版本漂移：ci.yml 钉 `cargo-deny 0.19.1`、`sqlx-cli 0.9.0`，
   本地装什么跑什么（实测本机 cargo-deny 0.20.2）。漂移是「本地绿 / CI 红」
   的一条新来源，与边界 1 同源；要根治就在本地也按 ci.yml 的版本装。
-8 保护路径检查是对基线的 diff（已跟踪 + 未跟踪），判据是「任务改没改」，
+8 保护路径检查是对基线的 diff，三条来源并集（工作区、提交树、未跟踪），
+  判据是「任务改没改」，
   不是「清单里的文件现在对不对」—— 后者由 CI 的卡口自身保证。
   任务确需触碰时用任务文件的 `allow-paths:` 放行，放行责任在写任务的人。
 9 清单刻意不含 docs/plan/proposals/ 与 docs/plan/ponytail-debt.md：提示词

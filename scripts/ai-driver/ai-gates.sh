@@ -35,11 +35,16 @@ export TGM_DB_URL_OWNER="${TGM_DB_URL_OWNER:-postgres://postgres:pw@127.0.0.1:55
 
 # 版本漂移报警：ci.yml 钉了工具版本（本地装什么跑什么）。期望值从
 # ci.yml 解析，不硬编码 —— 硬编码就是再造一份会漂的清单。
-CI_DENY="$(sed -n 's/.*cargo install cargo-deny --locked --version \([0-9.]*\).*/\1/p' .github/workflows/ci.yml | head -1)"
-LOCAL_DENY="$(cargo deny --version 2>/dev/null | sed 's/[^0-9.]//g')"
-if [ -n "$CI_DENY" ] && [ "$LOCAL_DENY" != "$CI_DENY" ]; then
-  echo "⚠ cargo-deny 版本漂移：本地 $LOCAL_DENY，ci.yml 钉 $CI_DENY（见 README 已知边界 7）"
-fi
+# ci.yml 钉了两个：cargo-deny 与 sqlx-cli（README 已知边界 7 点名两者）。
+check_version_drift() {
+  local tool="$1" local_ver="$2" ci_ver
+  ci_ver="$(sed -n "s/.*cargo install $tool --locked --version \([0-9.]*\).*/\1/p" .github/workflows/ci.yml | head -1)"
+  if [ -n "$ci_ver" ] && [ "$local_ver" != "$ci_ver" ]; then
+    echo "⚠ $tool 版本漂移：本地 ${local_ver:-未安装}，ci.yml 钉 $ci_ver（见 README 已知边界 7）"
+  fi
+}
+check_version_drift cargo-deny "$(cargo deny --version 2>/dev/null | sed 's/[^0-9.]//g')"
+check_version_drift sqlx-cli "$(cargo sqlx --version 2>/dev/null | sed 's/[^0-9.]//g')"
 
 declare -a ORDER=(fmt clippy offline-build deny newtype migrate sqlx-check migrate-idempotent test audit-rls double-pass)
 declare -A NEED_DB=( [migrate]=1 [sqlx-check]=1 [migrate-idempotent]=1 [test]=1 [audit-rls]=1 [double-pass]=1 )
