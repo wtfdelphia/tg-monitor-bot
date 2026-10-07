@@ -17,6 +17,7 @@ license = "MIT"
 [workspace.dependencies]
 # 核心运行时
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
+rstest = "0.27"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
 

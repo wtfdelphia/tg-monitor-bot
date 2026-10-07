@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO account_leases\n            (identity_id, worker_id, fencing_token, heartbeat_at, expires_at)\n        VALUES ($1, $2, 1, clock_timestamp(), clock_timestamp() + interval '30 seconds')\n        ON CONFLICT (identity_id) DO UPDATE SET\n            worker_id = CASE\n                WHEN account_leases.expires_at < clock_timestamp() THEN EXCLUDED.worker_id\n                ELSE account_leases.worker_id\n            END,\n            fencing_token = CASE\n                WHEN account_leases.expires_at < clock_timestamp()\n                    THEN account_leases.fencing_token + 1\n                ELSE account_leases.fencing_token\n            END,\n            heartbeat_at = clock_timestamp(),\n            expires_at = clock_timestamp() + interval '30 seconds'\n        WHERE account_leases.expires_at < clock_timestamp()\n           OR account_leases.worker_id = EXCLUDED.worker_id\n        RETURNING fencing_token\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "fencing_token",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "account_leases",
+            "name": "fencing_token"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "bd4a6d2e7c271c004e05fc7919a6dfcf89b76aa5fcdc6ab71ad872dacdbd4b83"
+}

@@ -1,8 +1,8 @@
 //! ID newtype。定义处是 ../../docs/design/spec/05-安全与租户隔离.md §二，
 //! 构造路径的约束在 ../../docs/design/eng/00-工程约定.md §4.1。
 //!
-//! 本文件目前只落 `TenantId` —— 其余几个（`TenantEventId` / `TgChatId` /
-//! `SourceRef`）随用到它们的工作包进来，现在建了也没有调用点。
+//! 本文件目前落地 `TenantId` 与 `IdentityId` —— 其余几个
+//! （`TenantEventId` / `TgChatId` / `SourceRef`）随用到它们的工作包进来。
 
 /// 租户标识。
 ///
@@ -15,6 +15,20 @@
 pub struct TenantId(i64);
 
 impl TenantId {
+    /// 取出内部值，用于绑参。
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// Telegram 身份在数据库中的内部标识。
+///
+/// 与 `TenantId` 分开，避免把身份主键误当成租户主键传入 Repo。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct IdentityId(i64);
+
+impl IdentityId {
     /// 取出内部值，用于绑参。
     pub fn get(self) -> i64 {
         self.0

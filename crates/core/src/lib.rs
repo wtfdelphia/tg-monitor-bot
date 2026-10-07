@@ -7,7 +7,7 @@
 pub mod config;
 /// `AppError` 与 spec/07 §2.1 那 11 个错误码的映射（eng/00 §三）。
 pub mod error;
-/// ID newtype。`TenantId` 已落地，其余几个随用到它们的工作包进来。
+/// ID newtype。`TenantId` 与 `IdentityId` 已落地，其余几个随用到它们的工作包进来。
 pub mod ids;
 /// KEK 的 trait 与 `EnvKek`（eng/01 §三，ADR-0011/0012）。`KmsKek` 不在此 crate。
 pub mod kek;

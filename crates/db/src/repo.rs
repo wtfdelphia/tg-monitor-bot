@@ -5,9 +5,10 @@
 //! R5 断言「关掉 RLS 后应用层仍不泄漏」，而「应用层」指的就是下面那句
 //! 显式的 `WHERE tenant_id = $1`。没有它，R5 无从谈起。
 //!
-//! 其余 Repo 方法随各自的工作包进来。
+//! 租约方法在本文件中直接使用 PostgreSQL 的原子写法，避免把抢占判断拆成
+//! “先查再写”的竞态窗口。
 
-use tgm_core::ids::TenantId;
+use tgm_core::ids::{IdentityId, TenantId};
 
 use crate::tenant::tenant_tx;
 use sqlx::PgPool;
@@ -38,4 +39,102 @@ pub async fn count_keywords(pool: &PgPool, t: TenantId) -> Result<i64, sqlx::Err
         })
     })
     .await
+}
+
+/// 获取身份租约。
+///
+/// 首次获取从 token 1 开始；有效租约由同一 worker 再次获取时只刷新时间，
+/// 不改变 token；过期租约由任意 worker 接管时递增 token。有效租约由其他
+/// worker 持有时返回 `None`，不等待也不报错。
+pub async fn acquire_lease(
+    pool: &PgPool,
+    identity_id: IdentityId,
+    worker_id: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"
+        INSERT INTO account_leases
+            (identity_id, worker_id, fencing_token, heartbeat_at, expires_at)
+        VALUES ($1, $2, 1, clock_timestamp(), clock_timestamp() + interval '30 seconds')
+        ON CONFLICT (identity_id) DO UPDATE SET
+            worker_id = CASE
+                WHEN account_leases.expires_at < clock_timestamp() THEN EXCLUDED.worker_id
+                ELSE account_leases.worker_id
+            END,
+            fencing_token = CASE
+                WHEN account_leases.expires_at < clock_timestamp()
+                    THEN account_leases.fencing_token + 1
+                ELSE account_leases.fencing_token
+            END,
+            heartbeat_at = clock_timestamp(),
+            expires_at = clock_timestamp() + interval '30 seconds'
+        WHERE account_leases.expires_at < clock_timestamp()
+           OR account_leases.worker_id = EXCLUDED.worker_id
+        RETURNING fencing_token
+        "#,
+        identity_id.get(),
+        worker_id
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// 续租身份。
+///
+/// 续租必须同时匹配身份、worker 和 fencing token，且旧租约已经过期时不允许
+/// 复活。返回 `false` 表示当前 worker 已失去租约，调用方不得重试续租。
+pub async fn renew_lease(
+    pool: &PgPool,
+    identity_id: IdentityId,
+    worker_id: &str,
+    fencing_token: i64,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query!(
+        r#"
+        UPDATE account_leases
+           SET heartbeat_at = clock_timestamp(),
+               expires_at = clock_timestamp() + interval '30 seconds'
+         WHERE identity_id = $1
+           AND worker_id = $2
+           AND fencing_token = $3
+           AND expires_at > clock_timestamp()
+        RETURNING fencing_token
+        "#,
+        identity_id.get(),
+        worker_id,
+        fencing_token
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(updated.is_some())
+}
+
+/// 主动释放身份租约。
+///
+/// 不删除行，而是立即过期并保留 fencing token。这样下一次接管仍会递增 token，
+/// 不会因为删除后重新插入而让旧 worker 的 token 再次有效。
+pub async fn release_lease(
+    pool: &PgPool,
+    identity_id: IdentityId,
+    worker_id: &str,
+    fencing_token: i64,
+) -> Result<bool, sqlx::Error> {
+    let released = sqlx::query!(
+        r#"
+        UPDATE account_leases
+           SET expires_at = clock_timestamp()
+         WHERE identity_id = $1
+           AND worker_id = $2
+           AND fencing_token = $3
+        RETURNING fencing_token
+        "#,
+        identity_id.get(),
+        worker_id,
+        fencing_token
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(released.is_some())
 }
