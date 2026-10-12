@@ -50,7 +50,7 @@ const LOGIN_PAGE: &str = r###"<!doctype html>
 <title>TGM 登录</title>
 <style>
 :root{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#172033;background:#f5f7fb}
-body{margin:0;min-height:100vh;display:grid;place-items:center}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center}
 .card{width:min(440px,calc(100% - 32px));background:#fff;border:1px solid #dfe5ef;border-radius:16px;padding:32px;box-shadow:0 14px 40px #17203314}
 h1{margin:0 0 8px;font-size:28px}p{color:#5d687b;line-height:1.6}
 button,a.button{display:block;width:100%;box-sizing:border-box;border:0;border-radius:10px;padding:12px 16px;margin-top:12px;font:inherit;text-align:center;text-decoration:none;cursor:pointer}
@@ -136,17 +136,18 @@ const CONSOLE_PAGE: &str = r###"<!doctype html>
 *{box-sizing:border-box}body{margin:0}.layout{display:flex;min-height:100vh}
 .nav{width:220px;background:#172033;color:#dbe5ff;padding:24px 16px}.brand{font-size:20px;font-weight:700;margin:0 8px 24px}
 .nav a{display:block;color:#cbd5e1;text-decoration:none;padding:10px 12px;border-radius:8px;margin:4px 0}.nav a:hover{background:#253454;color:#fff}
-.main{flex:1;padding:32px;max-width:1280px}.top{display:flex;justify-content:space-between;gap:16px;align-items:start}.top h1{margin:0 0 6px}
+.main{flex:1;min-width:0;padding:32px;max-width:1280px}.top{display:flex;justify-content:space-between;gap:16px;align-items:start;flex-wrap:wrap}.top h1{margin:0 0 6px}
 .muted{color:#687386}.card{background:#fff;border:1px solid #dfe5ef;border-radius:12px;padding:20px;margin-top:24px}
 .toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}.toolbar form{margin:0}
-button,input,select,textarea{font:inherit;border:1px solid #cbd5e1;border-radius:8px;padding:9px 10px}
+button,input,select,textarea{font:inherit;border:1px solid #cbd5e1;border-radius:8px;padding:9px 10px;max-width:100%;min-width:0}
 button{cursor:pointer;background:#2563eb;color:#fff;border-color:#2563eb}.secondary{background:#eef2ff;color:#1e40af;border-color:#c7d2fe}.danger-button{background:#fff1f2;color:#b91c1c;border-color:#fecdd3}
-table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 8px;border-bottom:1px solid #eef2f7;vertical-align:top}th{font-size:13px;color:#687386}
-form.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}label{display:grid;gap:6px;font-size:14px;color:#4b5563}
+.table-scroll{max-width:100%;overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 8px;border-bottom:1px solid #eef2f7;vertical-align:top}th{font-size:13px;color:#687386}
+form.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:14px}label{display:grid;gap:6px;font-size:14px;color:#4b5563}
 .full{grid-column:1/-1}.notice{padding:12px;border-radius:8px;background:#eff6ff;color:#1e40af}.danger{color:#b91c1c}.empty{color:#687386;padding:20px 0}
 .actions{display:flex;gap:6px;flex-wrap:wrap}.actions button{padding:6px 9px;font-size:13px}.inline-form{display:grid;grid-template-columns:repeat(2,minmax(120px,1fr));gap:6px;margin-top:8px}
 details summary{cursor:pointer;color:#1e40af}.status-ok{color:#15803d}.status-warn{color:#b45309}.status-off{color:#64748b}
 pre{white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:700px){.layout{flex-direction:column}.nav{width:100%;padding:16px}.brand{margin-bottom:8px}.nav a{display:inline-block;margin:0}.main{padding:16px}.card{padding:16px}.inline-form{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -232,7 +233,7 @@ function bindSessionControls(){
   open.addEventListener('click',async()=>{open.disabled=true;try{await sessions()}catch(error){showSessionError(error)}finally{open.disabled=false}});
   logout.addEventListener('click',async()=>{if(!window.confirm('退出当前登录？'))return;logout.disabled=true;try{await sessionWriteApi('/auth/logout','POST');window.location.href='/login'}catch(error){showError(error)}finally{logout.disabled=false}});
 }
-function renderTable(headers,rows){return '<table><thead><tr>'+headers.map(value=>'<th>'+value+'</th>').join('')+'</tr></thead><tbody>'+rows.join('')+'</tbody></table>'}
+function renderTable(headers,rows){return '<div class="table-scroll" tabindex="0" role="region" aria-label="可横向滚动的数据表"><table><thead><tr>'+headers.map(value=>'<th>'+value+'</th>').join('')+'</tr></thead><tbody>'+rows.join('')+'</tbody></table></div>'}
 function identityStatus(status){const cls=status==='online'?'status-ok':status==='offline'?'status-off':'status-warn';return '<span class="'+cls+'">'+escapeHtml(status)+'</span>'}
 function targetStatus(item){return item.enabled?'<span class="status-ok">启用</span>':'<span class="status-off">停用</span>'}
 function readOnlyNotice(){return '<div id="console-readonly-notice" class="notice">当前角色为只读，仅可查看数据；写操作需要租户所有者或管理员。</div>'}
