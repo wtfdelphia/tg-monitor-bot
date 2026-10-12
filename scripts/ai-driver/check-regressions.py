@@ -88,6 +88,42 @@ class Regressions(unittest.TestCase):
         return self.bash(source, 'PROTECTED=(AGENTS.md CLAUDE.md newline-link scripts); '
                          'protected_tree_mismatches "$PRIMARY" HEAD', expected)
 
+    def test_pr_reference_lookup_is_exact_and_fails_closed(self):
+        base_commit = "a" * 40
+        head_commit = "b" * 40
+        expected_refs = f"dev\t{base_commit}\t{head_commit}"
+        trace = self.root / "gh-call.json"
+        self.env.update(BASE="dev", BASE_COMMIT=base_commit, GH_CALL=str(trace))
+        source = definitions(DRIVER, "verify_pr_refs")
+        source += '\nlog() { printf "%s\\n" "$*" >&2; }\n'
+        source += '''
+gh() {
+  printf '%s\\n' "$*" > "$GH_CALL"
+  printf '%s' "$PR_REFS_RESULT"
+  return "$PR_REFS_STATUS"
+}
+'''
+        cases = [
+            (expected_refs, 0, 0),
+            (f"main\t{base_commit}\t{head_commit}", 0, 1),
+            (f"dev\t{'c' * 40}\t{head_commit}", 0, 1),
+            (f"dev\t{base_commit}\t{'c' * 40}", 0, 1),
+            ("", 0, 1),
+            (f"dev\t{base_commit}\t", 0, 1),
+            (expected_refs + "\nextra", 0, 1),
+            (expected_refs, 17, 1),
+        ]
+        for actual, status, expected in cases:
+            with self.subTest(actual=actual, status=status):
+                self.env.update(PR_REFS_RESULT=actual, PR_REFS_STATUS=str(status))
+                self.bash(source, f'verify_pr_refs https://github.com/example/repo/pull/1 {head_commit}',
+                          expected=expected)
+        self.assertIn("api graphql", trace.read_text())
+        self.assertIn("baseRefName baseRefOid headRefOid", trace.read_text())
+        publisher = definitions(DRIVER, "push_and_pr")
+        self.assertIn('verify_pr_refs "$pr_url" "$push_head" || return 1', publisher)
+        self.assertNotIn("gh pr view", publisher)
+
     def test_protected_paths_compare_raw_bytes_and_types(self):
         self.assertEqual(self.protected().stdout, "")
         agent = self.repo / "AGENTS.md"
@@ -212,8 +248,10 @@ class Regressions(unittest.TestCase):
             "with open(os.environ['REGRESSION_TRACE'], 'a') as output:\n"
             "    output.write(json.dumps({'tool': os.path.basename(sys.argv[0]), "
             "'args': sys.argv[1:], 'env': dict(os.environ)}) + '\\n')\n"
+            "if os.environ.get('REGRESSION_FAIL_TOOL') == os.path.basename(sys.argv[0]) "
+            "and os.environ.get('REGRESSION_FAIL_ARGS') == json.dumps(sys.argv[1:]): sys.exit(29)\n"
         )
-        for tool in ("cargo", "psql"):
+        for tool in ("cargo", "psql", "python3"):
             target = bindir / tool
             target.write_text(launcher)
             target.chmod(0o755)
@@ -234,15 +272,17 @@ class Regressions(unittest.TestCase):
 
     def test_gate_order_modes_and_schema_defaults(self):
         order = re.search(r'ORDER=\((.*?)\)', GATES.read_text()).group(1).split()
+        static = ["fmt", "clippy", "offline-build", "deny", "newtype", "driver-regressions"]
+        self.assertEqual(order, [*static, "migrate", "sqlx-check", "migrate-idempotent", "test", "audit-rls", "double-pass"])
         for args, selected in (
             ((), order),
-            (("--static-only",), order[:5]),
-            (("--no-db",), order[:5]),
-            (("--task-only",), [*order[:5], "sqlx-check", "test"]),
+            (("--static-only",), static),
+            (("--no-db",), static),
+            (("--task-only",), [*static, "sqlx-check", "test"]),
             (("--trusted-db-only",), ["migrate", "migrate-idempotent", "audit-rls", "double-pass"]),
-            (("--from", "migrate"), order[5:]),
+            (("--from", "migrate"), order[len(static):]),
             (("--task-only", "--from", "sqlx-check"), ["sqlx-check", "test"]),
-            (("--from", "test"), order[8:]),
+            (("--from", "test"), order[order.index("test"):]),
         ):
             with self.subTest(args=args):
                 result, events = self.gate_trace(*args)
@@ -262,10 +302,26 @@ class Regressions(unittest.TestCase):
                     if event["tool"] == "cargo" and event["args"][:1] in (["sqlx"], ["test"], ["fmt"], ["clippy"], ["build"], ["deny"]):
                         self.assertNotIn("TGM_DB_URL_OWNER", event["env"])
                         self.assertNotIn("TGM_TASK_SCHEMA_OWNER_DATABASE_URL", event["env"])
+                    if event["args"] == ["run", "--quiet", "--bin", "tgm", "--", "openapi", "--check"] or event["tool"] == "python3":
+                        self.assertNotIn("DATABASE_URL", event["env"])
+                        self.assertNotIn("TGM_DB_URL_OWNER", event["env"])
+                        self.assertNotIn("TGM_TASK_SCHEMA_OWNER_DATABASE_URL", event["env"])
         for args in (("--from", "invalid"), ("--static-only", "--from", "test"),
                      ("--task-only", "--from", "migrate"), ("--trusted-db-only", "--from", "test"),
                      ("--task-only", "--no-db")):
             self.gate_trace(*args, expected=2)
+
+    def test_driver_failure_stops_the_gate_chain(self):
+        arguments = ["scripts/ai-driver/check-regressions.py"]
+        result, events = self.gate_trace("--static-only", expected=29, overrides={
+            "REGRESSION_FAIL_TOOL": "python3",
+            "REGRESSION_FAIL_ARGS": json.dumps(arguments),
+        })
+        self.assertEqual(events[-1]["args"], arguments)
+        self.assertNotIn("静态卡口通过", result.stdout)
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        static_job = workflow.split("  static:", 1)[1].split("  database:", 1)[0]
+        self.assertIn("python3 scripts/ai-driver/check-regressions.py", static_job)
 
     def test_explicit_schema_and_control_overrides(self):
         _, events = self.gate_trace("--task-only", "--from", "sqlx-check", overrides={
@@ -387,7 +443,7 @@ class Regressions(unittest.TestCase):
                     for line in compiled.stdout.splitlines()
                     if (event := json.loads(line)).get("executable") and event.get("profile", {}).get("test")]
         self.assertTrue(binaries)
-        plan = GATES.read_text().split("run_gate static fmt", 1)[1].split("echo \"── 跳过 openapi", 1)[0]
+        plan = GATES.read_text().split("run_gate static fmt", 1)[1].split('\ncase "$MODE" in', 1)[0]
         plan = "run_gate static fmt" + plan
         plan = "\n".join(line for line in plan.splitlines() if
                          line.startswith(("run_gate trusted migrate cargo", "run_gate task test ")))

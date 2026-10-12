@@ -36,8 +36,6 @@ services:
     ports: ["56379:6379"]
 
   minio:                                  # 媒体中转目标
-    # 偏离 eng/02 §一：该文写的 minio/minio 在 Docker Hub 已不存在
-    # （pull access denied / repository does not exist），官方现发布于 quay.io
-    image: quay.io/minio/minio
+    image: ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9
     command: server /data
     ports: ["59000:9000"]
