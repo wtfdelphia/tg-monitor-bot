@@ -8,6 +8,7 @@
 
 pub mod bot_console;
 pub mod bot_gateway;
+pub mod console;
 pub mod console_login;
 pub mod control;
 pub mod delivery;

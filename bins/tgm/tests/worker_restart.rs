@@ -94,6 +94,26 @@ async fn wait_for_progress(
     }
 }
 
+async fn wait_for_worker_disconnect(pool: &PgPool) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let connections: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE datname = current_database()
+                AND application_name = 'tgm-restart-regression'",
+        )
+        .fetch_one(pool)
+        .await?;
+        if connections == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("强杀后数据库仍有 {connections} 个 worker 连接");
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn seed_event(
     pool: &PgPool,
     receiver_identity_id: IdentityId,
@@ -142,7 +162,9 @@ async fn fanout_process_recovers_partial_work_after_hard_kill(admin: PgPool) -> 
         .fetch_one(&app)
         .await?;
     assert_eq!(current_user, "app_user");
-    let app_url = format!("postgres://app_user:apw@127.0.0.1:55432/{database}");
+    let app_url = format!(
+        "postgres://app_user:apw@127.0.0.1:55432/{database}?application_name=tgm-restart-regression&options=-c%20client_connection_check_interval%3D100ms"
+    );
     let tenant = sqlx::query_scalar::<_, TenantId>(
         "INSERT INTO tenants (name, owner_user_id)
          VALUES ('restart-matching-tenant', 2001) RETURNING id",
@@ -182,6 +204,8 @@ async fn fanout_process_recovers_partial_work_after_hard_kill(admin: PgPool) -> 
     let mut first_worker = WorkerProcess::start(&app_url)?;
     wait_for_progress(&app, tenant, event.id, &mut first_worker, false).await?;
     first_worker.kill_and_wait()?;
+    wait_for_worker_disconnect(&app).await?;
+    assert_eq!(event_progress(&app, tenant, event.id).await?, (false, 1));
     checkpoint_blocker.rollback().await?;
     assert_eq!(event_progress(&app, tenant, event.id).await?, (false, 1));
 

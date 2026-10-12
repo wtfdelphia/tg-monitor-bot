@@ -4300,6 +4300,7 @@ pub fn admin_openapi_json() -> Result<String, serde_json::Error> {
 
 pub fn router(state: ControlPlaneState) -> Router {
     Router::new()
+        .merge(crate::console::route())
         .merge(crate::bot_console::route(state.clone()))
         .route(
             "/auth/oidc/start",
