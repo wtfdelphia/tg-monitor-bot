@@ -54,8 +54,15 @@ KEK 的两种实现怎么共存。
 | `TGM_OIDC_BOT_ID` | control-plane | `id_token.aud` 的期望值 |
 | `TGM_OIDC_ALG` | control-plane | **验签算法从这里读，不从 token header 读** |
 | `TGM_OIDC_REDIRECT_URL` | control-plane | 必须与 BotFather 登记的白名单一致 |
+| `TGM_OIDC_CLIENT_SECRET` | control-plane | Telegram OIDC token exchange 的 Client Secret，只能由 Secret 注入 |
 | `TGM_CONTROL_BOT_TOKEN` | control-plane | 控制 Bot 的 token（平台自己的，非租户凭据） |
+| `TGM_CONTROL_BOT_SECRET_TOKEN` | control-plane | 控制 Bot Webhook 的 `secret_token`，只允许 `A-Za-z0-9_-`，长度 1–256 |
+| `TGM_CONTROL_BOT_IDENTITY_ID` | control-plane | 控制 Bot Webhook 使用的 `identities.id` |
+| `TGM_CONTROL_BOT_USERNAME` | control-plane | 控制 Bot 的公开 username，用于生成控制台扫码深链 |
 | `TGM_LISTEN_ADDR` | control-plane | 默认 `127.0.0.1:8080`，见下方 |
+| `TGM_DATA_BOT_SECRET_TOKEN` | bot-gateway | 数据 Bot Webhook 的 `secret_token`，只允许 `A-Za-z0-9_-`，长度 1–256 |
+| `TGM_DATA_BOT_IDENTITY_ID` | bot-gateway | 接收该 Webhook 的 `identities.id`，必须指向 `kind='bot'` 的身份 |
+| `TGM_BOT_GATEWAY_LISTEN_ADDR` | bot-gateway | 默认 `127.0.0.1:8081`，只监听反向代理内侧 |
 
 > **`TGM_LISTEN_ADDR` 默认绑回环，不绑 `0.0.0.0`。**
 > 控制面自身**不做** TLS 终止与公网暴露，那是反向代理的职责

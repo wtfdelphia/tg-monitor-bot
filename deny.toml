@@ -20,6 +20,9 @@ allow = [
     "Unlicense",                       # aho-corasick / memchr / byteorder 的双许可之一
     "Zlib",                            # foldhash（唯一单一 Zlib 的包）、tinyvec
     "BSL-1.0",                         # whoami 三选一之一
+    "BSD-3-Clause",                    # matchit（axum 的路由依赖）
+    "ISC",                             # rustls/ring 的传递依赖
+    "CDLA-Permissive-2.0",             # webpki-roots 的传递依赖
 ]
 
 # 刻意不列入的项，写清楚免得下次有人「顺手加上」：
@@ -29,6 +32,8 @@ allow = [
 #   GPL-*/AGPL-*        服务端 copyleft，与闭源自运营冲突，一旦出现必须人来决定
 #   SSPL/BUSL/Elastic   非 OSI，MinIO 生态里常见（MinIO 自身是 AGPL），
 #                       但我们只用它的 S3 协议端，不链它的代码
+#   ISC / CDLA-Permissive-2.0 已明确纳入上方白名单，仅用于当前 rustls
+#   TLS 依赖链；未知许可证仍保持拒绝。
 
 [bans]
 multiple-versions = "warn"

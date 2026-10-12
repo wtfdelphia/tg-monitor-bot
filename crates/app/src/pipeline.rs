@@ -1,0 +1,427 @@
+use std::collections::HashMap;
+
+use sqlx::PgPool;
+use std::time::Duration;
+use tgm_core::error::AppError;
+use tgm_core::ids::TenantId;
+use tgm_db::repo::{
+    DeliveryTaskInput, DeliveryTaskWrite, RuleConditionRecord, RuleRecord, TenantEventRecord,
+    enqueue_delivery_tasks, fanout_canonical_event, list_all_active_tenants,
+    list_unfanned_canonical_event_ids, list_unprocessed_tenant_event_ids, load_enabled_rules,
+    load_tenant_event, mark_canonical_event_fanned_out,
+};
+use tokio::sync::watch;
+
+const MIN_WORKER_RETRY_DELAY: Duration = Duration::from_millis(100);
+const MAX_WORKER_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+use crate::rule::{
+    KeywordMatchType, Rule, RuleAction, RuleCondition, RuleConditionKind, RuleEvent, evaluate_rules,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FanoutWorkerConfig {
+    pub poll_interval: Duration,
+    pub event_batch_size: i64,
+}
+
+impl Default for FanoutWorkerConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(1),
+            event_batch_size: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FanoutRunOutcome {
+    pub event_count: usize,
+    pub tenant_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanoutWorkerExit {
+    Shutdown,
+}
+
+pub struct FanoutWorker {
+    pool: PgPool,
+    config: FanoutWorkerConfig,
+}
+
+impl FanoutWorker {
+    pub fn new(pool: PgPool, config: FanoutWorkerConfig) -> Self {
+        Self { pool, config }
+    }
+
+    pub async fn run(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<FanoutWorkerExit, AppError> {
+        let mut retry_delay = self.config.poll_interval;
+        loop {
+            if *shutdown.borrow() {
+                return Ok(FanoutWorkerExit::Shutdown);
+            }
+
+            let outcome = match run_fanout_once(&self.pool, self.config.event_batch_size).await {
+                Ok(outcome) => {
+                    retry_delay = self.config.poll_interval;
+                    outcome
+                }
+                Err(error) if is_retryable_worker_error(&error) => {
+                    tracing::warn!(
+                        error = %error,
+                        retry_after_ms = retry_delay.as_millis(),
+                        "fanout worker 数据库操作失败，将退避重试"
+                    );
+                    if !wait_for_worker_retry(&mut shutdown, retry_delay).await {
+                        return Ok(FanoutWorkerExit::Shutdown);
+                    }
+                    retry_delay = next_worker_retry_delay(retry_delay, self.config.poll_interval);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if outcome.event_count > 0 {
+                continue;
+            }
+
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(FanoutWorkerExit::Shutdown);
+                    }
+                }
+                _ = tokio::time::sleep(self.config.poll_interval) => {}
+            }
+        }
+    }
+}
+
+pub async fn run_fanout_once(
+    pool: &PgPool,
+    event_batch_size: i64,
+) -> Result<FanoutRunOutcome, AppError> {
+    if event_batch_size <= 0 {
+        return Err(AppError::ConditionInvalid(
+            "worker 批大小必须为正数".to_owned(),
+        ));
+    }
+
+    let event_ids = list_unfanned_canonical_event_ids(pool, event_batch_size).await?;
+    let mut tenant_count = 0;
+    for event_id in &event_ids {
+        let tenants = list_all_active_tenants(pool).await?;
+        tenant_count += tenants.len();
+        for tenant in tenants {
+            fanout_canonical_event(pool, tenant, *event_id).await?;
+        }
+        mark_canonical_event_fanned_out(pool, *event_id).await?;
+    }
+
+    Ok(FanoutRunOutcome {
+        event_count: event_ids.len(),
+        tenant_count,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct RuleProcessingResult {
+    pub processed: bool,
+    pub matched_rule_ids: Vec<i64>,
+    pub tasks: Vec<DeliveryTaskWrite>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuleWorkerConfig {
+    pub poll_interval: Duration,
+    pub event_batch_size: i64,
+}
+
+impl Default for RuleWorkerConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(1),
+            event_batch_size: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuleRunOutcome {
+    pub tenant_count: usize,
+    pub event_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleWorkerExit {
+    Shutdown,
+}
+
+pub struct RuleWorker {
+    pool: PgPool,
+    config: RuleWorkerConfig,
+}
+
+impl RuleWorker {
+    pub fn new(pool: PgPool, config: RuleWorkerConfig) -> Self {
+        Self { pool, config }
+    }
+
+    pub async fn run(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<RuleWorkerExit, AppError> {
+        let mut retry_delay = self.config.poll_interval;
+        loop {
+            if *shutdown.borrow() {
+                return Ok(RuleWorkerExit::Shutdown);
+            }
+
+            let outcome = match run_rule_once(&self.pool, self.config.event_batch_size).await {
+                Ok(outcome) => {
+                    retry_delay = self.config.poll_interval;
+                    outcome
+                }
+                Err(error) if is_retryable_worker_error(&error) => {
+                    tracing::warn!(
+                        error = %error,
+                        retry_after_ms = retry_delay.as_millis(),
+                        "rule worker 数据库操作失败，将退避重试"
+                    );
+                    if !wait_for_worker_retry(&mut shutdown, retry_delay).await {
+                        return Ok(RuleWorkerExit::Shutdown);
+                    }
+                    retry_delay = next_worker_retry_delay(retry_delay, self.config.poll_interval);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if outcome.event_count > 0 {
+                continue;
+            }
+
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(RuleWorkerExit::Shutdown);
+                    }
+                }
+                _ = tokio::time::sleep(self.config.poll_interval) => {}
+            }
+        }
+    }
+}
+
+fn is_retryable_worker_error(error: &AppError) -> bool {
+    matches!(error, AppError::Db(_))
+}
+
+fn next_worker_retry_delay(current: Duration, poll_interval: Duration) -> Duration {
+    let base = poll_interval.max(MIN_WORKER_RETRY_DELAY);
+    let current = current.max(base);
+    match current.checked_mul(2) {
+        Some(next) => next.min(MAX_WORKER_RETRY_DELAY),
+        None => MAX_WORKER_RETRY_DELAY,
+    }
+}
+
+async fn wait_for_worker_retry(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bool {
+    tokio::select! {
+        changed = shutdown.changed() => changed.is_ok() && !*shutdown.borrow(),
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
+pub async fn run_rule_once(
+    pool: &PgPool,
+    event_batch_size: i64,
+) -> Result<RuleRunOutcome, AppError> {
+    if event_batch_size <= 0 {
+        return Err(AppError::ConditionInvalid(
+            "worker 批大小必须为正数".to_owned(),
+        ));
+    }
+
+    let tenants = list_all_active_tenants(pool).await?;
+    let tenant_count = tenants.len();
+    let mut event_count = 0;
+    for tenant in tenants {
+        let event_ids = list_unprocessed_tenant_event_ids(pool, tenant, event_batch_size).await?;
+        for event_id in event_ids {
+            process_tenant_event(pool, tenant, event_id).await?;
+            event_count += 1;
+        }
+    }
+
+    Ok(RuleRunOutcome {
+        tenant_count,
+        event_count,
+    })
+}
+
+pub async fn process_tenant_event(
+    pool: &PgPool,
+    tenant: TenantId,
+    tenant_event_id: i64,
+) -> Result<RuleProcessingResult, AppError> {
+    let Some(event_record) = load_tenant_event(pool, tenant, tenant_event_id).await? else {
+        return Err(AppError::NotFound);
+    };
+    if event_record.processed {
+        return Ok(RuleProcessingResult {
+            processed: false,
+            matched_rule_ids: Vec::new(),
+            tasks: Vec::new(),
+        });
+    }
+
+    let rules_with_conditions = load_enabled_rules(pool, tenant).await?;
+    let event = to_rule_event(&event_record);
+    let mut rules = Vec::with_capacity(rules_with_conditions.len());
+    let mut raw_rules = HashMap::with_capacity(rules_with_conditions.len());
+    for (record, conditions) in rules_with_conditions {
+        let rule = to_rule(record.clone(), conditions)?;
+        raw_rules.insert(rule.id, record);
+        rules.push(rule);
+    }
+
+    let matches = if event_record.event_type == "MESSAGE_CREATED" {
+        evaluate_rules(&event, &rules)?
+    } else {
+        Vec::new()
+    };
+
+    let matched_keywords: Vec<String> = matches
+        .iter()
+        .map(|matched| matched.matched_keyword.clone())
+        .collect();
+    let tasks: Vec<DeliveryTaskInput> = matches
+        .iter()
+        .filter_map(|matched| {
+            raw_rules
+                .get(&matched.rule_id)
+                .map(|record| (matched, record))
+        })
+        .map(|(matched, record)| DeliveryTaskInput {
+            rule_id: matched.rule_id,
+            rule_version: matched.rule_version,
+            target_tg_chat_id: record.target_tg_chat_id,
+            sender_identity_id: record.sender_identity_id,
+            action: action_as_str(matched.action).to_string(),
+        })
+        .collect();
+    let writes =
+        enqueue_delivery_tasks(pool, tenant, tenant_event_id, &matched_keywords, &tasks).await?;
+
+    Ok(RuleProcessingResult {
+        processed: true,
+        matched_rule_ids: matches.iter().map(|matched| matched.rule_id).collect(),
+        tasks: writes,
+    })
+}
+
+fn to_rule_event(record: &TenantEventRecord) -> RuleEvent {
+    RuleEvent {
+        source_ref: record.source_ref,
+        media_type: record.media_type.clone(),
+        sender_id: record.sender_id,
+        text: record.text.clone(),
+        caption: record.caption.clone(),
+        file_name: record.file_name.clone(),
+        file_size: record.file_size,
+    }
+}
+
+pub(crate) fn to_rule(
+    record: RuleRecord,
+    conditions: Vec<RuleConditionRecord>,
+) -> Result<Rule, AppError> {
+    Ok(Rule {
+        id: record.id,
+        tenant_id: record.tenant_id,
+        keyword: crate::rule::RuleKeyword {
+            id: record.keyword_id,
+            word: record.keyword,
+            match_type: match record.keyword_match_type.as_str() {
+                "exact" => KeywordMatchType::Exact,
+                "regex" => KeywordMatchType::Regex,
+                other => {
+                    return Err(AppError::ConditionInvalid(format!(
+                        "暂不支持关键词匹配类型: {other}"
+                    )));
+                }
+            },
+        },
+        source_ref: record.source_ref,
+        media_type: record.media_type,
+        target_ref: record.target_ref,
+        action: parse_action(&record.action)?,
+        priority: record.priority,
+        stop_processing: record.stop_processing,
+        version: record.version,
+        enabled: record.enabled,
+        conditions: conditions
+            .into_iter()
+            .map(parse_condition)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn parse_action(value: &str) -> Result<RuleAction, AppError> {
+    match value {
+        "COPY" => Ok(RuleAction::Copy),
+        "FORWARD" => Ok(RuleAction::Forward),
+        "RESEND" => Ok(RuleAction::Resend),
+        other => Err(AppError::ConditionInvalid(format!("未知投递动作: {other}"))),
+    }
+}
+
+fn parse_condition(record: RuleConditionRecord) -> Result<RuleCondition, AppError> {
+    let kind = match record.kind.as_str() {
+        "exclude_word" => RuleConditionKind::ExcludeWord,
+        "file_name" => RuleConditionKind::FileName,
+        "size_min" => RuleConditionKind::SizeMin,
+        "size_max" => RuleConditionKind::SizeMax,
+        "sender" => RuleConditionKind::Sender,
+        "ext_allow" => RuleConditionKind::ExtAllow,
+        "ext_deny" => RuleConditionKind::ExtDeny,
+        other => return Err(AppError::ConditionInvalid(format!("未知规则条件: {other}"))),
+    };
+    Ok(RuleCondition {
+        kind,
+        value: record.value,
+    })
+}
+
+fn action_as_str(action: RuleAction) -> &'static str {
+    match action {
+        RuleAction::Copy => "COPY",
+        RuleAction::Forward => "FORWARD",
+        RuleAction::Resend => "RESEND",
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::{MAX_WORKER_RETRY_DELAY, MIN_WORKER_RETRY_DELAY, next_worker_retry_delay};
+    use std::time::Duration;
+
+    #[test]
+    fn retry_delay_starts_at_poll_interval_and_caps() {
+        assert_eq!(
+            next_worker_retry_delay(Duration::from_millis(1), Duration::from_secs(2)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            next_worker_retry_delay(Duration::from_millis(1), Duration::ZERO),
+            MIN_WORKER_RETRY_DELAY * 2
+        );
+        assert_eq!(
+            next_worker_retry_delay(MAX_WORKER_RETRY_DELAY, Duration::from_secs(1)),
+            MAX_WORKER_RETRY_DELAY
+        );
+    }
+}

@@ -1,12 +1,15 @@
 //! 单二进制多 subcommand（eng/00 §一）。7 个组件共用一个 bin，
 //! 靠 `--role` 区分进程角色 —— 首发部署形态就是单机跑多进程（ops/00）。
 //!
-//! 本文件目前只有命令骨架：每个子命令都还没有实现体。
-//! 骨架先落地是因为 eng/04 §四 的五条卡口里有三条要求 `tgm` 这个二进制存在。
+//! 迁移、RLS 审计、OpenAPI 导出以及已接入的 HTTP/worker 角色在这里汇合；
+//! 尚未接入的角色会明确失败，不伪装成成功启动。
 
 use clap::{Parser, Subcommand, ValueEnum};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tgm_core::config::Role as CoreRole;
 use tgm_core::kek::Kek;
+use tokio::sync::watch;
 
 #[derive(Parser)]
 #[command(name = "tgm", version, about = "Telegram 多租户内容监控与分发平台")]
@@ -75,27 +78,219 @@ impl From<&Role> for CoreRole {
     }
 }
 
-/// 未实现的子命令统一走这里，且**退出码是 0**。
-///
-/// 这是个有意的、且危险的选择，写清理由：eng/04 §四 的卡口清单要求
-/// `tgm audit-rls` 与 `tgm openapi --check` 可执行，而动工顺序第 6 步的判据是
-/// 「命令存在且退出 0」—— 真正的断言要到第 7 步才接活库。
-///
-/// 危险在于：这期间流水线里那两条是**绿的但什么都没验**，
-/// 正是 eng/04 §五 说的 "false sense of security"。所以提示打到 stderr 且
-/// 带 NOT IMPLEMENTED 字样，让人读日志时能看见 —— 但机器看不见。
-/// 第 7 步落地 audit-rls 之后，这个函数的调用点要同步减少；
-/// 减到零之前，「流水线全绿」这句话不携带信息。
-///
-/// 第 7 步进展：`audit-rls` 已接活库，从这里移出去了。
-/// `openapi --check` 也移出去了，但**不是因为实现了**：它在卡口清单里，
-/// 所以改成 `exit(1)`。恒 0 的退出码对 CI 来说与「通过」不可区分，
-/// 而这个函数恰恰只会把话说给人听。
-/// `migrate` 随后也移出去了（真接了库）。
-///
-/// 剩下两个调用点 —— `serve` 与 `openapi`（不带 `--check` 的那支）。
-fn not_implemented(what: &str) {
-    eprintln!("tgm: {what}: NOT IMPLEMENTED（骨架阶段，退出码 0 不代表校验通过）");
+fn unimplemented_serve_error(role: &Role) -> anyhow::Error {
+    anyhow::anyhow!(
+        "tgm: serve --role {}: NOT IMPLEMENTED（该角色尚未接入运行链，拒绝以成功状态退出）",
+        role.as_str()
+    )
+}
+
+async fn serve_control_plane() -> anyhow::Result<()> {
+    let app_url = std::env::var("TGM_DB_URL_APP")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_APP —— 启动期校验本应先拦住"))?;
+    let auth_url = std::env::var("TGM_DB_URL_AUTH")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_AUTH —— 控制面鉴权需要独立连接池"))?;
+    let oidc_bot_id = std::env::var("TGM_OIDC_BOT_ID")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_OIDC_BOT_ID —— 启动期校验本应先拦住"))?;
+    if oidc_bot_id.parse::<u64>().is_err() {
+        return Err(anyhow::anyhow!("TGM_OIDC_BOT_ID 必须是正整数"));
+    }
+    let oidc_alg = std::env::var("TGM_OIDC_ALG")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_OIDC_ALG —— 启动期校验本应先拦住"))?;
+    let oidc_alg = tgm_core::config::validate_oidc_alg(&oidc_alg)
+        .map_err(|error| anyhow::anyhow!("OIDC 配置无效：{error}"))?;
+    let oidc_redirect_url = std::env::var("TGM_OIDC_REDIRECT_URL")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_OIDC_REDIRECT_URL —— 启动期校验本应先拦住"))?;
+    let oidc_client_secret = std::env::var("TGM_OIDC_CLIENT_SECRET")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_OIDC_CLIENT_SECRET —— 启动期校验本应先拦住"))?;
+    if oidc_client_secret.is_empty() {
+        return Err(anyhow::anyhow!("TGM_OIDC_CLIENT_SECRET 不能为空"));
+    }
+    let bot_secret = std::env::var("TGM_CONTROL_BOT_SECRET_TOKEN").map_err(|_| {
+        anyhow::anyhow!(
+            "缺少 TGM_CONTROL_BOT_SECRET_TOKEN —— 控制 Bot Webhook 必须启用 secret_token"
+        )
+    })?;
+    let bot_token = std::env::var("TGM_CONTROL_BOT_TOKEN")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_CONTROL_BOT_TOKEN —— 控制 Bot 需要出站调用"))?;
+    let bot_api = tgm_app::bot_console::TelegramBotApiClient::from_token(bot_token)
+        .map_err(|error| anyhow::anyhow!("控制 Bot API 配置无效：{error}"))?;
+    tgm_app::bot_gateway::verify_webhook_secret(&bot_secret, Some(&bot_secret))
+        .map_err(|_| anyhow::anyhow!("TGM_CONTROL_BOT_SECRET_TOKEN 格式无效"))?;
+    let bot_identity_id = std::env::var("TGM_CONTROL_BOT_IDENTITY_ID")
+        .map_err(|_| {
+            anyhow::anyhow!("缺少 TGM_CONTROL_BOT_IDENTITY_ID —— 控制 Bot Webhook 必须绑定身份")
+        })?
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("TGM_CONTROL_BOT_IDENTITY_ID 必须是正整数"))?;
+    if bot_identity_id <= 0 {
+        return Err(anyhow::anyhow!("TGM_CONTROL_BOT_IDENTITY_ID 必须是正整数"));
+    }
+    let bot_username = std::env::var("TGM_CONTROL_BOT_USERNAME")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_CONTROL_BOT_USERNAME —— 扫码深链需要绑定 Bot"))?;
+    if bot_username.is_empty()
+        || bot_username.len() > 64
+        || !bot_username
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(anyhow::anyhow!(
+            "TGM_CONTROL_BOT_USERNAME 必须是 1-64 位 ASCII 字母、数字或下划线"
+        ));
+    }
+    let pool = sqlx::PgPool::connect(&app_url).await?;
+    let auth_pool = sqlx::PgPool::connect(&auth_url).await?;
+    let mut identity_tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('app.tenant_id', '0', true)")
+        .execute(&mut *identity_tx)
+        .await?;
+    let bot_identity_id = sqlx::query_scalar::<_, tgm_core::ids::IdentityId>(
+        "SELECT id
+           FROM identities
+          WHERE id = $1
+            AND kind = 'bot'
+            AND tenant_id IS NULL",
+    )
+    .bind(bot_identity_id)
+    .fetch_optional(&mut *identity_tx)
+    .await?
+    .ok_or_else(|| {
+        anyhow::anyhow!("TGM_CONTROL_BOT_IDENTITY_ID 必须指向 tenant_id IS NULL 的 bot 身份")
+    })?;
+    identity_tx.commit().await?;
+    let raw_addr =
+        std::env::var("TGM_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let addr: SocketAddr = raw_addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("TGM_LISTEN_ADDR 无效 {raw_addr:?}: {e}"))?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(listen_addr = %addr, "control-plane HTTP 服务已启动");
+    tgm_app::control::serve_with_auth_and_bot_and_oidc(
+        pool,
+        auth_pool,
+        tgm_app::bot_console::BotConsoleConfig {
+            secret_token: bot_secret,
+            bot_identity_id,
+            bot_username,
+            bot_api: Some(Arc::new(bot_api)),
+        },
+        tgm_app::control::OidcConfig {
+            bot_id: oidc_bot_id,
+            client_secret: Arc::new(tgm_core::secret::Secret::new(oidc_client_secret)),
+            signing_algorithm: oidc_alg,
+            redirect_url: oidc_redirect_url,
+            authorization_endpoint: tgm_app::control::OIDC_AUTHORIZATION_ENDPOINT.to_owned(),
+            token_endpoint: tgm_app::control::OIDC_TOKEN_ENDPOINT.to_owned(),
+            issuer: tgm_app::control::OIDC_ISSUER.to_owned(),
+            jwks_endpoint: tgm_app::control::OIDC_JWKS_ENDPOINT.to_owned(),
+        },
+        listener,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn serve_bot_gateway() -> anyhow::Result<()> {
+    let app_url = std::env::var("TGM_DB_URL_APP")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_APP —— 启动期校验本应先拦住"))?;
+    let auth_url = std::env::var("TGM_DB_URL_AUTH")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_AUTH —— Bot 鉴权需要独立连接池"))?;
+    let secret_token = std::env::var("TGM_DATA_BOT_SECRET_TOKEN").map_err(|_| {
+        anyhow::anyhow!("缺少 TGM_DATA_BOT_SECRET_TOKEN —— Webhook 必须启用 secret_token")
+    })?;
+    let receiver_identity_id = std::env::var("TGM_DATA_BOT_IDENTITY_ID")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_DATA_BOT_IDENTITY_ID —— Webhook 必须绑定接收身份"))?
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("TGM_DATA_BOT_IDENTITY_ID 必须是正整数"))?;
+    if receiver_identity_id <= 0 {
+        return Err(anyhow::anyhow!("TGM_DATA_BOT_IDENTITY_ID 必须是正整数"));
+    }
+    tgm_app::bot_gateway::verify_webhook_secret(&secret_token, Some(&secret_token))
+        .map_err(|_| anyhow::anyhow!("TGM_DATA_BOT_SECRET_TOKEN 格式无效"))?;
+    let pool = sqlx::PgPool::connect(&app_url).await?;
+    let auth_pool = sqlx::PgPool::connect(&auth_url).await?;
+    let raw_addr = std::env::var("TGM_BOT_GATEWAY_LISTEN_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8081".to_owned());
+    let addr: SocketAddr = raw_addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("TGM_BOT_GATEWAY_LISTEN_ADDR 无效 {raw_addr:?}: {e}"))?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(listen_addr = %addr, "bot-gateway HTTP 服务已启动");
+    let receiver_identity_id =
+        sqlx::query_scalar::<_, tgm_core::ids::IdentityId>("SELECT $1::bigint")
+            .bind(receiver_identity_id)
+            .fetch_one(&pool)
+            .await?;
+    tgm_app::bot_gateway::serve(
+        pool,
+        auth_pool,
+        secret_token,
+        receiver_identity_id,
+        listener,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn serve_rule() -> anyhow::Result<()> {
+    let app_url = std::env::var("TGM_DB_URL_APP")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_APP —— 启动期校验本应先拦住"))?;
+    let pool = sqlx::PgPool::connect(&app_url).await?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let signal_task = tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = shutdown_tx.send(true);
+    });
+    let worker =
+        tgm_app::pipeline::RuleWorker::new(pool, tgm_app::pipeline::RuleWorkerConfig::default());
+    let result = worker.run(shutdown_rx).await;
+    signal_task.abort();
+    result?;
+    Ok(())
+}
+
+async fn serve_fanout() -> anyhow::Result<()> {
+    let app_url = std::env::var("TGM_DB_URL_APP")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_APP —— 启动期校验本应先拦住"))?;
+    let pool = sqlx::PgPool::connect(&app_url).await?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let signal_task = tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = shutdown_tx.send(true);
+    });
+    let worker = tgm_app::pipeline::FanoutWorker::new(
+        pool,
+        tgm_app::pipeline::FanoutWorkerConfig::default(),
+    );
+    let result = worker.run(shutdown_rx).await;
+    signal_task.abort();
+    result?;
+    Ok(())
+}
+
+fn openapi(check: bool) -> anyhow::Result<()> {
+    const PUBLIC_PATH: &str = "openapi.json";
+    const ADMIN_PATH: &str = "openapi-admin.json";
+    let public = format!("{}\n", tgm_app::control::public_openapi_json()?);
+    let admin = format!("{}\n", tgm_app::control::admin_openapi_json()?);
+    if check {
+        let existing_public = std::fs::read_to_string(PUBLIC_PATH)
+            .map_err(|e| anyhow::anyhow!("读取 {PUBLIC_PATH} 失败: {e}"))?;
+        let existing_admin = std::fs::read_to_string(ADMIN_PATH)
+            .map_err(|e| anyhow::anyhow!("读取 {ADMIN_PATH} 失败: {e}"))?;
+        if existing_public != public {
+            anyhow::bail!("{PUBLIC_PATH} 与代码生成结果不一致");
+        }
+        if existing_admin != admin {
+            anyhow::bail!("{ADMIN_PATH} 与代码生成结果不一致");
+        }
+        println!("tgm: OpenAPI 契约一致：{PUBLIC_PATH}, {ADMIN_PATH}");
+        return Ok(());
+    }
+    std::fs::write(PUBLIC_PATH, public)?;
+    std::fs::write(ADMIN_PATH, admin)?;
+    println!("tgm: 已导出 OpenAPI 契约：{PUBLIC_PATH}, {ADMIN_PATH}");
+    Ok(())
 }
 
 /// 跑迁移。ops/00 §2.1 的第 1 步：用 `TGM_DB_URL_OWNER`，跑完即结束。
@@ -245,6 +440,13 @@ async fn preflight(role: &Role) -> anyhow::Result<tgm_core::profile::Profile> {
         raw_profile.ok_or_else(|| anyhow::anyhow!("TGM_PROFILE 缺失 —— 上一步本该拦住"))?;
     let profile = tgm_core::profile::Profile::parse(&raw_profile)?;
 
+    if matches!(core_role, CoreRole::ControlPlane) {
+        let oidc_alg = std::env::var("TGM_OIDC_ALG")
+            .map_err(|_| anyhow::anyhow!("缺少 TGM_OIDC_ALG —— 上一步本该拦住，这里是兜底"))?;
+        tgm_core::config::validate_oidc_alg(&oidc_alg)
+            .map_err(|error| anyhow::anyhow!("OIDC 配置无效：{error}"))?;
+    }
+
     // §4.2 与 §4.3 都走业务连接池的那条连接串：检查的对象就是**这条连接**
     // 的属性，换一条连接去查等于没查（实测 server_version_num 经 PgBouncer
     // 的 transaction 模式可以透传，所以不需要旁路直连）。
@@ -326,26 +528,41 @@ fn main() -> anyhow::Result<()> {
         );
     }
     match cmd {
-        Command::Serve { role } => not_implemented(&format!("serve --role {}", role.as_str())),
+        Command::Serve { role } => {
+            if matches!(role, Role::ControlPlane) {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(serve_control_plane())?;
+            } else if matches!(role, Role::BotGateway) {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(serve_bot_gateway())?;
+            } else if matches!(role, Role::Rule) {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(serve_rule())?;
+            } else if matches!(role, Role::Fanout) {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(serve_fanout())?;
+            } else {
+                return Err(unimplemented_serve_error(&role));
+            }
+        }
         Command::Migrate => unreachable!("已在上面处理"),
         Command::AuditRls => unreachable!("已在上面处理"),
         Command::Openapi { check } => {
-            if check {
-                // **这一条退 1，不退 0。** 它是 eng/04 §四 卡口清单里的一员，
-                // 而一条恒 0 的卡口与一条通过的卡口在 CI 里完全同形 ——
-                // 契约漂移检查还不存在这件事，必须由退出码说出来，
-                // 不能只靠一行没人看的 stderr（`not_implemented` 的注释里
-                // 写着「机器看不见」，这就是那个代价兑现的地方）。
-                // 代价是这条卡口在 WP-5 落地前进不了 CI；ci.yml 里据此
-                // 显式注掉并注明原因，而不是让它假绿。
-                eprintln!(
-                    "tgm: openapi --check: NOT IMPLEMENTED（openapi.json 不存在，\
-                     契约导出随 WP-5 落地 —— 退出码 1 是刻意的，见 eng/04 §六）"
-                );
-                std::process::exit(1);
-            }
-            not_implemented("openapi");
+            openapi(check)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Role, unimplemented_serve_error};
+
+    #[test]
+    fn unimplemented_serve_role_is_an_error() {
+        let error = unimplemented_serve_error(&Role::Delivery);
+
+        assert!(error.to_string().contains("serve --role delivery"));
+        assert!(error.to_string().contains("NOT IMPLEMENTED"));
+    }
 }

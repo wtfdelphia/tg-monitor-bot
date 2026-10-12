@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO tenant_events (tenant_id, canonical_event_id, source_ref)\n                SELECT $1, ce.id, ss.id\n                  FROM canonical_events AS ce\n                  JOIN source_subscriptions AS ss\n                    ON ss.tenant_id = $1\n                   AND ss.tg_chat_id = ce.tg_chat_id\n                   AND ss.receiver_identity_id = ce.receiver_identity_id\n                   AND ss.enabled\n                 WHERE ce.id = $2\n                ON CONFLICT (tenant_id, canonical_event_id) DO NOTHING\n                RETURNING id\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "tenant_events",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "15da6cbc9daf11bc105d3034b2a85b63a753974bdaac82f5f7dff974375bd780"
+}
