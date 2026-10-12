@@ -2,6 +2,13 @@
 
 ## 当前证据
 
+发布增量（2026-10-12）：用户授权分支、提交、推送和以 `dev` 为 base 的 PR。
+PRE-001 已发布到 PR #3，head `4d7f3a06b85001036c92a35c74868a800675055f`；
+CI run `38249168593` 的 static/database 均通过，Compose 启动步骤通过。
+新建 PR 的实际 `verify_pr_refs` 正确引用返回 0、错误 head 返回 1；查询失败和空结果
+由默认回归验证闭锁。证据见 `PRE-001-独立发布验收-2026-10-12.md` 与后续发布记录。
+尚未合并进入 `dev`，不把发布验收当作无人值守驱动已启用。
+
 实施增量（2026-10-12）：用户在上轮明确列出本提案与 PRE-004 后再次要求实施，已
 按此范围修复本地镜像来源、PR 引用查询和固定回归入口。下面保留原始故障证据；
 当前结果见 `docs/plan/evidence/PRE-001-PRE-004-门禁收口-2026-10-12.md`。
@@ -68,6 +75,6 @@ CI 无凭据拉取、可固定版本、并能通过现有健康检查的镜像�
 
 [report]
 task: PRE-001
-path: blocked
+path: ok
 gates: pass
 escalation: docs/plan/proposals/PRE-001-远端CI与驱动门禁收口.md
