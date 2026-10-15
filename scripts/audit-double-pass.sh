@@ -70,6 +70,7 @@ declare -A BREAK=(
   [C1]="DROP POLICY tenant_isolation ON delivery_logs;"
   [C4]="CREATE MATERIALIZED VIEW probe_mv AS SELECT tenant_id, word FROM keywords;"
   [C2]="GRANT UPDATE ON identities TO app_user;"
+  [C6]="GRANT UPDATE (payload_snapshot) ON delivery_tasks TO app_user;"
   # 权限只授给组，登录角色本人在 relacl/attacl/polroles 三处都查不到 ——
   # 这正是它能绕过 runtime_role 派生的原因。组带 BYPASSRLS，
   # 于是 probe_worker 实际上 RLS 全免，而 A2a 因为派生里没有它而保持绿。
@@ -103,6 +104,7 @@ declare -A UNDO=(
   # 撤销要恢复列级形态，顺序同 migrations/0011：先收表级再逐列给。
   # 反了不报错、权限照旧 —— 这个陷阱正是 C2 存在的理由
   [C2]="REVOKE UPDATE ON identities FROM app_user; GRANT UPDATE (kind, tg_user_id, display_name, status, proxy_url, updated_at) ON identities TO app_user;"
+  [C6]="REVOKE UPDATE (payload_snapshot) ON delivery_tasks FROM app_user;"
   # DROP ROLE 要求该角色不再持有任何权限，所以先 REVOKE 表级授权 ——
   # 漏了就是 ERROR: role "probe_g2" cannot be dropped because some objects depend on it。
   # 成员关系随 DROP ROLE 自动消失，不用单独 REVOKE；MBR 段就是用来证实这一点的
@@ -121,7 +123,7 @@ declare -A AS_SUPER=([A2a]=1 [A2b]=1 [A8]=1 [C5]=1)
 #             必然同时触发 A1。两条断言从不同角度抓同一个事实，是冗余而非耦合
 declare -A ALSO=([A2b]="A1")
 
-ORDER=(MAIN A1 A2a A2b A3 A4 A5 A6 A7 A8 A9 C1 C4 C2 C5)
+ORDER=(MAIN A1 A2a A2b A3 A4 A5 A6 A7 A8 A9 C1 C4 C2 C6 C5)
 
 psql_do() {  # $1=sql  $2=1 表示以超级用户身份
   if [ "${2:-}" = "1" ]; then

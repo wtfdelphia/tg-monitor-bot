@@ -130,10 +130,17 @@ mod tests {
     #[test]
     fn parse_keeps_every_assertion() {
         let parsed = parse(QUERIES);
-        // 数量对得上 eng/04：主查询 1 + A0~A9（A2 拆成 a/b，共 11）
-        // + C1/C4/C2/C5 四条 = 16。C4（禁物化视图）与 C5（禁登录角色的组成员身份）
-        // 是本步骤新增的，不在 eng/04 原文里
-        assert_eq!(parsed.len(), 16, "断言条数变了，同步改这里与 eng/04");
+        let expected = [
+            "A0", "MAIN", "A1", "A2a", "A2b", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "C1", "C4",
+            "C2", "C6", "C5",
+        ];
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|assertion| assertion.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
         for a in &parsed {
             assert!(!a.id.is_empty(), "断言缺 id");
             assert!(!a.title.is_empty(), "断言 {} 缺标题", a.id);

@@ -9,7 +9,8 @@ use sqlx::types::chrono::{DateTime, Utc};
 use tgm_core::ids::{IdentityId, TenantId};
 use tgm_db::repo::{
     DeliveryTaskFailureInput, DeliveryTaskFailureStatus, claim_due_delivery_task,
-    complete_delivery_task, record_delivery_failure, recover_stale_delivery_tasks,
+    complete_delivery_task, load_delivery_task_payload, record_delivery_failure,
+    recover_stale_delivery_tasks,
 };
 
 async fn seed_tenant(admin: &support::AdminOnlyPool, name: &str) -> TenantId {
@@ -51,17 +52,44 @@ async fn seed_task(
 ) -> i64 {
     sqlx::query_scalar(
         "INSERT INTO delivery_tasks
-            (tenant_id, target_tg_chat_id, sender_identity_id, action, status, idem_key)
-         VALUES ($1, $2, $3, 'COPY', 'PENDING', $4)
+            (tenant_id, target_tg_chat_id, sender_identity_id, action, status,
+             telegram_random_id, idem_key, payload_snapshot)
+         VALUES ($1, $2, $3, 'COPY', 'PENDING', $5, $4, $6)
          RETURNING id",
     )
     .bind(tenant)
     .bind(-30_000 - tenant.get())
     .bind(sender_identity_id)
     .bind(key)
+    .bind(tenant.get() * 1_000_000 + 1)
+    .bind(serde_json::json!({
+        "source": {"tg_chat_id": -1001, "tg_message_id": 42, "media_type": "TEXT"},
+        "message": {"text": "frozen message", "parse_mode": "HTML"}
+    }))
     .fetch_one(admin.raw())
     .await
     .expect("创建投递任务失败")
+}
+
+async fn seed_historical_task(
+    admin: &support::AdminOnlyPool,
+    tenant: TenantId,
+    sender_identity_id: IdentityId,
+    key: &str,
+) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO delivery_tasks
+            (tenant_id, target_tg_chat_id, sender_identity_id, action, status, idem_key)
+         VALUES ($1, $2, $3, 'COPY', 'PENDING', $4)
+         RETURNING id",
+    )
+    .bind(tenant)
+    .bind(-40_000 - tenant.get())
+    .bind(sender_identity_id)
+    .bind(key)
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建历史投递任务失败")
 }
 
 async fn task_status(admin: &support::AdminOnlyPool, task_id: i64) -> (String, i32) {
@@ -281,6 +309,12 @@ async fn stale_sending_tasks_are_recovered_after_worker_restart(admin: PgPool) {
         .expect("重启前领取投递任务失败")
         .expect("重启前应领取到投递任务");
     assert_eq!(claimed.status, "SENDING");
+    let telegram_random_id = claimed.telegram_random_id;
+    let before = load_delivery_task_payload(&app, tenant, task_id)
+        .await
+        .expect("读取回收前快照失败")
+        .expect("任务应存在")
+        .payload_snapshot;
 
     sqlx::query(
         "UPDATE delivery_tasks
@@ -306,10 +340,273 @@ async fn stale_sending_tasks_are_recovered_after_worker_restart(admin: PgPool) {
         .expect("重启后应继续领取遗留任务");
     assert_eq!(recovered.id, task_id);
     assert_eq!(recovered.status, "SENDING");
+    assert_eq!(recovered.telegram_random_id, telegram_random_id);
+    assert_eq!(
+        load_delivery_task_payload(&app, tenant, task_id)
+            .await
+            .expect("读取回收后快照失败")
+            .expect("任务应存在")
+            .payload_snapshot,
+        before
+    );
     assert_eq!(
         recover_stale_delivery_tasks(&app, tenant, sender, 60)
             .await
             .expect("重复回收陈旧任务失败"),
         0
     );
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn historical_tasks_without_random_id_are_not_claimed(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let tenant = seed_tenant(&admin, "delivery-tenant-a").await;
+    let sender = seed_identity(&admin, tenant, "historical").await;
+    let task_id = seed_historical_task(&admin, tenant, sender, "delivery-historical").await;
+
+    assert!(
+        claim_due_delivery_task(&app, tenant, sender)
+            .await
+            .expect("历史任务领取查询失败")
+            .is_none()
+    );
+    assert_eq!(
+        task_status(&admin, task_id).await,
+        ("PENDING".to_owned(), 0)
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn random_id_is_positive_and_immutable_for_app_user(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let tenant = seed_tenant(&admin, "delivery-tenant-a").await;
+    let sender = seed_identity(&admin, tenant, "random-id").await;
+    let task_id = seed_task(&admin, tenant, sender, "delivery-random-id").await;
+    let random_id: i64 =
+        sqlx::query_scalar("SELECT telegram_random_id FROM delivery_tasks WHERE id = $1")
+            .bind(task_id)
+            .fetch_one(admin.raw())
+            .await
+            .expect("读取 Telegram random_id 失败");
+    assert!(random_id > 0);
+
+    let duplicate_result = sqlx::query(
+        "INSERT INTO delivery_tasks
+            (tenant_id, target_tg_chat_id, sender_identity_id, action, telegram_random_id, idem_key)
+         VALUES ($1, $2, $3, 'COPY', $4, 'delivery-random-id-duplicate')",
+    )
+    .bind(tenant)
+    .bind(-30_000 - tenant.get())
+    .bind(sender)
+    .bind(random_id)
+    .execute(admin.raw())
+    .await
+    .expect_err("同租户发送身份和 peer 下的 random_id 应唯一");
+    assert!(
+        duplicate_result
+            .to_string()
+            .contains("uq_task_telegram_random_id")
+    );
+
+    let mut app_tx = app.begin().await.expect("开启 app_user 事务失败");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.get().to_string())
+        .execute(&mut *app_tx)
+        .await
+        .expect("设置 app_user 租户上下文失败");
+    let status_update = sqlx::query("UPDATE delivery_tasks SET status = 'FAILED' WHERE id = $1")
+        .bind(task_id)
+        .execute(&mut *app_tx)
+        .await
+        .expect("app_user 正常更新任务状态失败");
+    assert_eq!(status_update.rows_affected(), 1);
+    let app_error = sqlx::query("UPDATE delivery_tasks SET telegram_random_id = $2 WHERE id = $1")
+        .bind(task_id)
+        .bind(random_id + 1)
+        .execute(&mut *app_tx)
+        .await
+        .expect_err("app_user 不应获得 telegram_random_id 的 UPDATE 权限");
+    app_tx.rollback().await.expect("回滚 app_user 事务失败");
+    assert!(app_error.to_string().contains("permission denied"));
+
+    let mut owner_tx = admin.raw().begin().await.expect("开启 owner 事务失败");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.get().to_string())
+        .execute(&mut *owner_tx)
+        .await
+        .expect("设置管理员租户上下文失败");
+    let owner_error =
+        sqlx::query("UPDATE delivery_tasks SET telegram_random_id = $2 WHERE id = $1")
+            .bind(task_id)
+            .bind(random_id + 1)
+            .execute(&mut *owner_tx)
+            .await
+            .expect_err("已分配 Telegram random_id 不应可变更");
+    owner_tx.rollback().await.expect("回滚 owner 事务失败");
+    assert!(
+        owner_error
+            .to_string()
+            .contains("delivery payload snapshot is immutable")
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn delivery_snapshot_and_routing_cannot_be_rewritten(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let tenant = seed_tenant(&admin, "delivery-tenant-a").await;
+    let sender = seed_identity(&admin, tenant, "snapshot").await;
+    let task_id = seed_task(&admin, tenant, sender, "snapshot").await;
+    for statement in [
+        "UPDATE delivery_tasks SET payload_snapshot = NULL WHERE id = $1",
+        "UPDATE delivery_tasks SET payload_snapshot = '{}'::jsonb WHERE id = $1",
+        "UPDATE delivery_tasks SET target_tg_chat_id = -9999 WHERE id = $1",
+        "UPDATE delivery_tasks SET sender_identity_id = sender_identity_id + 1 WHERE id = $1",
+        "UPDATE delivery_tasks SET action = 'FORWARD' WHERE id = $1",
+        "UPDATE delivery_tasks SET tenant_event_id = NULL WHERE id = $1",
+        "UPDATE delivery_tasks SET rule_id = 7 WHERE id = $1",
+        "UPDATE delivery_tasks SET rule_version = 2 WHERE id = $1",
+        "UPDATE delivery_tasks SET idem_key = 'changed' WHERE id = $1",
+        "UPDATE delivery_tasks SET telegram_random_id = 99 WHERE id = $1",
+        "UPDATE delivery_tasks SET tenant_id = tenant_id + 1 WHERE id = $1",
+        "UPDATE delivery_tasks SET id = id + 1 WHERE id = $1",
+    ] {
+        let mut transaction = app.begin().await.expect("开启受限事务失败");
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(tenant.get().to_string())
+            .execute(&mut *transaction)
+            .await
+            .expect("设置租户失败");
+        let error = sqlx::query(statement)
+            .bind(task_id)
+            .execute(&mut *transaction)
+            .await
+            .expect_err("不可变列应拒绝改写");
+        let code = error.as_database_error().and_then(|error| error.code());
+        assert!(matches!(code.as_deref(), Some("42501" | "428C9")));
+        transaction.rollback().await.expect("回滚受限事务失败");
+    }
+    for statement in [
+        "UPDATE delivery_tasks SET payload_snapshot = NULL WHERE id = $1",
+        "UPDATE delivery_tasks SET target_tg_chat_id = -9999 WHERE id = $1",
+        "UPDATE delivery_tasks SET action = 'FORWARD' WHERE id = $1",
+    ] {
+        let error = sqlx::query(statement)
+            .bind(task_id)
+            .execute(admin.raw())
+            .await
+            .expect_err("触发器应拒绝改写");
+        assert!(
+            error
+                .to_string()
+                .contains("delivery payload snapshot is immutable")
+        );
+    }
+    let claimed = claim_due_delivery_task(&app, tenant, sender)
+        .await
+        .expect("正常领取失败")
+        .expect("任务应可领取");
+    assert_eq!(claimed.id, task_id);
+    assert!(
+        complete_delivery_task(&app, tenant, task_id, 1234, None)
+            .await
+            .expect("正常状态更新失败")
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn legacy_tasks_with_random_id_but_no_snapshot_remain_quarantined(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let tenant = seed_tenant(&admin, "delivery-tenant-a").await;
+    let sender = seed_identity(&admin, tenant, "legacy-snapshot").await;
+    let task_id: i64 = sqlx::query_scalar(
+        "INSERT INTO delivery_tasks
+          (tenant_id, target_tg_chat_id, sender_identity_id, action, telegram_random_id,
+           status, updated_at)
+         VALUES ($1, -2001, $2, 'COPY', 12345, 'SENDING',
+                 clock_timestamp() - interval '120 seconds') RETURNING id",
+    )
+    .bind(tenant)
+    .bind(sender)
+    .fetch_one(admin.raw())
+    .await
+    .expect("构造迁移前记录失败");
+    assert_eq!(
+        recover_stale_delivery_tasks(&app, tenant, sender, 60)
+            .await
+            .expect("查询回收失败"),
+        0
+    );
+    sqlx::query("UPDATE delivery_tasks SET status = 'PENDING' WHERE id = $1")
+        .bind(task_id)
+        .execute(admin.raw())
+        .await
+        .expect("恢复待领取状态失败");
+    assert!(
+        claim_due_delivery_task(&app, tenant, sender)
+            .await
+            .expect("查询领取失败")
+            .is_none()
+    );
+    let error = sqlx::query("UPDATE delivery_tasks SET payload_snapshot = $2 WHERE id = $1")
+        .bind(task_id)
+        .bind(serde_json::json!({
+            "source": {"tg_chat_id": -1001, "tg_message_id": 42, "media_type": "TEXT"},
+            "message": {"text": "unproven", "parse_mode": "HTML"}
+        }))
+        .execute(admin.raw())
+        .await
+        .expect_err("不得静默回填历史快照");
+    assert!(
+        error
+            .to_string()
+            .contains("delivery payload snapshot is immutable")
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn malformed_delivery_snapshots_are_rejected_at_insert(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let tenant = seed_tenant(&admin, "delivery-tenant-a").await;
+    let sender = seed_identity(&admin, tenant, "invalid-snapshot").await;
+    let valid = serde_json::json!({
+        "source": {"tg_chat_id": -1001, "tg_message_id": 42, "media_type": "TEXT"},
+        "message": {"text": "valid", "parse_mode": "HTML"}
+    });
+    let mut invalid = vec![
+        serde_json::json!({}),
+        serde_json::Value::Null,
+        serde_json::json!([]),
+    ];
+    for (section, field) in [
+        ("source", "tg_chat_id"),
+        ("source", "tg_message_id"),
+        ("source", "media_type"),
+        ("message", "text"),
+        ("message", "parse_mode"),
+    ] {
+        let mut missing = valid.clone();
+        missing[section]
+            .as_object_mut()
+            .expect("快照应是对象")
+            .remove(field);
+        invalid.push(missing);
+    }
+    for snapshot in invalid {
+        let result = tgm_db::tenant::tenant_tx(&app, tenant, |connection| Box::pin(async move {
+            sqlx::query("INSERT INTO delivery_tasks
+                (tenant_id, target_tg_chat_id, sender_identity_id, action, telegram_random_id, payload_snapshot)
+                VALUES ($1, -2001, $2, 'COPY', 99, $3)")
+                .bind(tenant).bind(sender).bind(snapshot).execute(connection).await
+        })).await.expect_err("不完整快照应被 CHECK 拒绝");
+        assert_eq!(
+            result
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23514")
+        );
+    }
 }

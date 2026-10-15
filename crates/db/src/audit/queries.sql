@@ -557,6 +557,37 @@ SELECT q::text FROM (
   ORDER BY 1
 ) q;
 
+-- name: C6 投递请求列不得被运行时角色改写
+SELECT q::text FROM (
+  WITH runtime_role AS (
+    SELECT r.oid, r.rolname FROM pg_roles r
+    WHERE r.rolcanlogin
+      AND (EXISTS (SELECT 1 FROM pg_class c
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   CROSS JOIN LATERAL aclexplode(c.relacl) a
+                   WHERE n.nspname = 'public' AND c.relkind IN ('r','p')
+                     AND a.grantee = r.oid)
+        OR EXISTS (SELECT 1 FROM pg_attribute att
+                   JOIN pg_class c ON c.oid = att.attrelid
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   CROSS JOIN LATERAL aclexplode(att.attacl) a
+                   WHERE n.nspname = 'public' AND c.relkind IN ('r','p')
+                     AND att.attnum > 0 AND NOT att.attisdropped
+                     AND a.grantee = r.oid)
+        OR EXISTS (SELECT 1 FROM pg_policy p WHERE r.oid = ANY (p.polroles)))
+  )
+  SELECT rr.rolname AS role, att.attname AS immutable_column
+    FROM runtime_role rr
+    CROSS JOIN pg_attribute att
+   WHERE att.attrelid = 'public.delivery_tasks'::regclass
+     AND att.attnum > 0 AND NOT att.attisdropped
+     AND att.attname IN ('id', 'tenant_id', 'tenant_event_id', 'rule_id',
+                        'rule_version', 'target_tg_chat_id', 'sender_identity_id',
+                        'action', 'telegram_random_id', 'payload_snapshot', 'idem_key')
+     AND has_column_privilege(rr.oid, att.attrelid, att.attnum, 'UPDATE')
+   ORDER BY 1, 2
+) q;
+
 -- name: C5 登录角色不得持有组成员身份
 -- 本步骤新增，补的是 A0 那条派生的一个盲区，不在 eng/04 原文里。
 --

@@ -109,10 +109,15 @@ pub struct TenantEventRecord {
     pub id: i64,
     pub canonical_event_id: i64,
     pub source_ref: i64,
+    pub receiver_identity_id: IdentityId,
+    pub tg_chat_id: i64,
+    pub tg_message_id: i64,
     pub event_type: String,
     pub sender_id: Option<i64>,
     pub text: Option<String>,
     pub caption: Option<String>,
+    pub chat_title: Option<String>,
+    pub username: Option<String>,
     pub media_type: Option<String>,
     pub file_name: Option<String>,
     pub file_size: Option<i64>,
@@ -281,6 +286,7 @@ pub struct DeliveryTaskInput {
     pub target_tg_chat_id: i64,
     pub sender_identity_id: IdentityId,
     pub action: String,
+    pub payload_snapshot: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +308,7 @@ pub struct DeliveryTaskRecord {
     pub attempt_count: i32,
     pub next_retry_at: Option<DateTime<Utc>>,
     pub idem_key: Option<String>,
+    pub telegram_random_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -384,29 +391,11 @@ pub struct SystemLogRecord {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DeliveryTaskPayloadRecord {
     pub id: i64,
-    pub tenant_event_id: Option<i64>,
-    pub rule_id: Option<i64>,
-    pub rule_version: Option<i32>,
     pub target_tg_chat_id: i64,
     pub sender_identity_id: IdentityId,
     pub action: String,
-    pub receiver_identity_id: Option<IdentityId>,
-    pub tg_chat_id: Option<i64>,
-    pub tg_message_id: Option<i64>,
-    pub sender_id: Option<i64>,
-    pub text: Option<String>,
-    pub caption: Option<String>,
-    pub media_group_id: Option<String>,
-    pub media_type: Option<String>,
-    pub file_unique_id: Option<String>,
-    pub file_name: Option<String>,
-    pub file_size: Option<i64>,
-    pub mime_type: Option<String>,
-    pub raw_file_id: Option<String>,
-    pub chat_title: Option<String>,
-    pub username: Option<String>,
-    pub matched_keywords: Option<Vec<String>>,
-    pub rule_snapshot: Option<Value>,
+    pub telegram_random_id: Option<i64>,
+    pub payload_snapshot: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3375,17 +3364,25 @@ pub async fn load_tenant_event(
                 SELECT te.id,
                        te.canonical_event_id,
                        te.source_ref,
+                       ce.receiver_identity_id,
+                       ce.tg_chat_id,
+                       ce.tg_message_id,
                        ce.event_type,
                        ce.sender_id,
                        ce.text,
                        ce.caption,
-                       ce.media_type,
                        ce.file_name,
                        ce.file_size,
+                       ss.title AS chat_title,
+                       ss.username,
+                       ce.media_type,
                        te.processed_at IS NOT NULL AS processed
                   FROM tenant_events AS te
                   JOIN canonical_events AS ce
                     ON ce.id = te.canonical_event_id
+                  JOIN source_subscriptions AS ss
+                    ON ss.tenant_id = te.tenant_id
+                   AND ss.id = te.source_ref
                  WHERE te.tenant_id = $1
                    AND te.id = $2
                 "#,
@@ -3570,49 +3567,65 @@ pub async fn enqueue_delivery_tasks(
                     tenant_event_id,
                     task.target_tg_chat_id,
                 );
-                let inserted_id = sqlx::query_scalar::<_, i64>(
-                    r#"
-                    INSERT INTO delivery_tasks (
-                        tenant_id,
-                        tenant_event_id,
-                        rule_id,
-                        rule_version,
-                        target_tg_chat_id,
-                        sender_identity_id,
-                        action,
-                        idem_key
+                let mut write = None;
+                for _ in 0..16 {
+                    let telegram_random_id = delivery_random_id()?;
+                    let inserted_id = sqlx::query_scalar::<_, i64>(
+                        r#"
+                        INSERT INTO delivery_tasks (
+                            tenant_id,
+                            tenant_event_id,
+                            rule_id,
+                            rule_version,
+                            target_tg_chat_id,
+                            sender_identity_id,
+                            action,
+                            telegram_random_id,
+                            payload_snapshot,
+                            idem_key
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        ON CONFLICT DO NOTHING
+                        RETURNING id
+                        "#,
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                    ON CONFLICT (tenant_id, idem_key) WHERE idem_key IS NOT NULL DO NOTHING
-                    RETURNING id
-                    "#,
-                )
-                .bind(tenant.get())
-                .bind(tenant_event_id)
-                .bind(task.rule_id)
-                .bind(task.rule_version)
-                .bind(task.target_tg_chat_id)
-                .bind(task.sender_identity_id)
-                .bind(&task.action)
-                .bind(&idem_key)
-                .fetch_optional(&mut *conn)
-                .await?;
+                    .bind(tenant.get())
+                    .bind(tenant_event_id)
+                    .bind(task.rule_id)
+                    .bind(task.rule_version)
+                    .bind(task.target_tg_chat_id)
+                    .bind(task.sender_identity_id)
+                    .bind(&task.action)
+                    .bind(telegram_random_id)
+                    .bind(&task.payload_snapshot)
+                    .bind(&idem_key)
+                    .fetch_optional(&mut *conn)
+                    .await?;
 
-                if let Some(id) = inserted_id {
-                    writes.push(DeliveryTaskWrite { id, inserted: true });
-                } else {
-                    let id = sqlx::query_scalar::<_, i64>(
+                    if let Some(id) = inserted_id {
+                        write = Some((id, true));
+                        break;
+                    }
+
+                    let existing_id = sqlx::query_scalar::<_, i64>(
                         "SELECT id FROM delivery_tasks WHERE tenant_id = $1 AND idem_key = $2",
                     )
                     .bind(tenant.get())
                     .bind(&idem_key)
-                    .fetch_one(&mut *conn)
+                    .fetch_optional(&mut *conn)
                     .await?;
-                    writes.push(DeliveryTaskWrite {
-                        id,
-                        inserted: false,
-                    });
+                    if let Some(id) = existing_id {
+                        write = Some((id, false));
+                        break;
+                    }
                 }
+                let Some((id, inserted)) = write else {
+                    return Err(sqlx::Error::Protocol(
+                        "could not allocate unique Telegram random_id after 16 attempts".to_owned(),
+                    ));
+                };
+
+                writes.push(DeliveryTaskWrite { id, inserted });
             }
 
             sqlx::query(
@@ -3668,6 +3681,8 @@ pub async fn claim_due_delivery_task(
                       FROM delivery_tasks
                      WHERE tenant_id = $1
                        AND sender_identity_id = $2
+                       AND telegram_random_id IS NOT NULL
+                       AND payload_snapshot IS NOT NULL
                        AND status IN ('PENDING', 'FAILED')
                        AND (next_retry_at IS NULL OR next_retry_at <= clock_timestamp())
                      ORDER BY created_at ASC, id ASC
@@ -3689,7 +3704,8 @@ pub async fn claim_due_delivery_task(
                           task.status,
                           task.attempt_count,
                           task.next_retry_at,
-                          task.idem_key
+                          task.idem_key,
+                          task.telegram_random_id
                 "#,
             )
             .bind(tenant.get())
@@ -3721,6 +3737,8 @@ pub async fn recover_stale_delivery_tasks(
                        updated_at = clock_timestamp()
                  WHERE tenant_id = $1
                    AND sender_identity_id = $2
+                   AND telegram_random_id IS NOT NULL
+                   AND payload_snapshot IS NOT NULL
                    AND status = 'SENDING'
                    AND updated_at <= clock_timestamp() - ($3 * interval '1 second')
                 "#,
@@ -3746,42 +3764,12 @@ pub async fn load_delivery_task_payload(
             sqlx::query_as::<_, DeliveryTaskPayloadRecord>(
                 r#"
                 SELECT task.id,
-                       task.tenant_event_id,
-                       task.rule_id,
-                       task.rule_version,
                        task.target_tg_chat_id,
                        task.sender_identity_id,
                        task.action,
-                       ce.receiver_identity_id,
-                       ce.tg_chat_id,
-                       ce.tg_message_id,
-                       ce.sender_id,
-                       ce.text,
-                       ce.caption,
-                       ce.media_group_id,
-                       ce.media_type,
-                       ce.file_unique_id,
-                       ce.file_name,
-                       ce.file_size,
-                       ce.mime_type,
-                       ce.raw_file_id,
-                       ss.title AS chat_title,
-                       ss.username,
-                       te.matched_keywords,
-                       rv.snapshot AS rule_snapshot
+                       task.telegram_random_id,
+                       task.payload_snapshot
                   FROM delivery_tasks AS task
-                  LEFT JOIN tenant_events AS te
-                    ON te.tenant_id = task.tenant_id
-                   AND te.id = task.tenant_event_id
-                  LEFT JOIN canonical_events AS ce
-                    ON ce.id = te.canonical_event_id
-                  LEFT JOIN source_subscriptions AS ss
-                    ON ss.tenant_id = task.tenant_id
-                   AND ss.id = te.source_ref
-                  LEFT JOIN rule_versions AS rv
-                    ON rv.tenant_id = task.tenant_id
-                   AND rv.rule_id = task.rule_id
-                   AND rv.version = task.rule_version
                  WHERE task.tenant_id = $1
                    AND task.id = $2
                 "#,
@@ -4161,6 +4149,13 @@ fn delivery_idem_key(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn delivery_random_id() -> Result<i64, sqlx::Error> {
+    let mut bytes = [0_u8; std::mem::size_of::<u64>()];
+    getrandom::fill(&mut bytes).map_err(|error| sqlx::Error::Io(std::io::Error::other(error)))?;
+    let value = i64::from_le_bytes(bytes) & i64::MAX;
+    Ok(value.max(1))
 }
 
 /// 写入第一层规范化事件，并按数据库唯一键完成幂等去重。
