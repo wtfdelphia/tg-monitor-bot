@@ -4,6 +4,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::chrono::{TimeZone, Utc};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use tgm_app::delivery::{
     DeliveryPayload, DeliveryRunOutcome, DeliverySendError, DeliveryTransport, DeliveryWorker,
@@ -15,19 +16,46 @@ use tgm_app::pipeline::{
 };
 use tgm_core::ids::{IdentityId, TenantId};
 use tgm_db::repo::{
-    CanonicalAdapter, CanonicalEventInput, CanonicalEventType, fanout_canonical_event,
-    insert_canonical_event, load_delivery_task_payload,
+    CanonicalAdapter, CanonicalEventInput, CanonicalEventType, DeliveryTaskInput,
+    enqueue_delivery_tasks, fanout_canonical_event, insert_canonical_event,
+    load_delivery_task_payload,
 };
 
 struct ExpectingTransport {
     expected_text: String,
+    expected_random_id: i64,
+    seen_random_ids: Arc<Mutex<Vec<i64>>>,
+    expected_payload: Option<DeliveryPayload>,
 }
 
 #[async_trait::async_trait]
 impl DeliveryTransport for ExpectingTransport {
     async fn deliver(&self, payload: DeliveryPayload) -> Result<i64, DeliverySendError> {
-        if payload.message.text == self.expected_text {
-            Ok(9_877)
+        self.seen_random_ids
+            .lock()
+            .expect("读取投递随机 ID 记录失败")
+            .push(payload.telegram_random_id);
+        if payload.message.text == self.expected_text
+            && payload.telegram_random_id == self.expected_random_id
+            && self
+                .expected_payload
+                .as_ref()
+                .is_none_or(|expected| expected == &payload)
+        {
+            let attempts = self
+                .seen_random_ids
+                .lock()
+                .expect("读取投递尝试次数失败")
+                .len();
+            if attempts == 1 {
+                Err(DeliverySendError {
+                    code: "RANDOM_ID_DUPLICATE".to_owned(),
+                    message: Some("Telegram random_id 仍在处理".to_owned()),
+                    flood_wait_seconds: None,
+                })
+            } else {
+                Ok(9_877)
+            }
         } else {
             Err(DeliverySendError {
                 code: "PAYLOAD_MISMATCH".to_owned(),
@@ -226,8 +254,8 @@ async fn pipeline_fanout_rule_match_and_delivery_outbox_are_idempotent(admin: Pg
         .expect("读取投递任务载荷失败")
         .expect("投递任务载荷不存在");
     let rendered = tgm_app::delivery::build_delivery_payload(&payload).expect("构造投递载荷失败");
+    assert!(rendered.telegram_random_id > 0);
     assert_eq!(rendered.target_tg_chat_id, -2001);
-    assert_eq!(rendered.source.receiver_identity_id, receiver_identity);
     assert_eq!(rendered.source.tg_chat_id, -1001);
     assert_eq!(rendered.source.tg_message_id, 42);
     assert_eq!(rendered.source.media_type.as_deref(), Some("TEXT"));
@@ -238,10 +266,97 @@ async fn pipeline_fanout_rule_match_and_delivery_outbox_are_idempotent(admin: Pg
 
     let transport = ExpectingTransport {
         expected_text: rendered.message.text.clone(),
+        expected_random_id: rendered.telegram_random_id,
+        seen_random_ids: Arc::new(Mutex::new(Vec::new())),
+        expected_payload: Some(rendered.clone()),
     };
+    let first_outcome = run_delivery_once(&app, tenant, sender_identity, &transport)
+        .await
+        .expect("执行首次投递 worker 失败");
+    assert_eq!(
+        first_outcome,
+        DeliveryRunOutcome::Failed {
+            task_id: first.tasks[0].id,
+            status: tgm_app::delivery::DeliveryDecisionStatus::Pending,
+            attempt_count: 1,
+        }
+    );
+
+    sqlx::query("UPDATE delivery_tasks SET next_retry_at = clock_timestamp() WHERE id = $1")
+        .bind(first.tasks[0].id)
+        .execute(&admin)
+        .await
+        .expect("将重试任务设为到期失败");
+
+    sqlx::query(
+        "UPDATE canonical_events SET text = 'changed', tg_chat_id = -9991,
+                 tg_message_id = 99, media_type = 'PHOTO' WHERE id = $1",
+    )
+    .bind(canonical.id)
+    .execute(&admin)
+    .await
+    .expect("更改来源事件失败");
+    sqlx::query(
+        "UPDATE source_subscriptions SET title = 'changed', username = 'changed' WHERE id = $1",
+    )
+    .bind(source_ref)
+    .execute(&admin)
+    .await
+    .expect("更改来源展示信息失败");
+    sqlx::query(
+        "UPDATE target_channels SET tg_chat_id = -9992, sender_identity_id = $2 WHERE id = $1",
+    )
+    .bind(target_ref)
+    .bind(receiver_identity)
+    .execute(&admin)
+    .await
+    .expect("更改目标配置失败");
+    sqlx::query(
+        "UPDATE rule_versions SET snapshot = '{}'::jsonb WHERE tenant_id = $1 AND rule_id = $2",
+    )
+    .bind(tenant)
+    .bind(rule_id)
+    .execute(&admin)
+    .await
+    .expect("更改规则快照失败");
+    sqlx::query("UPDATE rules SET action = 'FORWARD', template = 'changed' WHERE id = $1")
+        .bind(rule_id)
+        .execute(&admin)
+        .await
+        .expect("更改当前规则失败");
+    let duplicate = enqueue_delivery_tasks(
+        &app,
+        tenant,
+        tenant_event.id,
+        &["changed".to_owned()],
+        &[DeliveryTaskInput {
+            rule_id,
+            rule_version: 1,
+            target_tg_chat_id: -2001,
+            sender_identity_id: receiver_identity,
+            action: "FORWARD".to_owned(),
+            payload_snapshot: serde_json::json!({
+                "source": {"tg_chat_id": -9991, "tg_message_id": 99, "media_type": "PHOTO"},
+                "message": {"text": "changed", "parse_mode": "HTML"}
+            }),
+        }],
+    )
+    .await
+    .expect("重复入队失败");
+    assert_eq!(duplicate[0].id, first.tasks[0].id);
+    assert!(!duplicate[0].inserted);
+    let reloaded = load_delivery_task_payload(&app, tenant, first.tasks[0].id)
+        .await
+        .expect("重读快照失败")
+        .expect("任务不存在");
+    assert_eq!(
+        tgm_app::delivery::build_delivery_payload(&reloaded).expect("重建快照失败"),
+        rendered
+    );
+
     let outcome = run_delivery_once(&app, tenant, sender_identity, &transport)
         .await
-        .expect("执行投递 worker 一次失败");
+        .expect("执行重试投递 worker 失败");
     assert_eq!(
         outcome,
         DeliveryRunOutcome::Done {
@@ -260,14 +375,21 @@ async fn pipeline_fanout_rule_match_and_delivery_outbox_are_idempotent(admin: Pg
     .await
     .expect("读取 worker 完成状态失败");
     assert_eq!(status, "DONE");
-    assert_eq!(attempt_count, 1);
+    assert_eq!(attempt_count, 2);
     assert_eq!(message_id, Some(9_877));
+    assert_eq!(
+        *transport
+            .seen_random_ids
+            .lock()
+            .expect("读取投递随机 ID 记录失败"),
+        vec![rendered.telegram_random_id, rendered.telegram_random_id]
+    );
 
     let missing_snapshot_task: i64 = sqlx::query_scalar(
         "INSERT INTO delivery_tasks
             (tenant_id, tenant_event_id, rule_id, rule_version, target_tg_chat_id,
-             sender_identity_id, action, status, idem_key)
-         VALUES ($1, $2, $3, 99, -2001, $4, 'COPY', 'PENDING', 'missing-snapshot-task')
+             sender_identity_id, action, status, telegram_random_id, idem_key)
+         VALUES ($1, $2, $3, 99, -2001, $4, 'COPY', 'PENDING', 2000001, 'missing-snapshot-task')
          RETURNING id",
     )
     .bind(tenant)
@@ -280,14 +402,13 @@ async fn pipeline_fanout_rule_match_and_delivery_outbox_are_idempotent(admin: Pg
     let missing_snapshot_outcome = run_delivery_once(&app, tenant, sender_identity, &transport)
         .await
         .expect("缺失快照任务处理失败");
-    assert_eq!(
-        missing_snapshot_outcome,
-        DeliveryRunOutcome::Failed {
-            task_id: missing_snapshot_task,
-            status: tgm_app::delivery::DeliveryDecisionStatus::Dead,
-            attempt_count: 1,
-        }
-    );
+    assert_eq!(missing_snapshot_outcome, DeliveryRunOutcome::Idle);
+    let status: String = sqlx::query_scalar("SELECT status FROM delivery_tasks WHERE id = $1")
+        .bind(missing_snapshot_task)
+        .fetch_one(&admin)
+        .await
+        .expect("读取隔离状态失败");
+    assert_eq!(status, "PENDING");
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]
@@ -297,6 +418,9 @@ async fn delivery_worker_stops_cleanly_when_shutdown_is_requested(admin: PgPool)
     let sender_identity = seed_identity(&admin, tenant).await;
     let transport = Arc::new(ExpectingTransport {
         expected_text: String::new(),
+        expected_random_id: 1,
+        seen_random_ids: Arc::new(Mutex::new(Vec::new())),
+        expected_payload: None,
     });
     let worker = DeliveryWorker::new(
         app,

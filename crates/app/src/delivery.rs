@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
 use sqlx::types::chrono::Utc;
@@ -18,12 +19,14 @@ use tokio::sync::watch;
 const MIN_WORKER_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_WORKER_RETRY_DELAY: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeliveryParseMode {
+    #[serde(rename = "HTML")]
     Html,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenderedDeliveryMessage {
     pub text: String,
     pub parse_mode: DeliveryParseMode,
@@ -39,6 +42,7 @@ pub enum DeliveryAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryPayload {
     pub task_id: i64,
+    pub telegram_random_id: i64,
     pub target_tg_chat_id: i64,
     pub sender_identity_id: IdentityId,
     pub action: DeliveryAction,
@@ -46,19 +50,19 @@ pub struct DeliveryPayload {
     pub message: RenderedDeliveryMessage,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeliverySourceMessage {
-    pub receiver_identity_id: IdentityId,
     pub tg_chat_id: i64,
     pub tg_message_id: i64,
-    pub sender_id: Option<i64>,
-    pub media_group_id: Option<String>,
     pub media_type: Option<String>,
-    pub file_unique_id: Option<String>,
-    pub file_name: Option<String>,
-    pub file_size: Option<i64>,
-    pub mime_type: Option<String>,
-    pub raw_file_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliverySnapshot {
+    source: DeliverySourceMessage,
+    message: RenderedDeliveryMessage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +101,7 @@ impl DeliveryTransport for TelegramDeliveryTransport {
                 payload.source.tg_chat_id,
                 payload.source.tg_message_id,
                 payload.target_tg_chat_id,
+                payload.telegram_random_id,
                 &payload.message.text,
                 payload.source.media_type.as_deref(),
             )
@@ -266,60 +271,59 @@ pub struct DeliveryRenderInput<'a> {
 pub fn build_delivery_payload(
     record: &DeliveryTaskPayloadRecord,
 ) -> Result<DeliveryPayload, AppError> {
-    let snapshot = record.rule_snapshot.as_ref();
-    if record.rule_id.is_some() && record.rule_version.is_some() && snapshot.is_none() {
-        return Err(invalid_payload("规则快照不存在"));
-    }
-    let template = snapshot
-        .and_then(|value| value.get("rule"))
-        .and_then(|rule| rule.get("template"))
-        .and_then(Value::as_str);
-    let replacements = parse_replacements(snapshot)?;
-    let matched_keywords = record.matched_keywords.clone().unwrap_or_default();
-    let source = DeliverySourceMessage {
-        receiver_identity_id: record
-            .receiver_identity_id
-            .ok_or_else(|| invalid_payload("缺少来源接收身份"))?,
-        tg_chat_id: record
-            .tg_chat_id
-            .ok_or_else(|| invalid_payload("缺少来源 chat_id"))?,
-        tg_message_id: record
-            .tg_message_id
-            .ok_or_else(|| invalid_payload("缺少来源 message_id"))?,
-        sender_id: record.sender_id,
-        media_group_id: record.media_group_id.clone(),
-        media_type: record.media_type.clone(),
-        file_unique_id: record.file_unique_id.clone(),
-        file_name: record.file_name.clone(),
-        file_size: record.file_size,
-        mime_type: record.mime_type.clone(),
-        raw_file_id: record.raw_file_id.clone(),
-    };
-    let message = render_delivery_message(DeliveryRenderInput {
-        template,
-        text: record.text.as_deref(),
-        caption: record.caption.as_deref(),
-        chat_title: record.chat_title.as_deref(),
-        username: record.username.as_deref(),
-        sender_id: record.sender_id,
-        matched_keywords: &matched_keywords,
-        tg_chat_id: record
-            .tg_chat_id
-            .ok_or_else(|| invalid_payload("缺少来源 chat_id"))?,
-        tg_message_id: record
-            .tg_message_id
-            .ok_or_else(|| invalid_payload("缺少来源 message_id"))?,
-        replacements: &replacements,
-    })?;
+    let snapshot: DeliverySnapshot = serde_json::from_value(
+        record
+            .payload_snapshot
+            .clone()
+            .ok_or_else(|| invalid_payload("缺少投递快照"))?,
+    )
+    .map_err(|_| invalid_payload("投递快照格式无效"))?;
+    let random_id = record
+        .telegram_random_id
+        .filter(|value| *value > 0)
+        .ok_or_else(|| invalid_payload("缺少有效 Telegram random_id"))?;
 
     Ok(DeliveryPayload {
         task_id: record.id,
+        telegram_random_id: random_id,
         target_tg_chat_id: record.target_tg_chat_id,
         sender_identity_id: record.sender_identity_id,
         action: parse_delivery_action(&record.action)?,
-        source,
+        source: snapshot.source,
+        message: snapshot.message,
+    })
+}
+
+pub(crate) fn freeze_delivery_snapshot(
+    event: &tgm_db::repo::TenantEventRecord,
+    rule_snapshot: &Value,
+    matched_keywords: &[String],
+) -> Result<Value, AppError> {
+    let replacements = parse_replacements(Some(rule_snapshot))?;
+    let message = render_delivery_message(DeliveryRenderInput {
+        template: rule_snapshot
+            .get("rule")
+            .and_then(|rule| rule.get("template"))
+            .and_then(Value::as_str),
+        text: event.text.as_deref(),
+        caption: event.caption.as_deref(),
+        chat_title: event.chat_title.as_deref(),
+        username: event.username.as_deref(),
+        sender_id: event.sender_id,
+        matched_keywords,
+        tg_chat_id: event.tg_chat_id,
+        tg_message_id: event.tg_message_id,
+        replacements: &replacements,
+    })?;
+    serde_json::to_value(DeliverySnapshot {
+        source: DeliverySourceMessage {
+            tg_chat_id: event.tg_chat_id,
+            tg_message_id: event.tg_message_id,
+            media_type: event.media_type.clone(),
+        },
         message,
     })
+    .map_err(|_| invalid_payload("序列化投递快照失败"))
 }
 
 pub async fn run_delivery_once<T: DeliveryTransport + ?Sized>(
@@ -556,6 +560,7 @@ fn message_link(username: Option<&str>, tg_chat_id: i64, tg_message_id: i64) -> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryErrorKind {
     FloodWait { seconds: i64 },
+    RandomIdUncertain,
     Retryable,
     Permanent,
 }
@@ -579,6 +584,11 @@ impl DeliveryErrorKind {
             return Self::FloodWait {
                 seconds: flood_wait_seconds.unwrap_or_default().max(0),
             };
+        }
+        if code.eq_ignore_ascii_case("RANDOM_ID_DUPLICATE")
+            || code.eq_ignore_ascii_case("MESSAGE_NOT_RETURNED")
+        {
+            return Self::RandomIdUncertain;
         }
         if [
             "CONTENT_PROTECTED",
@@ -613,6 +623,19 @@ pub fn decide_failure(
         };
     }
 
+    if matches!(error, DeliveryErrorKind::RandomIdUncertain) {
+        let retry_after = match current_attempt {
+            1 => 30,
+            2 => 5 * 60,
+            _ => 30 * 60,
+        };
+        return DeliveryFailureDecision {
+            status: DeliveryDecisionStatus::Pending,
+            attempt_count: current_attempt,
+            next_retry_after_seconds: Some(retry_after + jitter_seconds.max(0)),
+        };
+    }
+
     let retry_after = match current_attempt {
         1 => 30,
         2 => 5 * 60,
@@ -628,7 +651,9 @@ pub fn decide_failure(
 
     let flood_wait = match error {
         DeliveryErrorKind::FloodWait { seconds } => seconds,
-        DeliveryErrorKind::Retryable | DeliveryErrorKind::Permanent => 0,
+        DeliveryErrorKind::RandomIdUncertain
+        | DeliveryErrorKind::Retryable
+        | DeliveryErrorKind::Permanent => 0,
     };
 
     DeliveryFailureDecision {
@@ -694,6 +719,28 @@ mod tests {
             DeliveryErrorKind::from_code("FLOOD_WAIT", Some(12)),
             DeliveryErrorKind::FloodWait { seconds: 12 }
         ));
+    }
+
+    #[test]
+    fn random_id_uncertainty_never_enters_dead_letter_after_retry_limit() {
+        assert_eq!(
+            DeliveryErrorKind::from_code("RANDOM_ID_DUPLICATE", None),
+            DeliveryErrorKind::RandomIdUncertain
+        );
+        assert_eq!(
+            DeliveryErrorKind::from_code("MESSAGE_NOT_RETURNED", None),
+            DeliveryErrorKind::RandomIdUncertain
+        );
+
+        for previous_attempt_count in 0..10 {
+            let decision = decide_failure(
+                previous_attempt_count,
+                DeliveryErrorKind::RandomIdUncertain,
+                0,
+            );
+            assert_eq!(decision.status, DeliveryDecisionStatus::Pending);
+            assert!(decision.next_retry_after_seconds.is_some());
+        }
     }
 
     #[test]

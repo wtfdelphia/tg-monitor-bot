@@ -8,7 +8,7 @@ use tgm_db::repo::{
     DeliveryTaskInput, DeliveryTaskWrite, RuleConditionRecord, RuleRecord, TenantEventRecord,
     enqueue_delivery_tasks, fanout_canonical_event, list_all_active_tenants,
     list_unfanned_canonical_event_ids, list_unprocessed_tenant_event_ids, load_enabled_rules,
-    load_tenant_event, mark_canonical_event_fanned_out,
+    load_rule_version, load_tenant_event, mark_canonical_event_fanned_out,
 };
 use tokio::sync::watch;
 
@@ -298,21 +298,25 @@ pub async fn process_tenant_event(
         .iter()
         .map(|matched| matched.matched_keyword.clone())
         .collect();
-    let tasks: Vec<DeliveryTaskInput> = matches
-        .iter()
-        .filter_map(|matched| {
-            raw_rules
-                .get(&matched.rule_id)
-                .map(|record| (matched, record))
-        })
-        .map(|(matched, record)| DeliveryTaskInput {
+    let mut tasks = Vec::with_capacity(matches.len());
+    for matched in &matches {
+        let record = raw_rules.get(&matched.rule_id).ok_or(AppError::NotFound)?;
+        let version = load_rule_version(pool, tenant, matched.rule_id, matched.rule_version)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        tasks.push(DeliveryTaskInput {
             rule_id: matched.rule_id,
             rule_version: matched.rule_version,
             target_tg_chat_id: record.target_tg_chat_id,
             sender_identity_id: record.sender_identity_id,
             action: action_as_str(matched.action).to_string(),
-        })
-        .collect();
+            payload_snapshot: crate::delivery::freeze_delivery_snapshot(
+                &event_record,
+                &version.snapshot,
+                &matched_keywords,
+            )?,
+        });
+    }
     let writes =
         enqueue_delivery_tasks(pool, tenant, tenant_event_id, &matched_keywords, &tasks).await?;
 
