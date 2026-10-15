@@ -399,6 +399,310 @@ async fn r13_console_sessions_denied(admin: PgPool) {
     }
 }
 
+/// `web_sessions` 的写入只允许鉴权域代表当前绑定的 Telegram 用户写入。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn auth_lookup_web_session_insert_is_bound_to_auth_user(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let auth = support::auth_pool(&admin).await;
+    support::assert_role(&app, "app_user").await;
+    support::assert_role(&auth, "auth_lookup").await;
+    let tenant = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO tenants (name, owner_user_id) VALUES ('session-rls', 7301) RETURNING id",
+    )
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建会话 RLS 测试租户失败");
+    sqlx::query("INSERT INTO tenant_members (tenant_id, user_id) VALUES ($1, 7301), ($1, 7302)")
+        .bind(tenant)
+        .execute(admin.raw())
+        .await
+        .expect("创建会话 RLS 测试成员失败");
+
+    let mut tx = auth.begin().await.expect("开启 auth_lookup 事务失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', '7301', true)")
+        .execute(&mut *tx)
+        .await
+        .expect("绑定 auth_user_id 失败");
+    let own = sqlx::query(
+        "INSERT INTO web_sessions (tenant_id, id, user_id, csrf_token, expires_at)
+         VALUES ($1, $2, 7301, $3, now() + interval '30 days')",
+    )
+    .bind(tenant)
+    .bind([1_u8; 32].as_slice())
+    .bind([2_u8; 32].as_slice())
+    .execute(&mut *tx)
+    .await;
+    assert!(own.is_ok(), "auth_lookup 不能写入自己的会话：{own:?}");
+    tx.commit().await.expect("提交自己的会话失败");
+
+    let mut tx = auth.begin().await.expect("开启越权事务失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', '7301', true)")
+        .execute(&mut *tx)
+        .await
+        .expect("绑定越权测试 auth_user_id 失败");
+    let err = sqlx::query(
+        "INSERT INTO web_sessions (tenant_id, id, user_id, csrf_token, expires_at)
+         VALUES ($1, $2, 7302, $3, now() + interval '30 days')",
+    )
+    .bind(tenant)
+    .bind([3_u8; 32].as_slice())
+    .bind([4_u8; 32].as_slice())
+    .execute(&mut *tx)
+    .await
+    .expect_err("auth_lookup 竟能代表别的 Telegram 用户写会话");
+    assert!(
+        err.to_string().contains("row-level security policy"),
+        "越权写入被拒了，但不是 RLS 拒绝：{err}"
+    );
+
+    let mut tx = app.begin().await.expect("开启 app_user 事务失败");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("绑定租户上下文失败");
+    let err = sqlx::query(
+        "INSERT INTO web_sessions (tenant_id, id, user_id, csrf_token, expires_at)
+         VALUES ($1, $2, 7301, $3, now() + interval '30 days')",
+    )
+    .bind(tenant)
+    .bind([5_u8; 32].as_slice())
+    .bind([6_u8; 32].as_slice())
+    .execute(&mut *tx)
+    .await
+    .expect_err("app_user 竟能写入 web_sessions");
+    assert!(
+        err.to_string().contains("permission denied"),
+        "app_user 被拒了，但不是 GRANT 层拒绝：{err}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn auth_lookup_web_session_delete_is_bound_to_session(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let auth = support::auth_pool(&admin).await;
+    support::assert_role(&app, "app_user").await;
+    support::assert_role(&auth, "auth_lookup").await;
+    let tenant: i64 = sqlx::query_scalar(
+        "INSERT INTO tenants (name, owner_user_id)
+         VALUES ('web-session-delete', 7301)
+         RETURNING id",
+    )
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建会话删除隔离租户失败");
+    sqlx::query(
+        "INSERT INTO tenant_members (tenant_id, user_id, role)
+         VALUES ($1, 7301, 'TENANT_ADMIN'), ($1, 7302, 'TENANT_ADMIN')",
+    )
+    .bind(tenant)
+    .execute(admin.raw())
+    .await
+    .expect("创建会话删除隔离成员失败");
+    let own = [7_u8; 32];
+    let other = [8_u8; 32];
+
+    sqlx::query(
+        "INSERT INTO web_sessions (tenant_id, id, user_id, csrf_token, expires_at)
+         VALUES ($1, $2, 7301, $3, now() + interval '30 days'),
+                ($1, $4, 7302, $5, now() + interval '30 days')",
+    )
+    .bind(tenant)
+    .bind(own.as_slice())
+    .bind([9_u8; 32].as_slice())
+    .bind(other.as_slice())
+    .bind([10_u8; 32].as_slice())
+    .execute(admin.raw())
+    .await
+    .expect("创建会话删除隔离数据失败");
+
+    let mut tx = auth.begin().await.expect("开启无上下文删除事务失败");
+    let deleted = sqlx::query("DELETE FROM web_sessions WHERE id = $1")
+        .bind(own.as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect("无上下文删除应闭锁为零行");
+    assert_eq!(deleted.rows_affected(), 0, "未设置上下文竟能删除会话");
+    drop(tx);
+
+    let mut tx = auth.begin().await.expect("开启会话删除隔离事务失败");
+    sqlx::query("SELECT set_config('app.session_id', '\\x' || encode($1, 'hex'), true)")
+        .bind(own.as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect("绑定当前 session_id 失败");
+    let deleted = sqlx::query("DELETE FROM web_sessions WHERE id IN ($1, $2)")
+        .bind(own.as_slice())
+        .bind(other.as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect("删除当前会话失败");
+    assert_eq!(deleted.rows_affected(), 1);
+    tx.commit().await.expect("提交会话删除隔离事务失败");
+
+    let mut tx = app.begin().await.expect("开启业务角色删除事务失败");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("绑定业务角色租户上下文失败");
+    let err = sqlx::query("DELETE FROM web_sessions WHERE id = $1")
+        .bind(other.as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect_err("app_user 竟能删除 web_sessions");
+    assert!(
+        err.to_string().contains("permission denied"),
+        "app_user 被拒了，但不是 GRANT 层拒绝：{err}"
+    );
+
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM web_sessions WHERE id = $1")
+        .bind(other.as_slice())
+        .fetch_one(admin.raw())
+        .await
+        .expect("查询未授权会话失败");
+    assert_eq!(remaining, 1);
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn auth_lookup_web_session_management_is_bound_to_user(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let auth = support::auth_pool(&admin).await;
+    support::assert_role(&app, "app_user").await;
+    support::assert_role(&auth, "auth_lookup").await;
+    support::assert_not_bypassrls(&auth).await;
+    let (tenant_a, tenant_b) = seed_two_tenants(&admin).await;
+    const USER_ID: i64 = 7311;
+    const OTHER_USER_ID: i64 = 7312;
+    for tenant in [tenant_a, tenant_b] {
+        sqlx::query("INSERT INTO tenant_members (tenant_id, user_id) VALUES ($1, $2), ($1, $3)")
+            .bind(tenant)
+            .bind(USER_ID)
+            .bind(OTHER_USER_ID)
+            .execute(admin.raw())
+            .await
+            .expect("创建跨租户会话成员失败");
+    }
+    let own_a = [31_u8; 32];
+    let own_b = [32_u8; 32];
+    let other_a = [33_u8; 32];
+    let other_b = [34_u8; 32];
+    for (tenant, user_id, session_id) in [
+        (tenant_a, USER_ID, own_a),
+        (tenant_b, USER_ID, own_b),
+        (tenant_a, OTHER_USER_ID, other_a),
+        (tenant_b, OTHER_USER_ID, other_b),
+    ] {
+        sqlx::query(
+            "INSERT INTO web_sessions (tenant_id, id, user_id, csrf_token, expires_at)
+             VALUES ($1, $2, $3, $2, now() + interval '30 days')",
+        )
+        .bind(tenant)
+        .bind(session_id.as_slice())
+        .bind(user_id)
+        .execute(admin.raw())
+        .await
+        .expect("创建跨租户会话失败");
+    }
+
+    let mut tx = auth.begin().await.expect("开启无上下文会话事务失败");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM web_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("无上下文列表应闭锁为零行");
+    assert_eq!(count, 0);
+    let deleted = sqlx::query("DELETE FROM web_sessions")
+        .execute(&mut *tx)
+        .await
+        .expect("无上下文撤销应闭锁为零行");
+    assert_eq!(deleted.rows_affected(), 0);
+    tx.commit().await.expect("提交无上下文事务失败");
+
+    let mut connection = auth.acquire().await.expect("获取会话隔离连接失败");
+    let mut tx = sqlx::Connection::begin(&mut *connection)
+        .await
+        .expect("开启用户会话事务失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', $1, true)")
+        .bind(USER_ID.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("绑定用户会话上下文失败");
+    let tenants: Vec<i64> =
+        sqlx::query_scalar("SELECT tenant_id FROM web_sessions ORDER BY tenant_id")
+            .fetch_all(&mut *tx)
+            .await
+            .expect("读取本人跨租户会话失败");
+    assert_eq!(tenants, vec![tenant_a, tenant_b]);
+    let denied = sqlx::query("DELETE FROM web_sessions WHERE id IN ($1, $2)")
+        .bind(other_a.as_slice())
+        .bind(other_b.as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect("他人会话撤销应闭锁为零行");
+    assert_eq!(denied.rows_affected(), 0);
+    let deleted = sqlx::query("DELETE FROM web_sessions WHERE id = $1")
+        .bind(own_b.as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect("撤销本人另一租户会话失败");
+    assert_eq!(deleted.rows_affected(), 1);
+    tx.commit().await.expect("提交用户撤销事务失败");
+
+    let mut tx = sqlx::Connection::begin(&mut *connection)
+        .await
+        .expect("开启上下文残留检查事务失败");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM web_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("用户事务结束后的会话列表应闭锁");
+    assert_eq!(count, 0);
+    let deleted = sqlx::query("DELETE FROM web_sessions")
+        .execute(&mut *tx)
+        .await
+        .expect("用户事务结束后的会话撤销应闭锁");
+    assert_eq!(deleted.rows_affected(), 0);
+    tx.commit().await.expect("提交上下文残留检查失败");
+
+    for query in ["SELECT id FROM web_sessions", "DELETE FROM web_sessions"] {
+        let mut tx = app.begin().await.expect("开启业务角色会话事务失败");
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(tenant_a.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("绑定业务角色租户失败");
+        let err = sqlx::query(query)
+            .execute(&mut *tx)
+            .await
+            .expect_err("业务角色竟能管理会话");
+        assert!(
+            err.to_string().contains("permission denied"),
+            "业务角色不是在 GRANT 层被拒：{err}"
+        );
+    }
+    let mut tx = auth.begin().await.expect("开启裸删除隔离事务失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', $1, true)")
+        .bind(USER_ID.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("绑定裸删除用户上下文失败");
+    let deleted = sqlx::query("DELETE FROM web_sessions")
+        .execute(&mut *tx)
+        .await
+        .expect("本人裸删除会话失败");
+    assert_eq!(
+        deleted.rows_affected(),
+        1,
+        "DELETE 策略泄露了他人行或没有删除本人行"
+    );
+    tx.commit().await.expect("提交裸删除会话失败");
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM web_sessions WHERE user_id = $1")
+        .bind(OTHER_USER_ID)
+        .fetch_one(admin.raw())
+        .await
+        .expect("确认他人会话保留失败");
+    assert_eq!(remaining, 2);
+}
+
 /// R24 `ensure_rls` 不得把 FORCE RLS 打到临时表上。
 ///
 /// 这条的来历与清单里其余各条不同：它不是照设计推出来的，是被一条无关探针

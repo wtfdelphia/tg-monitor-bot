@@ -27,8 +27,8 @@
 | 7 | `scripts/ai-driver/refs/README.md` | 上游纪律事实源与台账（§4.0 / §6.1 / §6.2 的全文与锚点） |
 
 其他层按需：规格问题查 `docs/design/spec/`，为什么这么定查 `docs/design/decisions/`
-（只增不改），怎么部署查 `docs/design/ops/`。`docs/pre-do/` 是动工前清单，
-其作废条件尚未满足（见该目录 `README.md`），其中的实测记录仍然有效。
+（只增不改），怎么部署查 `docs/design/ops/`。`docs/pre-do/` 是已作废的动工前清单，
+后续任务以 `docs/plan/` 为准；其中的实测记录仍然有效。
 
 **任务队列**：`docs/plan/backlog/`（机器可读，格式见该目录 `README.md`，
 驱动从第一个 `status: pending` 取件）。

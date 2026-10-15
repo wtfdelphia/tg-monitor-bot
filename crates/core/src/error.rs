@@ -1,4 +1,4 @@
-//! `AppError` 与 11 个错误码的映射。定义处是 eng/00 §三，
+//! `AppError` 与错误码的映射。定义处是 eng/00 §三，
 //! 错误码表在 spec/07 §2.1（含每个码的 HTTP 状态与场景）。
 //!
 //! **HTTP 层的 `IntoResponse` impl 不在这里，它随 WP-5 的 axum 落地。**
@@ -25,6 +25,14 @@ pub enum AppError {
     NotFound,
     #[error("rule conflict")]
     RuleConflict { existing_id: i64 },
+    #[error("keyword conflict")]
+    KeywordConflict { existing_id: i64 },
+    #[error("keyword is referenced by rules")]
+    KeywordReferenced { rule_ids: Vec<i64> },
+    #[error("target conflict")]
+    TargetConflict { existing_id: i64 },
+    #[error("identity is referenced")]
+    IdentityReferenced { reason: String },
     #[error("condition invalid: {0}")]
     ConditionInvalid(String),
     #[error("regex invalid: {0}")]
@@ -37,6 +45,8 @@ pub enum AppError {
     CredentialViaWebOnly,
     #[error("not invited")]
     NotInvited,
+    #[error("OIDC provider unavailable")]
+    OidcProviderUnavailable,
 
     // 以下两个不对外暴露细节，统一 500。
     // `transparent` 是**刻意**的：它让 Display 转发出底层错误全文，
@@ -75,12 +85,17 @@ impl AppError {
             Self::CsrfInvalid => "CSRF_INVALID",
             Self::NotFound => "NOT_FOUND",
             Self::RuleConflict { .. } => "RULE_CONFLICT",
+            Self::KeywordConflict { .. } => "KEYWORD_CONFLICT",
+            Self::KeywordReferenced { .. } => "KEYWORD_REFERENCED",
+            Self::TargetConflict { .. } => "TARGET_CONFLICT",
+            Self::IdentityReferenced { .. } => "IDENTITY_REFERENCED",
             Self::ConditionInvalid(_) => "CONDITION_INVALID",
             Self::RegexInvalid(_) => "REGEX_INVALID",
             Self::QuotaExceeded => "QUOTA_EXCEEDED",
             Self::RateLimited => "RATE_LIMITED",
             Self::CredentialViaWebOnly => "CREDENTIAL_VIA_WEB_ONLY",
             Self::NotInvited => "NOT_INVITED",
+            Self::OidcProviderUnavailable => "OIDC_PROVIDER_UNAVAILABLE",
             Self::Db(_) | Self::Other(_) => "INTERNAL",
         }
     }
@@ -95,9 +110,14 @@ impl AppError {
                 403
             }
             Self::NotFound => 404,
-            Self::RuleConflict { .. } => 409,
+            Self::RuleConflict { .. }
+            | Self::KeywordConflict { .. }
+            | Self::KeywordReferenced { .. }
+            | Self::TargetConflict { .. }
+            | Self::IdentityReferenced { .. } => 409,
             Self::ConditionInvalid(_) | Self::RegexInvalid(_) => 400,
             Self::QuotaExceeded | Self::RateLimited => 429,
+            Self::OidcProviderUnavailable => 503,
             Self::Db(_) | Self::Other(_) => 500,
         }
     }
@@ -116,14 +136,18 @@ impl AppError {
     pub fn public_message(&self) -> String {
         match self {
             Self::Db(_) | Self::Other(_) => "internal error".to_string(),
+            Self::OidcProviderUnavailable => "OIDC provider unavailable, please retry".to_string(),
             other => other.to_string(),
         }
     }
 
     /// 是否该把细节写进日志并附 `request_id`。
-    /// 只有 500 那两个 —— 其余都是客户端能自己纠正的输入问题，记了是噪声。
+    /// 内部错误与 OIDC provider 不可用需要记录；其余都是客户端能自己纠正的输入问题。
     pub fn is_internal(&self) -> bool {
-        matches!(self, Self::Db(_) | Self::Other(_))
+        matches!(
+            self,
+            Self::Db(_) | Self::Other(_) | Self::OidcProviderUnavailable
+        )
     }
 
     /// 显式擦除类型，产出 [`AppError::Other`]。
@@ -144,7 +168,7 @@ impl AppError {
 mod tests {
     use super::AppError;
 
-    /// spec/07 §2.1 那 11 个码，外加 `INTERNAL`。
+    /// spec/07 §2.1 的公开码，外加关键词引用保护码与 `INTERNAL`。
     /// 手写清单，与 `code()` 的 match 互为对照 —— match 的穷尽性保证
     /// 「每个变体都有码」，这份清单保证「码没重复、没错配状态」。
     fn all() -> Vec<AppError> {
@@ -154,26 +178,35 @@ mod tests {
             AppError::CsrfInvalid,
             AppError::NotFound,
             AppError::RuleConflict { existing_id: 7 },
+            AppError::KeywordConflict { existing_id: 7 },
+            AppError::KeywordReferenced {
+                rule_ids: vec![7, 8],
+            },
+            AppError::TargetConflict { existing_id: 9 },
+            AppError::IdentityReferenced {
+                reason: "identity has dependent records".into(),
+            },
             AppError::ConditionInvalid("size_min 给了两条".into()),
             AppError::RegexInvalid("unclosed group".into()),
             AppError::QuotaExceeded,
             AppError::RateLimited,
             AppError::CredentialViaWebOnly,
             AppError::NotInvited,
+            AppError::OidcProviderUnavailable,
             AppError::Db(sqlx::Error::RowNotFound),
         ]
     }
 
     #[test]
-    fn eleven_public_codes_plus_internal_all_distinct() {
+    fn public_codes_plus_internal_are_distinct() {
         let codes: Vec<&str> = all().iter().map(AppError::code).collect();
         let mut uniq = codes.clone();
         uniq.sort_unstable();
         uniq.dedup();
         assert_eq!(uniq.len(), codes.len(), "有重复的 code：{codes:?}");
-        // 11 个对外码 + INTERNAL。数字变了就是 spec/07 §2.1 改了，
+        // 关键词删除需要额外的 409 码，数字变了就是接口契约改了，
         // 那时该先改文档再改这里。
-        assert_eq!(codes.len(), 12);
+        assert_eq!(codes.len(), 17);
     }
 
     /// 本模块存在的头号理由。按直觉写会是 403。

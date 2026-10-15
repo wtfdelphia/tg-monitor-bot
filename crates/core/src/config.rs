@@ -9,6 +9,7 @@
 //! `Vec<ConfigProblem>` 而不是在第一个问题上 `return Err` —— 按角色配十几个
 //! 变量，逐个试错要重启十几次。
 
+use crate::oidc::{OidcAlgorithmError, OidcSigningAlgorithm};
 use crate::profile::Profile;
 
 /// 一条配置问题。`Display` 出来的文本就是运维要读的那一行。
@@ -30,6 +31,9 @@ pub enum ConfigProblem {
          见 eng/01 §4.5"
     )]
     SqlxLogNotSilenced(String),
+
+    #[error("TGM_OIDC_ALG 只接受 RS256、ES256、EdDSA 或 ES256K，收到 {0:?}")]
+    InvalidOidcAlgorithm(String),
 
     /// `TGM_PROFILE` 缺失。它本可以走 `Missing`，但单独一条是因为它的**后果**
     /// 不同：profile 定不下来时 §4.5 那条判不了（见 `check` 里对 `None` 的处理），
@@ -83,11 +87,20 @@ fn extra_required(role: Role) -> &'static [&'static str] {
             "TGM_OIDC_BOT_ID",
             "TGM_OIDC_ALG",
             "TGM_OIDC_REDIRECT_URL",
+            "TGM_OIDC_CLIENT_SECRET",
             "TGM_CONTROL_BOT_TOKEN",
+            "TGM_CONTROL_BOT_SECRET_TOKEN",
+            "TGM_CONTROL_BOT_IDENTITY_ID",
+            "TGM_CONTROL_BOT_USERNAME",
             // TGM_LISTEN_ADDR 不必填：§二 给了默认 127.0.0.1:8080，
             // 且那个默认值本身是安全选择（配错时失败方向是「连不上」而非「上公网」）
         ],
-        Role::BotGateway => &["TGM_DB_URL_AUTH", "TGM_KEK_BACKEND"],
+        Role::BotGateway => &[
+            "TGM_DB_URL_AUTH",
+            "TGM_KEK_BACKEND",
+            "TGM_DATA_BOT_SECRET_TOKEN",
+            "TGM_DATA_BOT_IDENTITY_ID",
+        ],
         Role::MtprotoWorker => &["TGM_KEK_BACKEND", "TGM_S3_ENDPOINT", "TGM_S3_BUCKET"],
         Role::Delivery => &["TGM_KEK_BACKEND", "TGM_S3_ENDPOINT", "TGM_S3_BUCKET"],
         // fanout 与 rule 只要 COMMON。它们不碰凭据也不碰对象存储 ——
@@ -107,7 +120,11 @@ fn allowed(role: Role) -> Vec<&'static str> {
     v.extend_from_slice(extra_required(role));
     match role {
         Role::ControlPlane => v.push("TGM_LISTEN_ADDR"),
-        Role::BotGateway | Role::MtprotoWorker | Role::Delivery => {
+        Role::BotGateway => {
+            v.push("TGM_BOT_GATEWAY_LISTEN_ADDR");
+            v.extend_from_slice(&["TGM_KMS_KEY_ARN", "TGM_LOCAL_KEK"]);
+        }
+        Role::MtprotoWorker | Role::Delivery => {
             v.extend_from_slice(&["TGM_KMS_KEY_ARN", "TGM_LOCAL_KEK"]);
         }
         Role::Fanout | Role::Rule => {}
@@ -209,6 +226,18 @@ pub fn check(
     problems
 }
 
+/// 校验控制面 OIDC 的固定验签算法。
+///
+/// 算法来自部署配置，而不是来自未经验证的 `id_token` header；`none`、`HS256`
+/// 等值在这里直接拒绝，避免把错误配置带进运行态验签路径。
+pub fn validate_oidc_alg(value: &str) -> Result<OidcSigningAlgorithm, ConfigProblem> {
+    OidcSigningAlgorithm::parse(value).map_err(|error| match error {
+        OidcAlgorithmError::Unsupported | OidcAlgorithmError::Mismatch => {
+            ConfigProblem::InvalidOidcAlgorithm(value.to_owned())
+        }
+    })
+}
+
 /// eng/01 §二 那张表里的全部变量名，加上 `NEVER` 里的。
 ///
 /// 这份清单是「多配」判定的定义域。表里加了新变量而这里漏了，后果是
@@ -234,8 +263,15 @@ fn known_names() -> &'static [&'static str] {
         "TGM_OIDC_BOT_ID",
         "TGM_OIDC_ALG",
         "TGM_OIDC_REDIRECT_URL",
+        "TGM_OIDC_CLIENT_SECRET",
         "TGM_CONTROL_BOT_TOKEN",
+        "TGM_CONTROL_BOT_SECRET_TOKEN",
+        "TGM_CONTROL_BOT_IDENTITY_ID",
+        "TGM_CONTROL_BOT_USERNAME",
         "TGM_LISTEN_ADDR",
+        "TGM_DATA_BOT_SECRET_TOKEN",
+        "TGM_DATA_BOT_IDENTITY_ID",
+        "TGM_BOT_GATEWAY_LISTEN_ADDR",
     ]
 }
 
@@ -243,7 +279,8 @@ fn known_names() -> &'static [&'static str] {
 // 同 kek.rs：测试里的 expect/unwrap 就是断言本身。
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::{COMMON, ConfigProblem, Role, check, extra_required};
+    use super::{COMMON, ConfigProblem, Role, check, extra_required, validate_oidc_alg};
+    use crate::oidc::OidcSigningAlgorithm;
 
     /// 该角色的一份「刚好合规」的环境。用它当基线，每条测试只动一处。
     fn minimal(role: Role) -> Vec<&'static str> {
@@ -421,5 +458,22 @@ mod tests {
         let env = minimal(Role::Rule);
         let p = check(Role::Rule, Some("development"), &env, Some("debug"));
         assert!(p.is_empty(), "development 下不该管 RUST_LOG：{p:?}");
+    }
+
+    #[test]
+    fn oidc_algorithm_configuration_is_closed_over_supported_public_key_algorithms() {
+        assert_eq!(validate_oidc_alg("RS256"), Ok(OidcSigningAlgorithm::Rs256));
+        assert_eq!(validate_oidc_alg("ES256"), Ok(OidcSigningAlgorithm::Es256));
+        assert_eq!(validate_oidc_alg("EdDSA"), Ok(OidcSigningAlgorithm::EdDsa));
+        assert_eq!(
+            validate_oidc_alg("ES256K"),
+            Ok(OidcSigningAlgorithm::Es256k)
+        );
+        for invalid in ["none", "HS256", "", "RS384"] {
+            assert_eq!(
+                validate_oidc_alg(invalid),
+                Err(ConfigProblem::InvalidOidcAlgorithm(invalid.to_owned()))
+            );
+        }
     }
 }

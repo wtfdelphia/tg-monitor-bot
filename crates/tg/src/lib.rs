@@ -6,5 +6,9 @@
 //!
 //! 所以有一条纪律：**raw invoke 不得出现在本 crate 之外。**
 
+pub mod client;
+
+pub use client::{TelegramClient, TelegramClientError, TelegramDeliveryAction};
+
 /// QR 登录状态机。这里只处理纯状态迁移，不接触网络、凭据或数据库。
 pub mod qr;
