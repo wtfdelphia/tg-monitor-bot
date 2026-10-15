@@ -70,6 +70,11 @@ jobs:
       - name: 池 newtype 的负向约束
         run: scripts/check-newtype.sh
 
+      - name: OpenAPI 契约一致
+        run: cargo run --quiet --bin tgm -- openapi --check
+        env:
+          SQLX_OFFLINE: "true"
+
       - name: 驱动回归
         run: python3 scripts/ai-driver/check-regressions.py
 

@@ -272,7 +272,7 @@ gh() {
 
     def test_gate_order_modes_and_schema_defaults(self):
         order = re.search(r'ORDER=\((.*?)\)', GATES.read_text()).group(1).split()
-        static = ["fmt", "clippy", "offline-build", "deny", "newtype", "driver-regressions"]
+        static = ["fmt", "clippy", "offline-build", "deny", "newtype", "openapi-check", "driver-regressions"]
         self.assertEqual(order, [*static, "migrate", "sqlx-check", "migrate-idempotent", "test", "audit-rls", "double-pass"])
         for args, selected in (
             ((), order),
@@ -283,6 +283,7 @@ gh() {
             (("--from", "migrate"), order[len(static):]),
             (("--task-only", "--from", "sqlx-check"), ["sqlx-check", "test"]),
             (("--from", "test"), order[order.index("test"):]),
+            (("--static-only", "--from", "openapi-check"), ["openapi-check", "driver-regressions"]),
         ):
             with self.subTest(args=args):
                 result, events = self.gate_trace(*args)
@@ -311,16 +312,22 @@ gh() {
                      ("--task-only", "--no-db")):
             self.gate_trace(*args, expected=2)
 
-    def test_driver_failure_stops_the_gate_chain(self):
-        arguments = ["scripts/ai-driver/check-regressions.py"]
-        result, events = self.gate_trace("--static-only", expected=29, overrides={
-            "REGRESSION_FAIL_TOOL": "python3",
-            "REGRESSION_FAIL_ARGS": json.dumps(arguments),
-        })
-        self.assertEqual(events[-1]["args"], arguments)
-        self.assertNotIn("静态卡口通过", result.stdout)
+    def test_static_contract_and_driver_failures_stop_the_gate_chain(self):
+        failures = [
+            ("cargo", ["run", "--quiet", "--bin", "tgm", "--", "openapi", "--check"]),
+            ("python3", ["scripts/ai-driver/check-regressions.py"]),
+        ]
+        for tool, arguments in failures:
+            with self.subTest(tool=tool):
+                result, events = self.gate_trace("--static-only", expected=29, overrides={
+                    "REGRESSION_FAIL_TOOL": tool,
+                    "REGRESSION_FAIL_ARGS": json.dumps(arguments),
+                })
+                self.assertEqual(events[-1]["args"], arguments)
+                self.assertNotIn("静态卡口通过", result.stdout)
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         static_job = workflow.split("  static:", 1)[1].split("  database:", 1)[0]
+        self.assertIn("cargo run --quiet --bin tgm -- openapi --check", static_job)
         self.assertIn("python3 scripts/ai-driver/check-regressions.py", static_job)
 
     def test_explicit_schema_and_control_overrides(self):

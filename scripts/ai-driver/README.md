@@ -41,11 +41,13 @@ owner 连接。可用 `TGM_DB_URL_TEST`、`TGM_DB_URL_TASK_SCHEMA`、
 单独初始化。`--task-only` 不迁移生产库，须先完成可信迁移并保证 PgBouncer 可用；
 `--from` 只运行指定卡口及之后的选中卡口，不能代替全量验收。
 
-默认驱动回归已纳入本地和 CI static，失败必须阻断后续步骤。PR 引用使用当前 gh
-支持的 GraphQL 查询，严格比较 base 名称、base SHA 和 head SHA；空结果或查询失败
-拒绝完成。OpenAPI 接入在依赖实现之后由 PRE-004 负责，不在本分支提前启用。
-
 驱动回归检查不调用模型、不推送分支、不创建 PR：
+
+默认回归和双 OpenAPI 契约检查已纳入本地 static 卡口及 CI static job；任一步失败
+都必须停止。PR 引用通过 `gh api graphql` 一次查询 `baseRefName`、`baseRefOid` 与
+`headRefOid`，严格比较固定基线和推送提交；兼容本机 `gh 2.4.0`，查询失败、空结果或
+任一引用不符都不会写入完成状态。发布授权后已对新建 PR #3/#4/#5 核验正确引用与
+错误 head；这不代表全权限驱动的失败回收与状态结算演练已经完成。
 
 ```bash
 python3 scripts/ai-driver/check-regressions.py
@@ -144,7 +146,7 @@ Rust/Node 工具链，使用真实服务检查环境白名单。`--fresh-db` 另
   scripts/ 等保护路径时不跑卡口直接升级。兜不住的是**基线里本来就坏的脚本**
   —— 所以 PROTECTED 清单本身只有人能改（见 AGENTS.md §七 信任边界）。
   另外 .sqlx 那条卡口的反证仍会被增量编译骗过（eng/04 §六），驱动不重复反证。
-3 tgm openapi --check 刻意不跑：WP-5 前它 exit 1，红不携带信息（同 ci.yml）。
+3 OpenAPI 与默认驱动回归已在 static 卡口执行；条件跳过的真实环境用例不算通过。
 4 驱动不并行多任务：入口用 Git common dir 下的 `flock` 互斥锁保证一次只有
    一个 `ai-run`，一个库、一条卡口序列；各任务使用隔离 target/，并行仍会把失败方向搅混。
    要吞吐先换「人审合并」的吞吐，不要在这里换。
