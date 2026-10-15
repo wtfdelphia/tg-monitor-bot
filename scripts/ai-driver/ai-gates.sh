@@ -175,9 +175,10 @@ check_version_drift() {
 check_version_drift cargo-deny "$(cargo deny --version 2>/dev/null | sed 's/[^0-9.]//g')"
 check_version_drift sqlx-cli "$(cargo sqlx --version 2>/dev/null | sed 's/[^0-9.]//g')"
 
-declare -a ORDER=(fmt clippy offline-build deny newtype migrate sqlx-check migrate-idempotent test audit-rls double-pass)
+declare -a ORDER=(fmt clippy offline-build deny newtype driver-regressions migrate sqlx-check migrate-idempotent test audit-rls double-pass)
 declare -A CLASS=(
   [fmt]=static [clippy]=static [offline-build]=static [deny]=static [newtype]=static
+  [driver-regressions]=static
   [migrate]=trusted [sqlx-check]=task [migrate-idempotent]=trusted [test]=task
   [audit-rls]=trusted [double-pass]=trusted
 )
@@ -377,6 +378,7 @@ run_gate static clippy cargo clippy --all-targets --all-features -- -D warnings
 run_gate static offline-build env SQLX_OFFLINE=true cargo build --workspace --all-targets
 run_gate static deny cargo deny check
 run_gate static newtype trusted_helper scripts/check-newtype.sh
+run_gate static driver-regressions python3 scripts/ai-driver/check-regressions.py
 if [ "$MODE" = trusted ] || [ "$MODE" = all ]; then
   ensure_db
 fi
@@ -391,7 +393,7 @@ run_gate task test cargo test --workspace
 run_gate trusted audit-rls cargo run --quiet --bin tgm -- audit-rls
 run_gate trusted double-pass trusted_helper scripts/audit-double-pass.sh
 
-echo "── 跳过 openapi-check（同 CI：WP-5 前该命令未实现）──"
+echo "── 跳过 openapi-check（PRE-004 在实现入分支后接入）──"
 case "$MODE" in
   static) echo "✓ 已执行的静态卡口通过；数据库卡口未运行" ;;
   task) echo "✓ 已执行的任务代码卡口通过；可信数据库卡口未运行" ;;
@@ -400,7 +402,7 @@ case "$MODE" in
     if [ -n "$FROM" ]; then
       echo "✓ 已执行从 $FROM 开始的本地卡口（此前卡口按 --from 跳过）"
     else
-      echo "✓ 已执行的全部本地卡口通过（openapi-check 按 CI 约定跳过）"
+      echo "✓ 已执行的全部本地卡口通过"
     fi
     ;;
 esac

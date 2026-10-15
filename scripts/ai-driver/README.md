@@ -41,6 +41,10 @@ owner 连接。可用 `TGM_DB_URL_TEST`、`TGM_DB_URL_TASK_SCHEMA`、
 单独初始化。`--task-only` 不迁移生产库，须先完成可信迁移并保证 PgBouncer 可用；
 `--from` 只运行指定卡口及之后的选中卡口，不能代替全量验收。
 
+默认驱动回归已纳入本地和 CI static，失败必须阻断后续步骤。PR 引用使用当前 gh
+支持的 GraphQL 查询，严格比较 base 名称、base SHA 和 head SHA；空结果或查询失败
+拒绝完成。OpenAPI 接入在依赖实现之后由 PRE-004 负责，不在本分支提前启用。
+
 驱动回归检查不调用模型、不推送分支、不创建 PR：
 
 ```bash

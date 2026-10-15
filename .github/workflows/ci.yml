@@ -70,6 +70,9 @@ jobs:
       - name: 池 newtype 的负向约束
         run: scripts/check-newtype.sh
 
+      - name: 驱动回归
+        run: python3 scripts/ai-driver/check-regressions.py
+
   # ── 连库的两条 + 全部测试 ────────────────────────────────────────
   database:
     runs-on: ubuntu-latest
@@ -202,12 +205,3 @@ jobs:
         run: scripts/audit-double-pass.sh
         env:
           TGM_DB_URL_OWNER: postgres://postgres:pw@127.0.0.1:55432/tgm
-
-# ── eng/04 §四 清单里**故意不在本文件**的一条 ──────────────────────
-#
-# tgm openapi --check
-#   契约导出随 WP-5 落地，`openapi.json` 还不存在。该命令现在 exit 1
-#   （main.rs 里那段注释写了为什么不是 exit 0）—— 所以它现在放进 CI
-#   会让每次 PR 都红。列在这里而不是静默省掉：一条漏掉的卡口和一条
-#   不存在的卡口在 yml 里长得一样，而前者是事故。
-#   WP-5 落地时把上面 static job 里加回这一步，并删掉本段注释。

@@ -1559,8 +1559,24 @@ fi
 
 # ── 推分支与 PR ─────────────────────────────────────────────────
 exit_rc=1
+verify_pr_refs() {
+  local pr_url="$1" expected_head="$2" actual_refs expected_refs
+  actual_refs="$(gh api graphql \
+    -f query='query($url: URI!) { resource(url: $url) { ... on PullRequest { baseRefName baseRefOid headRefOid } } }' \
+    -f url="$pr_url" \
+    --jq 'select(.errors == null) | .data.resource | select(. != null) | [.baseRefName, .baseRefOid, .headRefOid] | @tsv')" || {
+    log "PR 引用查询失败，拒绝写完成状态"
+    return 1
+  }
+  expected_refs="$(printf '%s\t%s\t%s' "$BASE" "$BASE_COMMIT" "$expected_head")"
+  if [ -z "$BASE" ] || [ -z "$BASE_COMMIT" ] || [ -z "$expected_head" ] || [ "$actual_refs" != "$expected_refs" ]; then
+    log "PR 实际引用与固定提交不一致，拒绝写完成状态"
+    return 1
+  fi
+}
+
 push_and_pr() {
-  local title="$1" label="$2" pr_url pr_base_name pr_base_oid pr_head_oid
+  local title="$1" label="$2" pr_url
   local push_head="$VALIDATED_HEAD"
   [ -n "$push_head" ] || push_head="$(git -C "$wt" rev-parse HEAD 2>/dev/null)"
   git_guard_now="$(git_guard_fingerprint)" \
@@ -1602,13 +1618,7 @@ push_and_pr() {
   }
   pr_url="$(printf '%s\n' "$pr_url" | tail -1)"
   [ -n "$pr_url" ] || { log "gh pr create 未返回 PR URL，拒绝写完成状态"; return 1; }
-  pr_base_name="$(gh pr view "$pr_url" --json baseRefName --jq .baseRefName)" || return 1
-  pr_base_oid="$(gh pr view "$pr_url" --json baseRefOid --jq .baseRefOid)" || return 1
-  pr_head_oid="$(gh pr view "$pr_url" --json headRefOid --jq .headRefOid)" || return 1
-  if [ "$pr_base_name" != "$BASE" ] || [ "$pr_base_oid" != "$BASE_COMMIT" ] || [ "$pr_head_oid" != "$push_head" ]; then
-    log "PR 实际引用与固定提交不一致：base=$pr_base_name@$pr_base_oid head=$pr_head_oid"
-    return 1
-  fi
+  verify_pr_refs "$pr_url" "$push_head" || return 1
   log "PR 已创建并核验 base=$BASE@$BASE_COMMIT"
 }
 
