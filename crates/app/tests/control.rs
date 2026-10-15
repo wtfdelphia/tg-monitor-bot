@@ -702,6 +702,186 @@ async fn auth_sessions_list_and_revoke_only_owned_sessions(admin: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]
+async fn console_pages_keep_login_public_and_protect_tenant_views(admin: PgPool) {
+    let (app, _admin) = support::pools(admin).await;
+    let login = router(ControlPlaneState::new(app.clone()))
+        .oneshot(request("GET", "/login", Body::empty()))
+        .await
+        .expect("执行登录页请求失败");
+    assert_eq!(login.status(), StatusCode::OK);
+    assert_eq!(
+        login
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.starts_with("text/html")),
+        Some(true)
+    );
+    let login_body = to_bytes(login.into_body(), 1_048_576)
+        .await
+        .expect("读取登录页响应失败");
+    let login_html = String::from_utf8(login_body.to_vec()).expect("登录页响应不是 UTF-8");
+    assert!(login_html.contains("这是控制台登录，不是 Telegram 账号接入"));
+    assert!(login_html.contains("仅在一致时确认登录"));
+    assert!(login_html.contains("尚未被邀请加入任何工作区"));
+    assert!(login_html.contains("role=\"status\" aria-live=\"polite\""));
+    assert!(!login_html.contains("setInterval"));
+    assert!(!login_html.contains("tenant_id"));
+
+    let protected = router(ControlPlaneState::new(app))
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/console/rules")
+                .body(Body::empty())
+                .expect("构造控制台页面请求失败"),
+        )
+        .await
+        .expect("执行控制台页面请求失败");
+    assert_eq!(protected.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_json(protected).await["error"]["code"],
+        "UNAUTHENTICATED"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn console_identity_page_exposes_safe_actions_without_tenant_parameters(admin: PgPool) {
+    let (app, _admin) = support::pools(admin).await;
+    let tenant = support::seed_tenant(&_admin, "console-page", 7010).await;
+    let auth = AuthContext::new(tenant, 7010, TenantRole::Owner, AuthSource::Web);
+    let response = router(ControlPlaneState::new(app))
+        .oneshot(with_auth(
+            request("GET", "/console/identities", Body::empty()),
+            auth,
+        ))
+        .await
+        .expect("执行身份页请求失败");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1_048_576)
+        .await
+        .expect("读取身份页响应失败");
+    let html = String::from_utf8(body.to_vec()).expect("身份页响应不是 UTF-8");
+    assert!(html.contains("状态复位"));
+    assert!(html.contains("目标频道"));
+    assert!(!html.contains("tenant_id"));
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn console_pages_expose_complete_frontend_controls(admin: PgPool) {
+    let (app, _admin) = support::pools(admin).await;
+    let tenant = support::seed_tenant(&_admin, "console-controls", 7011).await;
+    let auth = AuthContext::new(tenant, 7011, TenantRole::Owner, AuthSource::Web);
+
+    let rules = router(ControlPlaneState::new(app.clone()))
+        .oneshot(with_auth(
+            request("GET", "/console/rules", Body::empty()),
+            auth,
+        ))
+        .await
+        .expect("执行规则页请求失败");
+    assert_eq!(rules.status(), StatusCode::OK);
+    let rules_html = String::from_utf8(
+        to_bytes(rules.into_body(), 1_048_576)
+            .await
+            .expect("读取规则页响应失败")
+            .to_vec(),
+    )
+    .expect("规则页响应不是 UTF-8");
+    assert!(
+        rules_html.contains("async function rules(page=1,append=false,filters=ruleFilterState)")
+    );
+    assert!(rules_html.contains("rules-load-more"));
+    assert!(rules_html.contains("api('/api/v1/rules?'+params.toString())"));
+    assert!(rules_html.contains("ruleListLoading=true"));
+    assert!(rules_html.contains("rules-filter-form"));
+    assert!(rules_html.contains("rules-filter-clear"));
+    assert!(rules_html.contains("['enabled','target_ref','source_ref']"));
+    assert!(rules_html.contains("rules-bulk-form"));
+    assert!(rules_html.contains("data-rule-select"));
+    assert!(rules_html.contains("bindRuleBulk()"));
+    assert!(rules_html.contains("currentRole='';"));
+    assert!(
+        rules_html.contains("canWrite=currentRole==='TENANT_OWNER'||currentRole==='TENANT_ADMIN'")
+    );
+    assert!(rules_html.contains("if(!canWrite)throw new Error('当前角色没有写入权限')"));
+    assert!(rules_html.contains("async function runWrite(control,operation)"));
+    assert!(rules_html.contains("if(control.dataset.pending)return"));
+    assert!(rules_html.contains("delete control.dataset.pending"));
+    assert!(rules_html.contains("bindRuleHistory(id,current.version)"));
+    assert!(rules_html.contains("id=\"rule-delete\""));
+    assert!(rules_html.contains("id=\"rule-delete-message\""));
+    assert!(rules_html.contains("runWrite(ruleForm,async()=>"));
+    assert!(rules_html.contains("data-rule-version"));
+    assert!(rules_html.contains(
+        "snapshot.textContent=JSON.stringify(ruleVersionSnapshot(detail.snapshot),null,2)"
+    ));
+    assert!(rules_html.contains("当前角色没有规则编辑权限"));
+    assert!(rules_html.contains("enforceReadOnly()"));
+    assert!(rules_html.contains("id=\"sessions-open\""));
+    assert!(rules_html.contains("id=\"logout\""));
+    assert!(rules_html.contains("id=\"sessions-panel\""));
+    assert!(rules_html.contains("api('/auth/sessions')"));
+    assert!(rules_html.contains("sessionWriteApi('/auth/logout','POST')"));
+    assert!(rules_html.contains("sessionWriteApi('/auth/sessions/'+encodeURIComponent(button.dataset.sessionRevoke),'DELETE')"));
+    assert!(rules_html.contains("if(!authenticated)return;bindSessionControls()"));
+    assert!(!rules_html.contains("href=\"/login\">重新登录"));
+
+    let identities = router(ControlPlaneState::new(app.clone()))
+        .oneshot(with_auth(
+            request("GET", "/console/identities", Body::empty()),
+            auth,
+        ))
+        .await
+        .expect("执行身份页请求失败");
+    assert_eq!(identities.status(), StatusCode::OK);
+    let identities_html = String::from_utf8(
+        to_bytes(identities.into_body(), 1_048_576)
+            .await
+            .expect("读取身份页响应失败")
+            .to_vec(),
+    )
+    .expect("身份页响应不是 UTF-8");
+    assert!(identities_html.contains("name=\"clear_proxy\""));
+    assert!(identities_html.contains("body.proxy_url=null"));
+
+    let keywords = router(ControlPlaneState::new(app))
+        .oneshot(with_auth(
+            request("GET", "/console/keywords", Body::empty()),
+            auth,
+        ))
+        .await
+        .expect("执行关键词页请求失败");
+    assert_eq!(keywords.status(), StatusCode::OK);
+    let keywords_html = String::from_utf8(
+        to_bytes(keywords.into_body(), 1_048_576)
+            .await
+            .expect("读取关键词页响应失败")
+            .to_vec(),
+    )
+    .expect("关键词页响应不是 UTF-8");
+    assert!(keywords_html.contains("<input name=\"category\" placeholder=\"分类\">"));
+    assert!(keywords_html.contains("keyword-filter-form"));
+    assert!(keywords_html.contains("keywordFilterState={q:String(form.get('q')||'').trim()"));
+    assert!(keywords_html.contains("match_type:String(form.get('match_type')||'')"));
+    assert!(keywords_html.contains("category:String(form.get('category')||'').trim()"));
+    assert!(keywords_html.contains("category:form.get('category')||null"));
+    assert!(keywords_html.contains("async function apiAllPages(url)"));
+    assert!(keywords_html.contains("apiAllPages('/api/v1/keywords')"));
+    assert!(keywords_html.contains("const [keywordsBody,targetsBody]=await Promise.all([apiAllPages('/api/v1/keywords'),apiAllPages('/api/v1/targets')])"));
+    assert!(keywords_html.contains("MAX_LIST_PAGES=100"));
+    assert!(keywords_html.contains("分页响应没有进展"));
+    assert!(keywords_html.contains("控制台暂时不可用"));
+    assert!(keywords_html.contains("if(!authenticated)return"));
+    assert!(
+        keywords_html
+            .contains("#keyword-form','#keyword-test','#keyword-import-label','#target-form")
+    );
+    assert!(keywords_html.contains("#keyword-import-label"));
+    assert!(keywords_html.contains("writeRawApi('/api/v1/keywords/import',contentType,text)"));
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn oidc_callback_issues_session_from_verified_member(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     let auth_pool = support::auth_pool(&admin).await;
