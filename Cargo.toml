@@ -43,6 +43,12 @@ async-trait = "0.1"          # eng/01 §三 的 trait 签名是 async fn
 base64 = "0.23"              # TGM_LOCAL_KEK 是 base64 的 32 字节
 getrandom = { version = "0.4", features = ["std", "sys_rng"] }
 sha2 = "0.11"
+aws-config = { version = "=1.12.0", default-features = false, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio"] }
+aws-sdk-kms = { version = "=1.123.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-runtime = "=1.10.0"
+aws-smithy-runtime-api = "=1.19.0"
+aws-smithy-types = "=1.8.1"
+aws-types = "=1.6.0"
 
 # 可观测性（eng/00 §5.1 的 subscriber 形态首发就要落地）
 tracing = "0.1"

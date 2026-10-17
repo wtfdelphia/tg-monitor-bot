@@ -35,6 +35,37 @@ pub enum ConfigProblem {
     #[error("TGM_OIDC_ALG 只接受 RS256、ES256、EdDSA 或 ES256K，收到 {0:?}")]
     InvalidOidcAlgorithm(String),
 
+    #[error("TGM_KEK_BACKEND 只接受 kms 或 env")]
+    InvalidKekBackend,
+
+    #[error("TGM_KEK_BACKEND=kms 时必须设置 TGM_KMS_KEY_ARN")]
+    MissingKmsKeyArn,
+
+    #[error("TGM_KEK_BACKEND=kms 时不得设置 TGM_LOCAL_KEK")]
+    UnexpectedLocalKek,
+
+    #[error("TGM_KEK_BACKEND=env 时必须设置 TGM_LOCAL_KEK")]
+    MissingLocalKek,
+
+    #[error("TGM_KEK_BACKEND=env 时不得设置 TGM_KMS_KEY_ARN")]
+    UnexpectedKmsKeyArn,
+
+    #[error("AWS_ACCESS_KEY_ID 与 AWS_SECRET_ACCESS_KEY 必须同时设置")]
+    IncompleteAwsStaticCredentials,
+
+    /// 默认凭据链里 Environment provider 排第一。静态 key 与别的来源并存时，
+    /// 别的来源（如 Roles Anywhere 的 `credential_process`）静默不生效，
+    /// 迁移看起来完成了，实际仍在用长期 key。见 PRE-003 验证记录 G/A 探针。
+    #[error(
+        "AWS 静态 key 不得与 {0} 并存 —— 环境变量凭据优先，另一来源会被静默忽略，见 eng/01 §二"
+    )]
+    AwsStaticCredentialsShadowSource(&'static str),
+
+    /// OCI 等非 AWS 主机上 `169.254.169.254` 是该平台自己的元数据服务；
+    /// 凭据链末端的 IMDS provider 不能去碰它。
+    #[error("TGM_KEK_BACKEND=kms 时必须设置 AWS_EC2_METADATA_DISABLED=true（见 eng/01 §二）")]
+    AwsImdsNotDisabled,
+
     /// `TGM_PROFILE` 缺失。它本可以走 `Missing`，但单独一条是因为它的**后果**
     /// 不同：profile 定不下来时 §4.5 那条判不了（见 `check` 里对 `None` 的处理），
     /// 所以这一条同时是「本轮有一条检查没跑」的记号。
@@ -129,13 +160,47 @@ fn allowed(role: Role) -> Vec<&'static str> {
         }
         Role::Fanout | Role::Rule => {}
     }
-    if matches!(role, Role::MtprotoWorker | Role::Delivery) {
-        // 名字固定，由 aws-config 读（§二）。所以是「允许」而非「必填」——
-        // 用 IAM 角色跑的时候这两个本来就不该存在
-        v.extend_from_slice(&["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]);
+    if matches!(
+        role,
+        Role::BotGateway | Role::MtprotoWorker | Role::Delivery
+    ) {
+        v.extend_from_slice(&[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_PROFILE",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_ROLE_ARN",
+            "AWS_ROLE_SESSION_NAME",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            "AWS_EC2_METADATA_DISABLED",
+        ]);
     }
     v
 }
+
+/// 与环境变量静态 key 互斥的凭据来源变量。它们在凭据链里排在 Environment 之后，
+/// 并存时永远轮不到。`AWS_SESSION_TOKEN` 属于静态 key 本身，不在此列。
+///
+/// 只能按变量名判定：未设 `AWS_CONFIG_FILE` 时 SDK 仍会读 `~/.aws/config`，
+/// 那份文件里的 `credential_process` 这里看不见 —— eng/01 §二 要求服务账户的
+/// HOME 下不放 `.aws/`。
+const AWS_NON_STATIC_SOURCES: &[&str] = &[
+    "AWS_PROFILE",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+];
 
 /// 无论什么角色都不得出现的项。
 ///
@@ -213,6 +278,22 @@ pub fn check(
         }
     }
 
+    if matches!(
+        role,
+        Role::BotGateway | Role::MtprotoWorker | Role::Delivery
+    ) && present.contains(&"AWS_ACCESS_KEY_ID") != present.contains(&"AWS_SECRET_ACCESS_KEY")
+    {
+        problems.push(ConfigProblem::IncompleteAwsStaticCredentials);
+    }
+
+    if present.contains(&"AWS_ACCESS_KEY_ID") || present.contains(&"AWS_SECRET_ACCESS_KEY") {
+        for source in AWS_NON_STATIC_SOURCES {
+            if present.contains(source) {
+                problems.push(ConfigProblem::AwsStaticCredentialsShadowSource(source));
+            }
+        }
+    }
+
     // profile 是 None 时这一条判不了，跳过。跳过这件事本身已经在
     // ProfileMissing / ProfileUnknown 的文案里说了 —— 否则 profile 拼错的
     // production 部署会看到一份「RUST_LOG 没报错」的输出，而那条根本没跑。
@@ -224,6 +305,49 @@ pub fn check(
     }
 
     problems
+}
+
+pub fn check_kek_backend(
+    role: Role,
+    backend: Option<&str>,
+    kms_key_arn: Option<&str>,
+    local_kek: Option<&str>,
+    imds_disabled: Option<&str>,
+) -> Vec<ConfigProblem> {
+    if !matches!(
+        role,
+        Role::BotGateway | Role::MtprotoWorker | Role::Delivery
+    ) {
+        return Vec::new();
+    }
+
+    match backend {
+        Some("kms") => {
+            let mut problems = Vec::new();
+            if kms_key_arn.is_none_or(str::is_empty) {
+                problems.push(ConfigProblem::MissingKmsKeyArn);
+            }
+            if local_kek.is_some_and(|value| !value.is_empty()) {
+                problems.push(ConfigProblem::UnexpectedLocalKek);
+            }
+            if !imds_disabled.is_some_and(|value| value.eq_ignore_ascii_case("true")) {
+                problems.push(ConfigProblem::AwsImdsNotDisabled);
+            }
+            problems
+        }
+        Some("env") => {
+            let mut problems = Vec::new();
+            if local_kek.is_none_or(str::is_empty) {
+                problems.push(ConfigProblem::MissingLocalKek);
+            }
+            if kms_key_arn.is_some_and(|value| !value.is_empty()) {
+                problems.push(ConfigProblem::UnexpectedKmsKeyArn);
+            }
+            problems
+        }
+        Some(_) => vec![ConfigProblem::InvalidKekBackend],
+        None => Vec::new(),
+    }
 }
 
 /// 校验控制面 OIDC 的固定验签算法。
@@ -257,6 +381,25 @@ fn known_names() -> &'static [&'static str] {
         "TGM_S3_BUCKET",
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_ROLE_ARN",
+        "AWS_ROLE_SESSION_NAME",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "AWS_EC2_METADATA_DISABLED",
+        "AWS_ENDPOINT_URL",
+        "AWS_ENDPOINT_URL_STS",
+        "AWS_ENDPOINT_URL_KMS",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
         "TGM_KEK_BACKEND",
         "TGM_KMS_KEY_ARN",
         "TGM_LOCAL_KEK",
@@ -279,7 +422,9 @@ fn known_names() -> &'static [&'static str] {
 // 同 kek.rs：测试里的 expect/unwrap 就是断言本身。
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::{COMMON, ConfigProblem, Role, check, extra_required, validate_oidc_alg};
+    use super::{
+        COMMON, ConfigProblem, Role, check, check_kek_backend, extra_required, validate_oidc_alg,
+    };
     use crate::oidc::OidcSigningAlgorithm;
 
     /// 该角色的一份「刚好合规」的环境。用它当基线，每条测试只动一处。
@@ -393,6 +538,229 @@ mod tests {
         env.push("TGM_LOCAL_KEK");
         let p = check(Role::BotGateway, Some("development"), &env, None);
         assert!(p.is_empty(), "bot-gateway 带 TGM_LOCAL_KEK 不该报：{p:?}");
+    }
+
+    const IMDS_OFF: Option<&str> = Some("true");
+
+    #[test]
+    fn kms_backend_requires_imds_disabled() {
+        const ARN: Option<&str> = Some("arn:aws:kms:eu-west-1:123456789012:key/example");
+        for value in [None, Some(""), Some("false"), Some("1")] {
+            assert_eq!(
+                check_kek_backend(Role::Delivery, Some("kms"), ARN, None, value),
+                vec![ConfigProblem::AwsImdsNotDisabled],
+                "AWS_EC2_METADATA_DISABLED={value:?} 不该放行"
+            );
+        }
+        assert!(check_kek_backend(Role::Delivery, Some("kms"), ARN, None, Some("TRUE")).is_empty());
+        assert!(
+            check_kek_backend(
+                Role::Delivery,
+                Some("env"),
+                None,
+                Some("local-secret"),
+                None
+            )
+            .is_empty(),
+            "env 后端不经过 AWS 凭据链，不该要求禁用 IMDS"
+        );
+    }
+
+    #[test]
+    fn aws_static_credentials_reject_every_shadowed_source() {
+        for source in [
+            "AWS_PROFILE",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_ROLE_ARN",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        ] {
+            for key in [
+                ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"].as_slice(),
+                ["AWS_ACCESS_KEY_ID"].as_slice(),
+                ["AWS_SECRET_ACCESS_KEY"].as_slice(),
+            ] {
+                let mut env = minimal(Role::Delivery);
+                env.extend_from_slice(key);
+                env.push(source);
+                assert!(
+                    check(Role::Delivery, Some("development"), &env, None)
+                        .contains(&ConfigProblem::AwsStaticCredentialsShadowSource(source)),
+                    "{key:?} 与 {source} 并存应被拒绝"
+                );
+            }
+
+            let mut alone = minimal(Role::Delivery);
+            alone.push(source);
+            assert!(
+                check(Role::Delivery, Some("development"), &alone, None).is_empty(),
+                "单独使用 {source} 不该报"
+            );
+        }
+    }
+
+    #[test]
+    fn kms_backend_requires_arn_and_excludes_local_key() {
+        assert_eq!(
+            check_kek_backend(Role::Delivery, Some("kms"), None, None, IMDS_OFF),
+            vec![ConfigProblem::MissingKmsKeyArn]
+        );
+        assert_eq!(
+            check_kek_backend(
+                Role::BotGateway,
+                Some("kms"),
+                Some("arn:aws:kms:eu-west-1:123456789012:key/example"),
+                Some("local-secret"),
+                IMDS_OFF
+            ),
+            vec![ConfigProblem::UnexpectedLocalKek]
+        );
+        assert!(
+            check_kek_backend(
+                Role::MtprotoWorker,
+                Some("kms"),
+                Some("arn:aws:kms:eu-west-1:123456789012:key/example"),
+                None,
+                IMDS_OFF
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn env_backend_requires_local_key_and_excludes_kms_arn() {
+        assert_eq!(
+            check_kek_backend(Role::Delivery, Some("env"), None, None, None),
+            vec![ConfigProblem::MissingLocalKek]
+        );
+        assert_eq!(
+            check_kek_backend(
+                Role::BotGateway,
+                Some("env"),
+                Some("arn:aws:kms:eu-west-1:123456789012:key/example"),
+                Some("local-secret"),
+                IMDS_OFF
+            ),
+            vec![ConfigProblem::UnexpectedKmsKeyArn]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_kek_backend_and_ignores_roles_without_kek() {
+        assert_eq!(
+            check_kek_backend(Role::Delivery, Some("other"), None, None, None),
+            vec![ConfigProblem::InvalidKekBackend]
+        );
+        assert!(check_kek_backend(Role::Rule, Some("kms"), None, None, IMDS_OFF).is_empty());
+    }
+
+    #[test]
+    fn aws_session_credentials_are_allowed_for_kms_roles() {
+        for role in [Role::BotGateway, Role::MtprotoWorker, Role::Delivery] {
+            let mut env = minimal(role);
+            env.extend_from_slice(&[
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+            ]);
+            assert!(
+                check(role, Some("development"), &env, None).is_empty(),
+                "{role:?} 应允许 AWS 默认凭据链环境变量"
+            );
+        }
+    }
+
+    #[test]
+    fn approved_aws_credential_sources_are_limited_to_kms_roles() {
+        let sources = [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_PROFILE",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_ROLE_ARN",
+            "AWS_ROLE_SESSION_NAME",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            "AWS_EC2_METADATA_DISABLED",
+        ];
+        for role in [Role::BotGateway, Role::MtprotoWorker, Role::Delivery] {
+            let mut env = minimal(role);
+            env.extend_from_slice(&sources);
+            assert!(
+                check(role, Some("development"), &env, None)
+                    .iter()
+                    .all(|problem| !matches!(problem, ConfigProblem::Unexpected(_))),
+                "{role:?} 应允许已登记的 AWS 凭据来源"
+            );
+        }
+
+        for role in [Role::ControlPlane, Role::Fanout, Role::Rule] {
+            for source in sources {
+                let mut env = minimal(role);
+                env.push(source);
+                assert!(
+                    check(role, Some("development"), &env, None)
+                        .contains(&ConfigProblem::Unexpected(source)),
+                    "{role:?} 不应允许 {source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aws_static_credentials_must_be_a_complete_pair() {
+        for partial in [
+            ["AWS_ACCESS_KEY_ID"].as_slice(),
+            ["AWS_SECRET_ACCESS_KEY"].as_slice(),
+        ] {
+            let mut env = minimal(Role::Delivery);
+            env.extend_from_slice(partial);
+            assert!(
+                check(Role::Delivery, Some("development"), &env, None)
+                    .contains(&ConfigProblem::IncompleteAwsStaticCredentials)
+            );
+        }
+
+        let mut complete = minimal(Role::Delivery);
+        complete.extend_from_slice(&["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]);
+        assert!(check(Role::Delivery, Some("development"), &complete, None).is_empty());
+    }
+
+    #[test]
+    fn aws_endpoint_overrides_are_rejected_for_all_roles() {
+        for role in [
+            Role::ControlPlane,
+            Role::BotGateway,
+            Role::MtprotoWorker,
+            Role::Fanout,
+            Role::Rule,
+            Role::Delivery,
+        ] {
+            for override_name in [
+                "AWS_ENDPOINT_URL",
+                "AWS_ENDPOINT_URL_KMS",
+                "AWS_ENDPOINT_URL_STS",
+                "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+                "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
+            ] {
+                let mut env = minimal(role);
+                env.push(override_name);
+                assert!(
+                    check(role, Some("development"), &env, None)
+                        .contains(&ConfigProblem::Unexpected(override_name)),
+                    "{role:?} 不应允许 {override_name}"
+                );
+            }
+        }
     }
 
     /// §二 末段那条硬纪律：常驻进程不得持有 owner 连接串。

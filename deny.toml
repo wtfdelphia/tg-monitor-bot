@@ -23,6 +23,7 @@ allow = [
     "BSD-3-Clause",                    # matchit（axum 的路由依赖）
     "ISC",                             # rustls/ring 的传递依赖
     "CDLA-Permissive-2.0",             # webpki-roots 的传递依赖
+    "MIT-0",                           # aws-lc-sys 的一个备选许可分支
 ]
 
 # 刻意不列入的项，写清楚免得下次有人「顺手加上」：

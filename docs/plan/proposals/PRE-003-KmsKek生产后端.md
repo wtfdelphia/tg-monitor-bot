@@ -2,13 +2,29 @@
 
 ## 当前状态
 
-`tgm-core` 已有 `Kek` trait 与开发用 `EnvKek`。生产画像会拒绝 `EnvKek`，而
-`tgm serve --role ...` 在 `TGM_KEK_BACKEND=kms` 时仍只输出 `NOT IMPLEMENTED`。
+`tgm-core` 已有 `Kek` trait 与开发用 `EnvKek`。生产画像会拒绝 `EnvKek`；
+`tgm serve --role ...` 的 `TGM_KEK_BACKEND=kms` 路径现已接入 `KmsKek` 与启动期往返自测。
+
+本地开发继续使用 `EnvKek`，不需要 AWS 账号。PRE-003 只实现 AWS KMS 生产后端；
+目标生产平台尚未确定时，真实 KMS 验收保持待定，不阻塞本地开发。
 
 `KmsKek` 不能直接塞进 `tgm-core`：它需要 AWS SDK，且本地与 CI 没有真实 KMS 凭据。
 同时，新增 AWS 依赖需要修改根 `Cargo.toml` 与 `Cargo.lock`，这两个文件属于受保护路径。
 
+2026-10-16：获批实施已在最新 `dev` 基线上完成本地实现与门禁；获授权的 `KmsTest` 会话
+已完成真实 KMS 往返及项目内 `KmsKek` 启动自测。生产运行角色和目标部署环境尚未验证，
+因此本提案不记为生产出口通过；逐项结果见
+`docs/plan/evidence/PRE-003-KmsKek验证-2026-10-16.md`。
+
+2026-10-17：信任边界复核补充 KMS endpoint resolver 回归及 STS/IMDS endpoint 环境变量
+的预检拒绝项。默认凭据链 provider 解析、profile 内服务 endpoint 和目标 workload IAM
+仍未验收；相关结果见上述验证记录与
+`docs/plan/proposals/PRE-003-KMS信任边界收口.md`，生产出口继续待定。
+
 ## 需要批准的改动
+
+以下条目记录本提案获批时的实施范围；实现与验证结果以本文件状态说明和
+`docs/plan/evidence/PRE-003-KmsKek验证-2026-10-16.md` 为准。
 
 ### 1. 依赖与落点
 
@@ -57,5 +73,5 @@
 [report]
 task: PRE-003
 path: escalated
-gates: not-run
-escalation: docs/plan/proposals/PRE-003-KmsKek生产后端.md
+gates: pass
+escalation: docs/plan/proposals/PRE-003-KMS信任边界收口.md

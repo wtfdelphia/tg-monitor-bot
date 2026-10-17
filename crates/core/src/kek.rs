@@ -1,12 +1,8 @@
 //! KEK 的 trait 与本地实现。定义处是 docs/design/eng/01-配置与Secret.md §三，
 //! 决策是 ADR-0011（信封加密）与 ADR-0012（第一天就抽 trait）。
 //!
-//! 为什么第一天就是 trait 而不是先写死 KMS（ADR-0012 原话）：不抽的话
-//! **本地开发根本跑不起来** —— `KmsKek` 要真实 KMS 凭据，本地与 CI 都没有。
-//! 第二个实现不是假想的未来需求，它从第一天就必须存在。
-//!
-//! `KmsKek` 不在本文件：它要 `aws-sdk-kms`，而 trait 与 `EnvKek` 不该为此
-//! 把 AWS 依赖树拖进 `core`。它随 KMS 接入的工作包落到能依赖 AWS SDK 的层。
+//! ADR-0012 将 trait 与本地 `EnvKek` 分开，使开发环境和 CI 不依赖真实 KMS。
+//! 生产 `KmsKek` 位于 `bins/tgm`，AWS SDK 不进入 `core` 的依赖树。
 
 use crate::profile::Profile;
 use crate::secret::Secret;

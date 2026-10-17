@@ -21,5 +21,15 @@ sqlx = { workspace = true }
 # 这是本步骤唯一一个新增的依赖决定，登记在 docs/pre-do/03-文档待更正.md。
 clap = { workspace = true }
 anyhow = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-kms = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+aws-runtime = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
+aws-smithy-types = { workspace = true }
+aws-types = { workspace = true }

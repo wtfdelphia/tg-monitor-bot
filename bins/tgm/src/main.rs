@@ -11,6 +11,8 @@ use tgm_core::config::Role as CoreRole;
 use tgm_core::kek::Kek;
 use tokio::sync::watch;
 
+mod kms_kek;
+
 #[derive(Parser)]
 #[command(name = "tgm", version, about = "Telegram 多租户内容监控与分发平台")]
 struct Cli {
@@ -419,12 +421,29 @@ async fn preflight(role: &Role) -> anyhow::Result<tgm_core::profile::Profile> {
     let names = present_env_names();
     let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
     let rust_log = std::env::var("RUST_LOG").ok();
-    let problems = tgm_core::config::check(
+    let mut problems = tgm_core::config::check(
         core_role,
         raw_profile.as_deref(),
         &borrowed,
         rust_log.as_deref(),
     );
+    let kek_backend = std::env::var("TGM_KEK_BACKEND")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let kms_key_arn = std::env::var("TGM_KMS_KEY_ARN")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let local_kek = std::env::var("TGM_LOCAL_KEK")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let imds_disabled = std::env::var("AWS_EC2_METADATA_DISABLED").ok();
+    problems.extend(tgm_core::config::check_kek_backend(
+        core_role,
+        kek_backend.as_deref(),
+        kms_key_arn.as_deref(),
+        local_kek.as_deref(),
+        imds_disabled.as_deref(),
+    ));
     if !problems.is_empty() {
         // 一次性打印，不 `?` 在第一条上 —— §四 的元规则。
         for p in &problems {
@@ -465,7 +484,7 @@ async fn preflight(role: &Role) -> anyhow::Result<tgm_core::profile::Profile> {
 
     // §4.4。`backend=env` 时顺带校验 TGM_LOCAL_KEK 确实是 32 字节 ——
     // 那是 EnvKek::new 做的事，这里只负责调它。
-    // backend=kms 的自测要等 KmsKek 落地（它依赖 aws-sdk-kms，不在 tgm-core）。
+    // backend=kms 由 bins/tgm 中的 KmsKek 执行启动期往返自测。
     match std::env::var("TGM_KEK_BACKEND").as_deref() {
         Ok("env") => {
             let raw = std::env::var("TGM_LOCAL_KEK")
@@ -480,10 +499,16 @@ async fn preflight(role: &Role) -> anyhow::Result<tgm_core::profile::Profile> {
             );
         }
         Ok("kms") => {
-            // 这里是空的，而且必须被看见 —— 一个静默跳过的自测与通过的自测同形。
-            eprintln!(
-                "tgm: KEK 往返自测：NOT IMPLEMENTED（backend=kms 待 KmsKek 落地，eng/01 §4.4）"
-            );
+            let key_arn = kms_key_arn
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("TGM_KMS_KEY_ARN 缺失 —— 上一步本该拦住"))?;
+            let kek = kms_kek::KmsKek::from_arn(key_arn)
+                .await
+                .map_err(|_| anyhow::anyhow!("KMS KEK 初始化失败"))?;
+            tgm_core::kek::self_test(&kek)
+                .await
+                .map_err(|_| anyhow::anyhow!("KMS KEK 往返自测失败"))?;
+            eprintln!("tgm: KEK 往返自测通过：backend=kms");
         }
         Ok(other) => anyhow::bail!("TGM_KEK_BACKEND 只接受 kms 或 env，收到 {other:?}"),
         // 不配这个变量的角色（fanout / rule）就不该做 KEK 自测。
