@@ -58,6 +58,7 @@
 |---|---|
 | [00-部署与运行时.md](ops/00-部署与运行时.md) | 镜像构建、两种部署形态、运行时规格、PgBouncer 配置 |
 | [01-上线就绪与运维.md](ops/01-上线就绪与运维.md) | 备份与恢复演练、指标与告警、RPO/RTO、事故响应 |
+| [02-OCI的KMS凭据接入.md](ops/02-OCI的KMS凭据接入.md) | OCI 部署的 KMS 凭据来源、IAM 与 Roles Anywhere 模板、生产验收清单 |
 
 ### decisions/ — 决策记录
 
