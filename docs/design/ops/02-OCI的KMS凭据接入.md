@@ -20,10 +20,12 @@ OCI 主机不是 AWS 计算资源，没有 ECS task role、EKS IRSA 或 EC2 inst
 
 ## 一、两阶段共用的前提
 
-- **生产 key 的区域未定。** PRE-003 的真实往返用的是测试 key，在 `ap-southeast-2`；
-  而辖区已定为欧盟（`../decisions/ADR-0028-司法辖区定为欧盟.md`），那份 ADR 明写
-  部署地域由 `ops/` 承接。生产 key 建在哪个区域是合规决定，不在本文范围内，
-  上线前必须定。测试 key 不得用作生产 key。
+- **生产 key 区域：`ap-southeast-2`**（2026-10-17 定）。生产 key 必须是另建的一把，
+  不得沿用 PRE-003 真实往返用的测试 key，即使两者同区域。
+  **与辖区的张力未解决**：辖区已定为欧盟（`../decisions/ADR-0028-司法辖区定为欧盟.md`），
+  那份 ADR 把部署地域列为合规变量。KMS 里只放 KEK，不放租户数据，但 KEK 所在区域
+  仍可能被欧盟客户问到。这一项要由 ADR 正式承接（新写一份，或在 ADR-0028 的后续节里
+  标注），本文只记录区域取值。
 - **固定出口 IP。** OCI 实例绑定 reserved public IP（或经 NAT gateway 固定出口），
   G 阶段的 `aws:SourceIp` 条件依赖它。出口 IP 一变，KMS 调用就全部 AccessDenied。
 - **禁用 IMDS。** `TGM_KEK_BACKEND=kms` 时预检要求 `AWS_EC2_METADATA_DISABLED=true`：
@@ -46,7 +48,7 @@ OCI 主机不是 AWS 计算资源，没有 ECS task role、EKS IRSA 或 EC2 inst
       "Sid": "TgmKekWrapUnwrap",
       "Effect": "Allow",
       "Action": ["kms:Encrypt", "kms:Decrypt"],
-      "Resource": "arn:aws:kms:<region>:<account-id>:key/<key-id>",
+      "Resource": "arn:aws:kms:ap-southeast-2:<account-id>:key/<key-id>",
       "Condition": {
         "IpAddress": { "aws:SourceIp": "<oci-egress-ip>/32" }
       }
@@ -64,7 +66,7 @@ OCI 主机不是 AWS 计算资源，没有 ECS task role、EKS IRSA 或 EC2 inst
 
 ```bash
 TGM_KEK_BACKEND=kms
-TGM_KMS_KEY_ARN=arn:aws:kms:<region>:<account-id>:key/<key-id>
+TGM_KMS_KEY_ARN=arn:aws:kms:ap-southeast-2:<account-id>:key/<key-id>
 AWS_EC2_METADATA_DISABLED=true
 AWS_ACCESS_KEY_ID=<access-key-id>
 AWS_SECRET_ACCESS_KEY=<secret-access-key>
@@ -112,7 +114,7 @@ role 信任策略（只信任本 trust anchor，并按证书 CN 收紧）：
       "Action": ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"],
       "Condition": {
         "ArnEquals": {
-          "aws:SourceArn": "arn:aws:rolesanywhere:<region>:<account-id>:trust-anchor/<trust-anchor-id>"
+          "aws:SourceArn": "arn:aws:rolesanywhere:ap-southeast-2:<account-id>:trust-anchor/<trust-anchor-id>"
         },
         "StringEquals": {
           "aws:PrincipalTag/x509Subject/CN": "<host-cn>"
@@ -139,7 +141,7 @@ SDK 用 `sh -c` 执行这一行，路径里不要带需要转义的字符。私�
 
 ```bash
 TGM_KEK_BACKEND=kms
-TGM_KMS_KEY_ARN=arn:aws:kms:<region>:<account-id>:key/<key-id>
+TGM_KMS_KEY_ARN=arn:aws:kms:ap-southeast-2:<account-id>:key/<key-id>
 AWS_EC2_METADATA_DISABLED=true
 AWS_CONFIG_FILE=/etc/tgm/aws/config
 AWS_SHARED_CREDENTIALS_FILE=/etc/tgm/aws/empty
@@ -183,6 +185,6 @@ KEK 调用方，所以「进程跑过会话时长后再调 KMS」这条路径在
 ## 五、本文的局限
 
 - 本文所有模板都没有在真实 AWS 账号和 OCI 主机上跑过，只有凭据链行为经过本地 mock 探针验证。
-- 生产 key 区域、CA 选型（外部 CA 还是 AWS Private CA）、轮换周期、G 阶段退出期限都未定。
+- CA 选型（外部 CA 还是 AWS Private CA）、轮换周期、G 阶段退出期限都未定；生产 key 区域与欧盟辖区的关系待 ADR 承接（§一）。
 - 部署形态（容器还是 systemd）由 `00-部署与运行时.md` 定；本文的环境模板两种形态都适用，
   不规定注入方式。

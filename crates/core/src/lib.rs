@@ -7,6 +7,8 @@
 pub mod auth;
 /// 启动期配置校验的不连库部分（eng/01 §4.1 与 §4.5）。
 pub mod config;
+/// 凭据密文的 AES-256-GCM 加解密，AAD 绑定身份（spec/05 §七）。
+pub mod credential;
 /// `AppError` 与 spec/07 §2.1 错误码的映射（eng/00 §三）。
 pub mod error;
 /// ID newtype。`TenantId` 与 `IdentityId` 已落地，其余几个随用到它们的工作包进来。
