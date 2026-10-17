@@ -47,7 +47,7 @@ KEK 的两种实现怎么共存。
 | `TGM_DB_URL_OWNER` | 仅 `tgm migrate` | 持有 `tgm_owner` 的角色。`tgm_owner` 自身 `NOLOGIN`，本地为 `postgres`。**常驻进程不得持有** |
 | `TGM_REDIS_URL` | 全部 | 仅唤醒信号，无正确性依赖 |
 | `TGM_S3_ENDPOINT` / `TGM_S3_BUCKET` | delivery / mtproto | MinIO 或 S3 |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | delivery / mtproto | 由 `aws-config` 读取，名字固定 |
+| AWS 凭据配置：`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`、`AWS_PROFILE`、`AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE`、`AWS_REGION` / `AWS_DEFAULT_REGION`、`AWS_ROLE_ARN` / `AWS_ROLE_SESSION_NAME` / `AWS_WEB_IDENTITY_TOKEN_FILE`、容器凭据 URI / 授权 token、`AWS_EC2_METADATA_DISABLED` | bot-gateway / delivery / mtproto | 由固定版本 `aws-config` 默认凭据链读取；静态 access/secret 必须成对，且不得与 `AWS_PROFILE`、`AWS_CONFIG_FILE`、`AWS_SHARED_CREDENTIALS_FILE`、`AWS_ROLE_ARN`、`AWS_WEB_IDENTITY_TOKEN_FILE` 或容器凭据 URI 并存（环境变量凭据优先，并存会让另一来源被静默忽略）；凭据来源不设为必填。`TGM_KEK_BACKEND=kms` 时必须设置 `AWS_EC2_METADATA_DISABLED=true`。已启用 `credential_process` 特性，供 OCI 目标形态（IAM Roles Anywhere 的 `aws_signing_helper credential-process`）使用；未启用 SSO。OCI 过渡形态用静态 key，目标形态用 `AWS_CONFIG_FILE` 指向的 profile；服务账户 HOME 下不放 `.aws/`，因为预检只看变量名，看不到默认路径的 profile 文件。拒绝 `AWS_ENDPOINT_URL`、`AWS_ENDPOINT_URL_KMS`、`AWS_ENDPOINT_URL_STS`、`AWS_EC2_METADATA_SERVICE_ENDPOINT` 与 `AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE`；KMS 请求 endpoint 固定由 key ARN 的 region 与 AWS partition 解析。默认凭据链各 provider 及 profile 内服务 endpoint 尚未逐项验收，见 PRE-003 验证记录 |
 | `TGM_KEK_BACKEND` | bot-gateway / mtproto / delivery | `kms` / `env`，见 §三 |
 | `TGM_KMS_KEY_ARN` | 同上（`backend=kms`） | KEK 在 KMS 里的标识 |
 | `TGM_LOCAL_KEK` | 同上（`backend=env`） | base64 的 32 字节。`production` 下拒绝启动 |
@@ -291,8 +291,9 @@ RLS 配置是否完整   → tgm audit-rls（04-CI门禁.md）。它要读 pg_cl
   （`crates/db/tests/preflight.rs`）：**运行时角色是 public 表的 owner**
   与**从组继承来的 BYPASSRLS** —— 它们都要先造一个探针角色，
   拿现成的 `postgres` 测会在 `rolsuper` 那句先红，走不到这两个分支。
-  **仍然欠着的是 `backend=kms`** —— 那条路径只打一行 `NOT IMPLEMENTED`
-  （刻意可见：一个静默跳过的自测与通过的自测同形），`KmsKek` 待落地
+  `backend=kms` 已接入 KmsKek 与启动期往返自测；mock 协议测试覆盖请求形状、错误脱敏
+  与明文长度检查。2026-10-16 已用授权的 `KmsTest` 会话完成真实 key 往返和项目内自测；
+  生产 workload role、部署环境凭据链与生产网络仍需在生产就绪证据中确认
 - §三 的 `Kek` trait 的 `Secret` 清零**只做到 bound 层面**：
   `Zeroize` 的 bound 是 `E0367` 逼出来的（`00-工程约定.md` §五
   那段 `Secret<T>` 草图照抄编不过，`Drop` 里要清零就得给 `T` 加 bound）。
