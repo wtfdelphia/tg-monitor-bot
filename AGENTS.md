@@ -44,6 +44,16 @@
   见 `eng/02` §一），MinIO `59000`，Redis `56379`。
 - 跑迁移走**生产路径**：`cargo run --bin tgm -- migrate`，不是 `sqlx migrate run`
   （理由见 `.github/workflows/ci.yml` 对应步骤的注释）。
+- **及时管理构建产物，避免磁盘耗尽**：长时间构建、完整门禁或多个 worktree
+  构建后，检查 `df -h` 与相关 `target/` 目录占用；确认对应任务已结束且目录未被其他
+  worktree/进程共享后，只清理可丢弃的构建缓存（优先清理该任务专属 target，必要时用
+  `cargo clean` 指定该工作目录）。不得删除源码、`.sqlx/`、测试证据或仍在使用的构建目录；
+  构建产物清理与数据库清理分开处理，**不得为了释放构建空间执行 `docker compose down -v`**。
+- **及时清理临时 Docker 残留**：一次性容器优先用 `docker run --rm`；构建、门禁或探针
+  结束后，用 `docker ps -a`、`docker volume ls -f dangling=true`、`docker network ls`
+  核对本任务新增的容器、匿名卷和网络，按名称、标签与创建时间确认归属后再删。
+  不动正在使用的 Compose 栈与具名卷，不动无法确认归属的资源（列出来交给人决定），
+  不用 `docker system prune --volumes` 一刀切。
 - 环境变量命名与清单：`docs/design/eng/01-配置与Secret.md` §一。测试与审计常用的两条：
 
 ```bash
