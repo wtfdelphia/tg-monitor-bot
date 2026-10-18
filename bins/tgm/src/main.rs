@@ -8,7 +8,6 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tgm_core::config::Role as CoreRole;
-use tgm_core::kek::Kek;
 use tokio::sync::watch;
 
 mod kms_kek;
@@ -87,7 +86,34 @@ fn unimplemented_serve_error(role: &Role) -> anyhow::Error {
     )
 }
 
+/// 按 `TGM_KEK_BACKEND` 构造 KEK。预检已保证变量组合合法，这里的报错是兜底。
+async fn build_kek(
+    profile: tgm_core::profile::Profile,
+) -> anyhow::Result<Arc<dyn tgm_core::kek::Kek>> {
+    match std::env::var("TGM_KEK_BACKEND").as_deref() {
+        Ok("env") => {
+            let raw = std::env::var("TGM_LOCAL_KEK")
+                .map_err(|_| anyhow::anyhow!("TGM_KEK_BACKEND=env 但缺少 TGM_LOCAL_KEK"))?;
+            Ok(Arc::new(tgm_core::kek::EnvKek::new(profile, &raw)?))
+        }
+        Ok("kms") => {
+            let key_arn = std::env::var("TGM_KMS_KEY_ARN")
+                .map_err(|_| anyhow::anyhow!("TGM_KMS_KEY_ARN 缺失 —— 预检本该拦住"))?;
+            let kek = kms_kek::KmsKek::from_arn(&key_arn)
+                .await
+                .map_err(|_| anyhow::anyhow!("KMS KEK 初始化失败"))?;
+            Ok(Arc::new(kek))
+        }
+        _ => anyhow::bail!("TGM_KEK_BACKEND 只接受 kms 或 env"),
+    }
+}
+
 async fn serve_control_plane() -> anyhow::Result<()> {
+    // preflight 已解析并校验过同一个值，这里重读只为不把 profile 穿过 main 的分支。
+    let profile = tgm_core::profile::Profile::parse(
+        &std::env::var("TGM_PROFILE")
+            .map_err(|_| anyhow::anyhow!("缺少 TGM_PROFILE —— 启动期校验本应先拦住"))?,
+    )?;
     let app_url = std::env::var("TGM_DB_URL_APP")
         .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_APP —— 启动期校验本应先拦住"))?;
     let auth_url = std::env::var("TGM_DB_URL_AUTH")
@@ -185,6 +211,10 @@ async fn serve_control_plane() -> anyhow::Result<()> {
             token_endpoint: tgm_app::control::OIDC_TOKEN_ENDPOINT.to_owned(),
             issuer: tgm_app::control::OIDC_ISSUER.to_owned(),
             jwks_endpoint: tgm_app::control::OIDC_JWKS_ENDPOINT.to_owned(),
+        },
+        tgm_app::control::CredentialIntake {
+            kek: build_kek(profile).await?,
+            bot_api_base_url: tgm_app::bot_console::TELEGRAM_BOT_API_DEFAULT_BASE_URL.to_owned(),
         },
         listener,
     )
@@ -484,31 +514,35 @@ async fn preflight(role: &Role) -> anyhow::Result<tgm_core::profile::Profile> {
 
     // §4.4。`backend=env` 时顺带校验 TGM_LOCAL_KEK 确实是 32 字节 ——
     // 那是 EnvKek::new 做的事，这里只负责调它。
-    // backend=kms 由 bins/tgm 中的 KmsKek 执行启动期往返自测。
+    // control-plane 只 wrap（ADR-0032）：kms 下做 encrypt-only 自测，实测 Decrypt 被拒；
+    // env 下 EnvKek 对称、必然解得开，只验 wrap（ADR-0012 已接受的本地差距）。
+    let control_plane = matches!(core_role, CoreRole::ControlPlane);
     match std::env::var("TGM_KEK_BACKEND").as_deref() {
-        Ok("env") => {
-            let raw = std::env::var("TGM_LOCAL_KEK")
-                .map_err(|_| anyhow::anyhow!("TGM_KEK_BACKEND=env 但缺少 TGM_LOCAL_KEK"))?;
-            let kek = tgm_core::kek::EnvKek::new(profile, &raw)?;
-            tgm_core::kek::self_test(&kek).await?;
-            // kek_id 打进日志是安全的（它是标识，不是密钥材料），而且必要：
-            // 轮换之后要能从日志里回答「那条密文是哪个 KEK 包的」。
-            eprintln!(
-                "tgm: KEK 往返自测通过：backend=env kek_id={}",
-                Kek::kek_id(&kek)
-            );
-        }
-        Ok("kms") => {
-            let key_arn = kms_key_arn
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("TGM_KMS_KEY_ARN 缺失 —— 上一步本该拦住"))?;
-            let kek = kms_kek::KmsKek::from_arn(key_arn)
-                .await
-                .map_err(|_| anyhow::anyhow!("KMS KEK 初始化失败"))?;
-            tgm_core::kek::self_test(&kek)
-                .await
-                .map_err(|_| anyhow::anyhow!("KMS KEK 往返自测失败"))?;
-            eprintln!("tgm: KEK 往返自测通过：backend=kms");
+        Ok(backend @ ("env" | "kms")) => {
+            let kek = build_kek(profile).await?;
+            if control_plane && backend == "kms" {
+                tgm_core::kek::encrypt_only_self_test(kek.as_ref())
+                    .await
+                    .map_err(|error| anyhow::anyhow!("KMS KEK encrypt-only 自测失败：{error}"))?;
+                eprintln!("tgm: KEK encrypt-only 自测通过：backend=kms（Decrypt 已被拒）");
+            } else if control_plane {
+                kek.wrap(
+                    &tgm_core::secret::Secret::new([0x5a; tgm_core::kek::DEK_LEN]),
+                    &tgm_core::kek::KekContext::SELF_TEST,
+                )
+                .await?;
+                eprintln!(
+                    "tgm: KEK wrap 自测通过：backend=env kek_id={}（本地对称，不验无解密权）",
+                    kek.kek_id()
+                );
+            } else {
+                tgm_core::kek::self_test(kek.as_ref())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("KEK 往返自测失败"))?;
+                // kek_id 打进日志是安全的（它是标识，不是密钥材料），而且必要：
+                // 轮换之后要能从日志里回答「那条密文是哪个 KEK 包的」。
+                eprintln!("tgm: KEK 往返自测通过：kek_id={}", kek.kek_id());
+            }
         }
         Ok(other) => anyhow::bail!("TGM_KEK_BACKEND 只接受 kms 或 env，收到 {other:?}"),
         // 不配这个变量的角色（fanout / rule）就不该做 KEK 自测。

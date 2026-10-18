@@ -190,6 +190,64 @@
         }
       }
     },
+    "/api/v1/identities/bot": {
+      "post": {
+        "tags": [],
+        "operationId": "create_bot_identity",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BotIdentityCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Bot identity created; token is never echoed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentityResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Token rejected by Telegram or bot already registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Owner or admin required, or credential submitted via Bot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/identities/{id}": {
       "delete": {
         "tags": [],
@@ -3033,6 +3091,20 @@
             "format": "int64"
           }
         }
+      },
+      "BotIdentityCreateRequest": {
+        "type": "object",
+        "description": "提交 Bot Token。刻意不派生 `Debug`：token 明文不能经任何格式化路径出去。",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "BotFather 发放的 token。只写不读：响应与审计都不回显。"
+          }
+        },
+        "additionalProperties": false
       },
       "DashboardIdentityStatus": {
         "type": "object",

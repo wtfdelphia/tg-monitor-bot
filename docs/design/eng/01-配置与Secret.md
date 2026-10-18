@@ -35,7 +35,7 @@ KEK 的两种实现怎么共存。
 
 按 `--role` 分组。**某个角色不需要的项，就不该配给它** ——
 这不是整洁，是最小权限的可执行形式：
-`control-plane` 拿不到 KEK 相关配置，它就**不可能**解密租户凭据。
+`control-plane` 只拿得到 `kms:Encrypt`，它就**不可能**解密租户凭据（ADR-0032）。
 
 | 变量 | 需要它的角色 | 说明 |
 |---|---|---|
@@ -47,8 +47,8 @@ KEK 的两种实现怎么共存。
 | `TGM_DB_URL_OWNER` | 仅 `tgm migrate` | 持有 `tgm_owner` 的角色。`tgm_owner` 自身 `NOLOGIN`，本地为 `postgres`。**常驻进程不得持有** |
 | `TGM_REDIS_URL` | 全部 | 仅唤醒信号，无正确性依赖 |
 | `TGM_S3_ENDPOINT` / `TGM_S3_BUCKET` | delivery / mtproto | MinIO 或 S3 |
-| AWS 凭据配置：`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`、`AWS_PROFILE`、`AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE`、`AWS_REGION` / `AWS_DEFAULT_REGION`、`AWS_ROLE_ARN` / `AWS_ROLE_SESSION_NAME` / `AWS_WEB_IDENTITY_TOKEN_FILE`、容器凭据 URI / 授权 token、`AWS_EC2_METADATA_DISABLED` | bot-gateway / delivery / mtproto | 由固定版本 `aws-config` 默认凭据链读取；静态 access/secret 必须成对，且不得与 `AWS_PROFILE`、`AWS_CONFIG_FILE`、`AWS_SHARED_CREDENTIALS_FILE`、`AWS_ROLE_ARN`、`AWS_WEB_IDENTITY_TOKEN_FILE` 或容器凭据 URI 并存（环境变量凭据优先，并存会让另一来源被静默忽略）；凭据来源不设为必填。`TGM_KEK_BACKEND=kms` 时必须设置 `AWS_EC2_METADATA_DISABLED=true`。已启用 `credential_process` 特性，供 OCI 目标形态（IAM Roles Anywhere 的 `aws_signing_helper credential-process`）使用；未启用 SSO。OCI 过渡形态用静态 key，目标形态用 `AWS_CONFIG_FILE` 指向的 profile；服务账户 HOME 下不放 `.aws/`，因为预检只看变量名，看不到默认路径的 profile 文件。OCI 部署的 IAM 模板与验收清单见 `../ops/02-OCI的KMS凭据接入.md`。拒绝 `AWS_ENDPOINT_URL`、`AWS_ENDPOINT_URL_KMS`、`AWS_ENDPOINT_URL_STS`、`AWS_EC2_METADATA_SERVICE_ENDPOINT` 与 `AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE`；KMS 请求 endpoint 固定由 key ARN 的 region 与 AWS partition 解析。默认凭据链各 provider 及 profile 内服务 endpoint 尚未逐项验收，见 PRE-003 验证记录 |
-| `TGM_KEK_BACKEND` | bot-gateway / mtproto / delivery | `kms` / `env`，见 §三 |
+| AWS 凭据配置：`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`、`AWS_PROFILE`、`AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE`、`AWS_REGION` / `AWS_DEFAULT_REGION`、`AWS_ROLE_ARN` / `AWS_ROLE_SESSION_NAME` / `AWS_WEB_IDENTITY_TOKEN_FILE`、容器凭据 URI / 授权 token、`AWS_EC2_METADATA_DISABLED` | control-plane / bot-gateway / delivery / mtproto | 由固定版本 `aws-config` 默认凭据链读取；静态 access/secret 必须成对，且不得与 `AWS_PROFILE`、`AWS_CONFIG_FILE`、`AWS_SHARED_CREDENTIALS_FILE`、`AWS_ROLE_ARN`、`AWS_WEB_IDENTITY_TOKEN_FILE` 或容器凭据 URI 并存（环境变量凭据优先，并存会让另一来源被静默忽略）；凭据来源不设为必填。`TGM_KEK_BACKEND=kms` 时必须设置 `AWS_EC2_METADATA_DISABLED=true`。已启用 `credential_process` 特性，供 OCI 目标形态（IAM Roles Anywhere 的 `aws_signing_helper credential-process`）使用；未启用 SSO。OCI 过渡形态用静态 key，目标形态用 `AWS_CONFIG_FILE` 指向的 profile；服务账户 HOME 下不放 `.aws/`，因为预检只看变量名，看不到默认路径的 profile 文件。OCI 部署的 IAM 模板与验收清单见 `../ops/02-OCI的KMS凭据接入.md`。拒绝 `AWS_ENDPOINT_URL`、`AWS_ENDPOINT_URL_KMS`、`AWS_ENDPOINT_URL_STS`、`AWS_EC2_METADATA_SERVICE_ENDPOINT` 与 `AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE`；KMS 请求 endpoint 固定由 key ARN 的 region 与 AWS partition 解析。默认凭据链各 provider 及 profile 内服务 endpoint 尚未逐项验收，见 PRE-003 验证记录 |
+| `TGM_KEK_BACKEND` | control-plane / bot-gateway / mtproto / delivery | `kms` / `env`，见 §三。control-plane 只 wrap，KMS 权限只给 `kms:Encrypt`（ADR-0032） |
 | `TGM_KMS_KEY_ARN` | 同上（`backend=kms`） | KEK 在 KMS 里的标识 |
 | `TGM_LOCAL_KEK` | 同上（`backend=env`） | base64 的 32 字节。`production` 下拒绝启动 |
 | `TGM_OIDC_BOT_ID` | control-plane | `id_token.aud` 的期望值 |
@@ -101,14 +101,18 @@ KEK 的两种实现怎么共存。
 // crates/core/src/kek.rs
 #[async_trait]
 pub trait Kek: Send + Sync {
-    /// 用 KEK 包裹 DEK，产出 credential_keys.dek_ciphertext
-    async fn wrap(&self, dek: &Secret<[u8; 32]>) -> Result<Vec<u8>>;
-    /// 解开 DEK。返回值用后必须 zeroize
-    async fn unwrap(&self, ciphertext: &[u8]) -> Result<Secret<[u8; 32]>>;
-    /// 写入 credential_keys.kek_id，用于将来分辨轮换代次
+    /// 用 KEK 包裹 DEK，产出 identity_secrets.dek_ciphertext
+    async fn wrap(&self, dek: &Secret<[u8; 32]>, context: &KekContext) -> Result<Vec<u8>>;
+    /// 解开 DEK。上下文必须与 wrap 时一致。返回值用后必须 zeroize
+    async fn unwrap(&self, ciphertext: &[u8], context: &KekContext) -> Result<Secret<[u8; 32]>>;
+    /// 写入 identity_secrets.kek_id，用于将来分辨轮换代次
     fn kek_id(&self) -> &str;
 }
 ```
+
+`KekContext` 是 `{tgm:tenant_id, tgm:identity_id}`（ADR-0032）。`KmsKek` 作为 KMS
+`EncryptionContext` 发出，`EnvKek` 编进 AES-GCM 的 AAD。键名是线上契约，改名会让已有密文解不开。
+启动自测用固定的 `{0, 0}`，业务 id 从 1 起，不会撞上。
 
 ```text
 KmsKek   生产。调 KMS 的 Encrypt / Decrypt，KEK 明文永不出 KMS
@@ -119,7 +123,7 @@ EnvKek   本地。从 TGM_LOCAL_KEK 取 32 字节，AES-256-GCM 包裹 DEK
 
 `kek_id` 是列而不是常量的理由：它让 KEK 轮换可以增量做 ——
 新 DEK 用新 KEK 包，旧行按自己的 `kek_id` 找对应 KEK 解开，
-不需要一次性重包全部租户。`EnvKek` 的 `kek_id` 里带 `v1` 是同一个道理。
+不需要一次性重包全部身份。`EnvKek` 的 `kek_id` 里带 `v1` 是同一个道理。
 
 > **`EnvKek` 在 `TGM_PROFILE=production` 下必须拒绝启动。**
 > 它的安全属性与 `KmsKek` 差一个量级（KEK 明文在进程环境里），
@@ -256,6 +260,10 @@ SELECT r.rolname, r.rolsuper, r.rolbypassrls
 那时的报错会被当成业务 bug 查。
 
 `backend=env` 时这一步顺带校验 `TGM_LOCAL_KEK` 确实是 32 字节。
+
+`control-plane` 不做往返，做 encrypt-only 自测（ADR-0032）：`backend=kms` 时 wrap 必须成功、
+unwrap 必须失败，unwrap 竟然成功就拒绝启动 —— 那说明它的 IAM 多给了 `kms:Decrypt`。
+`backend=env` 下 `EnvKek` 对称、必然解得开，只验 wrap，日志里写明「不验无解密权」。
 
 ### 4.5 日志过滤器
 

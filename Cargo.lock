@@ -3211,6 +3211,7 @@ dependencies = [
 name = "tgm-db"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "getrandom 0.4.3",
  "serde_json",
  "sha2 0.11.0",

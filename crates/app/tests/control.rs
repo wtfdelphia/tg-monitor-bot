@@ -2906,12 +2906,13 @@ async fn identity_write_routes_enforce_scope_state_and_delete_guards(admin: PgPo
     let identity_a = support::seed_identity(&admin, tenant_a).await;
     let identity_b = support::seed_identity(&admin, tenant_b).await;
     sqlx::query(
-        "INSERT INTO identity_secrets (identity_id, secret_ciphertext, nonce)
-         VALUES ($1, $2, $3)",
+        "INSERT INTO identity_secrets (identity_id, secret_ciphertext, nonce, dek_ciphertext, kek_id)
+         VALUES ($1, $2, $3, $4, 'local:env:v1')",
     )
     .bind(identity_a)
     .bind(vec![1_u8, 2, 3])
     .bind(vec![4_u8, 5, 6])
+    .bind(vec![7_u8, 8, 9])
     .execute(admin.raw())
     .await
     .expect("创建身份凭据失败");
@@ -5271,4 +5272,228 @@ async fn rule_replacement_router_replaces_in_order_and_hides_cross_tenant_rules(
         .await
         .expect("执行跨租户替换查询失败");
     assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+}
+
+/// 起一个只回 getMe 的 Bot API mock，返回 (base_url, 收到的请求路径)。
+async fn mock_get_me(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("启动 getMe mock 失败");
+    let address = listener.local_addr().expect("读取 getMe mock 地址失败");
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("接受 getMe 请求失败");
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = socket.read(&mut chunk).await.expect("读取 getMe 请求失败");
+            assert!(read > 0, "getMe 请求意外结束");
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        let request_line = String::from_utf8_lossy(&buffer)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("写入 getMe 响应失败");
+        request_line
+    });
+    (format!("http://{address}"), task)
+}
+
+fn bot_intake_state(app: PgPool, base_url: String) -> ControlPlaneState {
+    let kek = tgm_core::kek::EnvKek::new(
+        tgm_core::profile::Profile::Development,
+        "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+    )
+    .expect("构造 EnvKek 失败");
+    ControlPlaneState::new(app).with_credential_intake(tgm_app::control::CredentialIntake {
+        kek: Arc::new(kek),
+        bot_api_base_url: base_url,
+    })
+}
+
+const BOT_TOKEN: &str = "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+fn bot_token_request() -> Request<Body> {
+    request(
+        "POST",
+        "/api/v1/identities/bot",
+        Body::from(json!({ "token": BOT_TOKEN }).to_string()),
+    )
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn bot_identity_intake_validates_with_get_me_and_never_echoes_token(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let tenant = support::seed_tenant(&admin, "bot-intake", 5301).await;
+    let owner = AuthContext::new(tenant, 5301, TenantRole::Owner, AuthSource::Web);
+    let (base_url, server) = mock_get_me(
+        r#"{"ok":true,"result":{"id":123456,"is_bot":true,"first_name":"Data","username":"data_bot"}}"#,
+    )
+    .await;
+
+    let response = router(bot_intake_state(app.clone(), base_url))
+        .oneshot(with_auth(bot_token_request(), owner))
+        .await
+        .expect("执行 Bot Token 提交失败");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = to_bytes(response.into_body(), 1_048_576)
+        .await
+        .expect("读取响应失败");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(!text.contains("AAAAAAAAAAAA"), "响应回显了 token：{text}");
+    let body: Value = serde_json::from_slice(&bytes).expect("解析响应失败");
+    assert_eq!(body["kind"], "bot");
+    assert_eq!(body["tg_user_id"], 123456);
+    assert_eq!(body["display_name"], "Data");
+    let request_line = server.await.expect("等待 getMe mock 失败");
+    assert!(
+        request_line.starts_with(&format!("POST /bot{BOT_TOKEN}/getMe ")),
+        "getMe 请求路径不对：{request_line}"
+    );
+
+    let identity_id = body["id"].as_i64().expect("id 缺失");
+    let stored: (Vec<u8>, String) = sqlx::query_as(
+        "SELECT secret_ciphertext, kek_id FROM identity_secrets WHERE identity_id = $1",
+    )
+    .bind(identity_id)
+    .fetch_one(admin.raw())
+    .await
+    .expect("凭据应当已落库");
+    assert!(
+        !stored
+            .0
+            .windows(b"AAAAAAAAAAAA".len())
+            .any(|window| window == b"AAAAAAAAAAAA"),
+        "库里出现了 token 明文"
+    );
+    assert_eq!(stored.1, "local:env:v1");
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_logs
+          WHERE tenant_id = $1 AND action = 'identity.create' AND resource_id = $2
+            AND NOT (after::text LIKE '%AAAAAAAAAAAA%')",
+    )
+    .bind(tenant)
+    .bind(identity_id)
+    .fetch_one(admin.raw())
+    .await
+    .expect("读审计失败");
+    assert_eq!(audits, 1);
+}
+
+/// spec/02 §6.3 与 spec/07 §2.1：Bot 入口提交凭据永久拒绝，而且拒在任何外呼之前。
+/// 角色不足同样拒在 getMe 之前。base_url 指向不可达端口，一旦外呼就会变成 500。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn bot_identity_intake_rejects_bot_source_role_and_bad_token_before_any_call(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let tenant = support::seed_tenant(&admin, "bot-intake-deny", 5311).await;
+    let unreachable = "http://127.0.0.1:9".to_owned();
+
+    for (auth, status, code) in [
+        (
+            AuthContext::new(tenant, 5311, TenantRole::Owner, AuthSource::Bot),
+            StatusCode::FORBIDDEN,
+            "CREDENTIAL_VIA_WEB_ONLY",
+        ),
+        (
+            AuthContext::new(tenant, 5312, TenantRole::Member, AuthSource::Web),
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+        ),
+    ] {
+        let response = router(bot_intake_state(app.clone(), unreachable.clone()))
+            .oneshot(with_auth(bot_token_request(), auth))
+            .await
+            .expect("执行请求失败");
+        assert_eq!(response.status(), status);
+        assert_eq!(response_json(response).await["error"]["code"], code);
+    }
+
+    let owner = AuthContext::new(tenant, 5311, TenantRole::Owner, AuthSource::Web);
+    for bad in [
+        "no-colon",
+        "abc:AAAAAAAAAAAAAAAAAAAAAAAA",
+        "1:short",
+        "1:AAAAAAAAAAAAAAAAAAAA/../x",
+    ] {
+        let response = router(bot_intake_state(app.clone(), unreachable.clone()))
+            .oneshot(with_auth(
+                request(
+                    "POST",
+                    "/api/v1/identities/bot",
+                    Body::from(json!({ "token": bad }).to_string()),
+                ),
+                owner,
+            ))
+            .await
+            .expect("执行请求失败");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "CONDITION_INVALID"
+        );
+    }
+
+    let identities: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM identities WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_one(admin.raw())
+            .await
+            .expect("计数失败");
+    assert_eq!(identities, 0, "被拒的提交不该建出身份");
+}
+
+/// getMe 说这不是 Bot，或 id 与 token 前缀不符：拒绝且不落库。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn bot_identity_intake_rejects_mismatched_get_me(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let tenant = support::seed_tenant(&admin, "bot-intake-mismatch", 5321).await;
+    let owner = AuthContext::new(tenant, 5321, TenantRole::Owner, AuthSource::Web);
+    for body in [
+        r#"{"ok":true,"result":{"id":123456,"is_bot":false,"first_name":"Human"}}"#,
+        r#"{"ok":true,"result":{"id":999,"is_bot":true,"first_name":"Other"}}"#,
+        r#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#,
+    ] {
+        let (base_url, server) = mock_get_me(body).await;
+        let response = router(bot_intake_state(app.clone(), base_url))
+            .oneshot(with_auth(bot_token_request(), owner))
+            .await
+            .expect("执行请求失败");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let _ = server.await;
+    }
+    let identities: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM identities WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_one(admin.raw())
+            .await
+            .expect("计数失败");
+    assert_eq!(identities, 0);
+}
+
+/// 未配置 KEK 时端点 fail closed，不落库。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn bot_identity_intake_fails_closed_without_kek(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let tenant = support::seed_tenant(&admin, "bot-intake-nokek", 5331).await;
+    let owner = AuthContext::new(tenant, 5331, TenantRole::Owner, AuthSource::Web);
+    let response = router(ControlPlaneState::new(app))
+        .oneshot(with_auth(bot_token_request(), owner))
+        .await
+        .expect("执行请求失败");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let identities: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM identities WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_one(admin.raw())
+            .await
+            .expect("计数失败");
+    assert_eq!(identities, 0);
 }

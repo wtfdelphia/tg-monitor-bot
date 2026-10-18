@@ -13,8 +13,9 @@ OCI 主机不是 AWS 计算资源，没有 ECS task role、EKS IRSA 或 EC2 inst
 排除（B）  helper 定时刷新 shared credentials 文件 —— SDK 只解析一次文件，已反证
 ```
 
-只有 `bot-gateway`、`delivery`、`mtproto-worker` 三个角色持有 AWS 凭据，其余角色配了
-就会被预检拒绝。
+`control-plane`、`bot-gateway`、`delivery`、`mtproto-worker` 四个角色持有 AWS 凭据，其余角色配了
+就会被预检拒绝。四个角色分两套 IAM 身份（ADR-0032）：`control-plane` 只能 `kms:Encrypt`，
+另外三个能 `kms:Encrypt` 与 `kms:Decrypt`。两套身份不得共用一份凭据。
 
 ---
 
@@ -38,7 +39,36 @@ OCI 主机不是 AWS 计算资源，没有 ECS task role、EKS IRSA 或 EC2 inst
 
 ### 2.1 IAM 模板
 
-用户名建议 `tgm-kms-<env>`，不开控制台登录，只挂这一条内联策略：
+两个 IAM user，都不开控制台登录，各挂一条内联策略：
+
+```text
+tgm-kms-<env>-encrypt   control-plane 专用，只有 kms:Encrypt
+tgm-kms-<env>           bot-gateway / delivery / mtproto-worker，kms:Encrypt + kms:Decrypt
+```
+
+`tgm-kms-<env>-encrypt`：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "TgmKekWrapOnly",
+      "Effect": "Allow",
+      "Action": ["kms:Encrypt"],
+      "Resource": "arn:aws:kms:ap-southeast-2:<account-id>:key/<key-id>",
+      "Condition": {
+        "IpAddress": { "aws:SourceIp": "<oci-egress-ip>/32" },
+        "ForAllValues:StringEquals": {
+          "kms:EncryptionContextKeys": ["tgm:tenant_id", "tgm:identity_id"]
+        }
+      }
+    }
+  ]
+}
+```
+
+`tgm-kms-<env>`：
 
 ```json
 {
@@ -50,19 +80,26 @@ OCI 主机不是 AWS 计算资源，没有 ECS task role、EKS IRSA 或 EC2 inst
       "Action": ["kms:Encrypt", "kms:Decrypt"],
       "Resource": "arn:aws:kms:ap-southeast-2:<account-id>:key/<key-id>",
       "Condition": {
-        "IpAddress": { "aws:SourceIp": "<oci-egress-ip>/32" }
+        "IpAddress": { "aws:SourceIp": "<oci-egress-ip>/32" },
+        "ForAllValues:StringEquals": {
+          "kms:EncryptionContextKeys": ["tgm:tenant_id", "tgm:identity_id"]
+        }
       }
     }
   ]
 }
 ```
 
+`kms:EncryptionContextKeys` 条件要求请求只带这两个上下文键（`ForAllValues` 对空集合也成立，
+所以它限制的是「不许多带别的键」，不是「必须带」；必须带由代码保证，`KmsKek` 每次都发）。
+
 `Encrypt`/`Decrypt` 正好是 `KmsKek` 用到的两个 API（`bins/tgm/src/kms_kek.rs`），
 不给 `GenerateDataKey`、`DescribeKey` 等。
 
 ### 2.2 环境模板
 
-每个 KMS 角色一份，文件权限 `0600`，属主是运行用户：
+每个 KMS 角色一份，文件权限 `0600`，属主是运行用户。control-plane 那份填
+`tgm-kms-<env>-encrypt` 的 key，另外三份填 `tgm-kms-<env>` 的 key：
 
 ```bash
 TGM_KEK_BACKEND=kms
@@ -97,9 +134,11 @@ IAM user 最多有两把 access key，轮换按以下顺序做，不中断服务
 ```text
 1 Trust anchor：选外部 CA（上传 CA 证书 bundle）或 AWS Private CA。CA 私钥
   不得放在 OCI 主机上
-2 IAM role：权限策略同 §2.1（可保留 aws:SourceIp），信任策略见下
-3 Profile：关联上一步的 role，会话时长按默认 3600 秒起步
-4 签发终端证书：每台主机一张，CN 写主机标识，私钥在主机上生成，不出机
+2 IAM role：两个，权限策略分别同 §2.1 的两份（可保留 aws:SourceIp），信任策略见下。
+  control-plane 用只含 kms:Encrypt 的那个
+3 Profile：每个 role 一个，会话时长按默认 3600 秒起步
+4 签发终端证书：每台主机每套身份一张，CN 写主机标识加用途（如 <host>-encrypt），
+  私钥在主机上生成，不出机。两张证书 CN 不同，信任策略各按自己的 CN 收紧
 ```
 
 role 信任策略（只信任本 trust anchor，并按证书 CN 收紧）：
@@ -157,7 +196,10 @@ AWS_SHARED_CREDENTIALS_FILE=/etc/tgm/aws/empty
 ### 4.1 G 阶段
 
 ```text
-[ ] 三个 KMS 角色启动日志出现「KEK 往返自测通过：backend=kms」
+[ ] 三个解密角色启动日志出现「KEK 往返自测通过」
+[ ] control-plane 启动日志出现「KEK encrypt-only 自测通过：backend=kms（Decrypt 已被拒）」
+[ ] 反证：给 control-plane 换上解密角色的凭据，它拒绝启动（encrypt-only 自测报 DecryptAllowed）
+[ ] CloudTrail 的 Encrypt/Decrypt 事件 requestParameters.encryptionContext 带 tgm:tenant_id 与 tgm:identity_id
 [ ] 反证：去掉 AWS_EC2_METADATA_DISABLED 后，预检拒绝启动
 [ ] 反证：环境里再加 AWS_CONFIG_FILE，预检报静态 key 遮蔽来源
 [ ] 反证：同一把 key 从非 OCI 出口 IP 调 kms:Encrypt，返回 AccessDenied
@@ -170,7 +212,7 @@ AWS_SHARED_CREDENTIALS_FILE=/etc/tgm/aws/empty
 
 ```text
 [ ] 主机上单独运行 aws_signing_helper credential-process 能返回凭据（只记录成功与否和 Expiration）
-[ ] 三个 KMS 角色启动自测通过
+[ ] 三个解密角色启动往返自测通过，control-plane encrypt-only 自测通过
 [ ] CloudTrail 中 userIdentity 是 assumed-role/<role>，不再是 IAM user
 [ ] 反证：换一张不同 CN 的证书，AssumeRole 失败
 [ ] 反证：在环境里残留 AWS_ACCESS_KEY_ID/SECRET，预检拒绝启动
@@ -178,9 +220,10 @@ AWS_SHARED_CREDENTIALS_FILE=/etc/tgm/aws/empty
 [ ] 切换完成后停用并删除 G 阶段 IAM user 的 key
 ```
 
-**运行期刷新这一项现在还验不了。** 当前生产代码只在启动自测时调用 KMS，没有运行期的
-KEK 调用方，所以「进程跑过会话时长后再调 KMS」这条路径在生产上还不存在。SDK 的自动重取
-已经在本地探针里验过（见验证记录）；生产侧这一项要等 session 加密落库等调用方接入后补验。
+**运行期刷新目前只有一个调用方。** `control-plane` 的 Bot Token 录入
+（`POST /api/v1/identities/bot`）会在运行期调 `kms:Encrypt`，可以用它补验：进程跑过会话时长后
+再提交一次 token，应当成功。三个解密角色在运行期还没有 `Decrypt` 调用方，那一侧要等
+session 加密落库等调用方接入后补验。SDK 的自动重取已经在本地探针里验过（见验证记录）。
 
 ## 五、本文的局限
 

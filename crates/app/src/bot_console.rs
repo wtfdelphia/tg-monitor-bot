@@ -34,7 +34,7 @@ use crate::control::ControlPlaneState;
 pub const TELEGRAM_SECRET_TOKEN_HEADER: &str = "x-telegram-bot-api-secret-token";
 const TELEGRAM_BOT_API_TIMEOUT: Duration = Duration::from_secs(10);
 const TELEGRAM_BOT_API_MAX_RESPONSE_BYTES: usize = 256 * 1024;
-const TELEGRAM_BOT_API_DEFAULT_BASE_URL: &str = "https://api.telegram.org";
+pub const TELEGRAM_BOT_API_DEFAULT_BASE_URL: &str = "https://api.telegram.org";
 
 #[derive(Debug, Clone)]
 pub struct BotConsoleConfig {
@@ -163,11 +163,28 @@ impl TelegramBotApiClient {
         self.call("sendMessage", &payload).await
     }
 
+    /// `getMe`：租户提交 Bot Token 时校验它确实属于一个 Bot（spec/07 §3.3）。
+    pub async fn get_me(&self) -> Result<TelegramBotUser, TelegramBotApiError> {
+        let result = self
+            .request("getMe", &serde_json::json!({}))
+            .await?
+            .ok_or_else(|| TelegramBotApiError::Api("getMe 缺少 result".to_owned()))?;
+        serde_json::from_value(result).map_err(TelegramBotApiError::Response)
+    }
+
     async fn call<T: Serialize>(
         &self,
         method: &str,
         payload: &T,
     ) -> Result<(), TelegramBotApiError> {
+        self.request(method, payload).await.map(|_| ())
+    }
+
+    async fn request<T: Serialize>(
+        &self,
+        method: &str,
+        payload: &T,
+    ) -> Result<Option<serde_json::Value>, TelegramBotApiError> {
         let url = format!(
             "{}/bot{}/{}",
             self.base_url.trim_end_matches('/'),
@@ -217,7 +234,7 @@ impl TelegramBotApiClient {
                     .unwrap_or_else(|| format!("HTTP {}", status.as_u16())),
             ));
         }
-        Ok(())
+        Ok(envelope.result)
     }
 }
 
@@ -225,6 +242,16 @@ impl TelegramBotApiClient {
 struct BotApiResponse {
     ok: bool,
     description: Option<String>,
+    result: Option<serde_json::Value>,
+}
+
+/// `getMe` 返回的 User 对象中本仓用到的字段。
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramBotUser {
+    pub id: i64,
+    pub is_bot: bool,
+    pub first_name: String,
+    pub username: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -812,6 +839,27 @@ mod tests {
             .await
             .expect_err("Bot API 失败响应不应被视为成功");
         assert!(matches!(error, TelegramBotApiError::Api(message) if message == "retry"));
+        let _ = server.await.expect("等待 Bot API mock 失败");
+    }
+
+    #[tokio::test]
+    async fn get_me_parses_bot_user() {
+        let body = r#"{"ok":true,"result":{"id":123456,"is_bot":true,"first_name":"Data","username":"data_bot"}}"#;
+        let response: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let (base_url, server) = mock_bot_api(response).await;
+        let client =
+            TelegramBotApiClient::new(Arc::new(Secret::new("123456:abc".to_owned())), base_url)
+                .expect("创建 Bot API client 失败");
+        let me = client.get_me().await.expect("getMe 失败");
+        assert_eq!(me.id, 123456);
+        assert!(me.is_bot);
+        assert_eq!(me.username.as_deref(), Some("data_bot"));
         let _ = server.await.expect("等待 Bot API mock 失败");
     }
 }
