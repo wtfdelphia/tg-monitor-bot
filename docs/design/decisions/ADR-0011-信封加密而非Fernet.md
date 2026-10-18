@@ -42,3 +42,5 @@
 [[ADR-0012]]、[[ADR-0013]]。
 落地在 `spec/05-安全与租户隔离.md`、`spec/03-数据模型.md`（`credential_keys`）、
 `eng/01-配置与Secret.md`。
+
+「每租户一个 DEK」与「`control-plane` 拿不到 KEK 相关配置」两处已被 [[ADR-0032]] 修订。

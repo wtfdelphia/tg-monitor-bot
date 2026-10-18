@@ -20,3 +20,4 @@ thiserror = { workspace = true }
 # 所以 dev 侧要 runtime 与 tokio 宏，而 src 侧不需要。
 sqlx = { workspace = true, features = ["migrate"] }
 tokio = { workspace = true }
+async-trait = { workspace = true }

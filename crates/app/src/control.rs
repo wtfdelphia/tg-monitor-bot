@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tgm_core::auth::{AuthContext, AuthSource, TenantRole};
 use tgm_core::error::AppError;
+use tgm_core::kek::Kek;
 use tgm_core::oidc::{
     OidcIdTokenClaims, OidcLoginMaterial, OidcLoginStateStore, OidcSigningAlgorithm,
     OidcTokenHeader, validate_id_token_claims,
@@ -44,6 +45,17 @@ pub struct ControlPlaneState {
     bot_console_config: Option<BotConsoleConfig>,
     oidc_config: Option<OidcConfig>,
     oidc_states: Arc<OidcLoginStateStore>,
+    credential_intake: Option<CredentialIntake>,
+}
+
+/// 凭据录入所需的 KEK 与 Bot API 地址（ADR-0032）。
+///
+/// control-plane 的 KEK 只用 `wrap`：生产上它的 KMS 权限只有 `kms:Encrypt`，
+/// 启动期 `encrypt_only_self_test` 实测这一点。
+#[derive(Clone)]
+pub struct CredentialIntake {
+    pub kek: Arc<dyn Kek>,
+    pub bot_api_base_url: String,
 }
 
 #[derive(Clone)]
@@ -66,6 +78,7 @@ impl ControlPlaneState {
             bot_console_config: None,
             oidc_config: None,
             oidc_states: Arc::new(OidcLoginStateStore::default()),
+            credential_intake: None,
         }
     }
 
@@ -76,6 +89,7 @@ impl ControlPlaneState {
             bot_console_config: None,
             oidc_config: None,
             oidc_states: Arc::new(OidcLoginStateStore::default()),
+            credential_intake: None,
         }
     }
 
@@ -90,6 +104,7 @@ impl ControlPlaneState {
             bot_console_config: Some(bot_console_config),
             oidc_config: None,
             oidc_states: Arc::new(OidcLoginStateStore::default()),
+            credential_intake: None,
         }
     }
 
@@ -105,6 +120,7 @@ impl ControlPlaneState {
             bot_console_config: Some(bot_console_config),
             oidc_config: Some(oidc_config),
             oidc_states: Arc::new(OidcLoginStateStore::default()),
+            credential_intake: None,
         }
     }
 
@@ -119,7 +135,14 @@ impl ControlPlaneState {
             bot_console_config: None,
             oidc_config: Some(oidc_config),
             oidc_states: Arc::new(OidcLoginStateStore::default()),
+            credential_intake: None,
         }
+    }
+
+    /// 启用 `POST /api/v1/identities/bot`。未调用时该端点 fail closed（500）。
+    pub fn with_credential_intake(mut self, intake: CredentialIntake) -> Self {
+        self.credential_intake = Some(intake);
+        self
     }
 
     pub(crate) fn app_pool(&self) -> &PgPool {
@@ -223,6 +246,14 @@ pub struct IdentityResponse {
     pub tg_user_id: Option<i64>,
     pub display_name: Option<String>,
     pub status: String,
+}
+
+/// 提交 Bot Token。刻意不派生 `Debug`：token 明文不能经任何格式化路径出去。
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BotIdentityCreateRequest {
+    /// BotFather 发放的 token。只写不读：响应与审计都不回显。
+    pub token: String,
 }
 
 #[derive(Debug, Clone, ToSchema)]
@@ -1816,6 +1847,105 @@ async fn list_identities(
         per_page,
         has_more,
     }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/identities/bot",
+    request_body = BotIdentityCreateRequest,
+    responses(
+        (status = 201, description = "Bot identity created; token is never echoed", body = IdentityResponse),
+        (status = 400, description = "Token rejected by Telegram or bot already registered", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required, or credential submitted via Bot", body = ErrorResponse)
+    )
+)]
+async fn create_bot_identity(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Json(input): Json<BotIdentityCreateRequest>,
+) -> Result<(StatusCode, Json<IdentityResponse>), ApiError> {
+    let token = Arc::new(Secret::new(input.token));
+    // spec/02 §6.3：凭据经 Bot 入口提交会留在 Telegram 聊天记录里，永久拒绝。
+    if auth.source() != AuthSource::Web {
+        return Err(AppError::CredentialViaWebOnly.into());
+    }
+    require_identity_write(auth)?;
+    let bot_id = validate_bot_token(token.expose())?;
+    let Some(intake) = state.credential_intake.as_ref() else {
+        return Err(
+            AppError::internal(std::io::Error::other("control-plane 未配置凭据录入 KEK")).into(),
+        );
+    };
+
+    let client =
+        crate::bot_console::TelegramBotApiClient::new(Arc::clone(&token), &intake.bot_api_base_url)
+            .map_err(AppError::internal)?;
+    let me = client.get_me().await.map_err(|error| match error {
+        crate::bot_console::TelegramBotApiError::Api(_) => {
+            AppError::ConditionInvalid("Telegram 拒绝了该 Bot Token".to_owned())
+        }
+        other => AppError::internal(other),
+    })?;
+    if !me.is_bot || me.id != bot_id {
+        return Err(AppError::ConditionInvalid("该 token 不属于一个 Bot".to_owned()).into());
+    }
+
+    let plaintext = Secret::new(token.expose().as_bytes().to_vec());
+    let display_name = Some(me.first_name.clone()).filter(|name| !name.trim().is_empty());
+    let identity_id = tgm_db::credentials::create_bot_identity(
+        &state.pool,
+        intake.kek.as_ref(),
+        auth.tenant_id(),
+        tgm_db::credentials::NewBotIdentity {
+            tg_user_id: me.id,
+            username: me.username,
+            display_name: display_name.clone(),
+            actor_user_id: auth.actor_user_id(),
+            source: auth.source().as_str().to_owned(),
+        },
+        &plaintext,
+    )
+    .await
+    .map_err(|error| match error {
+        tgm_db::credentials::CredentialError::BotAlreadyRegistered => {
+            AppError::ConditionInvalid("该 Bot 已接入".to_owned())
+        }
+        tgm_db::credentials::CredentialError::Db(error) => AppError::Db(error),
+        other => AppError::internal(other),
+    })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(IdentityResponse {
+            id: identity_id.get(),
+            kind: "bot".to_owned(),
+            tg_user_id: Some(me.id),
+            display_name,
+            status: "offline".to_owned(),
+        }),
+    ))
+}
+
+/// Bot Token 形如 `<bot_id>:<secret>`。先在本地拒掉明显不合法的输入，
+/// 免得把任意字符串拼进 Bot API 的 URL 路径；返回 bot_id 供与 getMe 结果比对。
+fn validate_bot_token(token: &str) -> Result<i64, ApiError> {
+    let invalid = || ApiError::from(AppError::ConditionInvalid("Bot Token 格式无效".to_owned()));
+    let (id, secret) = token.split_once(':').ok_or_else(invalid)?;
+    if id.is_empty()
+        || id.len() > 20
+        || !id.bytes().all(|byte| byte.is_ascii_digit())
+        || secret.len() < 20
+        || secret.len() > 128
+        || !secret
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(invalid());
+    }
+    id.parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(invalid)
 }
 
 #[utoipa::path(
@@ -4162,6 +4292,7 @@ async fn retry_task(
         health,
         dashboard,
         list_identities,
+        create_bot_identity,
         update_identity,
         reset_identity_status,
         delete_identity,
@@ -4215,6 +4346,7 @@ async fn retry_task(
         DashboardToday,
         IdentityResponse,
         IdentityListResponse,
+        BotIdentityCreateRequest,
         IdentityPatchRequest,
         KeywordResponse,
         KeywordListResponse,
@@ -4338,6 +4470,7 @@ pub fn router(state: ControlPlaneState) -> Router {
         .route("/health", get(health))
         .route("/api/v1/dashboard/summary", get(dashboard))
         .route("/api/v1/identities", get(list_identities))
+        .route("/api/v1/identities/bot", post(create_bot_identity))
         .route(
             "/api/v1/identities/{id}",
             patch(update_identity).delete(delete_identity),
@@ -4433,14 +4566,18 @@ pub async fn serve_with_auth_and_bot_and_oidc(
     auth_pool: PgPool,
     bot_console_config: BotConsoleConfig,
     oidc_config: OidcConfig,
+    credential_intake: CredentialIntake,
     listener: TcpListener,
 ) -> Result<(), std::io::Error> {
-    let app = router(ControlPlaneState::with_auth_pool_and_bot_and_oidc(
-        pool,
-        auth_pool,
-        bot_console_config,
-        oidc_config,
-    ));
+    let app = router(
+        ControlPlaneState::with_auth_pool_and_bot_and_oidc(
+            pool,
+            auth_pool,
+            bot_console_config,
+            oidc_config,
+        )
+        .with_credential_intake(credential_intake),
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

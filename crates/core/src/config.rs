@@ -96,6 +96,16 @@ pub enum Role {
     Delivery,
 }
 
+impl Role {
+    /// 持有 KEK 配置的角色。control-plane 只 wrap（ADR-0032），另外三个能 unwrap。
+    pub fn uses_kek(self) -> bool {
+        matches!(
+            self,
+            Role::ControlPlane | Role::BotGateway | Role::MtprotoWorker | Role::Delivery
+        )
+    }
+}
+
 /// 全部角色都必填的项（eng/01 §二 的「全部」行）。
 ///
 /// `TGM_DB_URL_OWNER` **不在任何角色的必填集里**，而且在下面被显式禁掉 ——
@@ -123,6 +133,9 @@ fn extra_required(role: Role) -> &'static [&'static str] {
             "TGM_CONTROL_BOT_SECRET_TOKEN",
             "TGM_CONTROL_BOT_IDENTITY_ID",
             "TGM_CONTROL_BOT_USERNAME",
+            // ADR-0032：Bot Token 录入要 wrap 新 DEK。生产上只给 kms:Encrypt，
+            // 启动期 encrypt-only 自测实测它解不开。
+            "TGM_KEK_BACKEND",
             // TGM_LISTEN_ADDR 不必填：§二 给了默认 127.0.0.1:8080，
             // 且那个默认值本身是安全选择（配错时失败方向是「连不上」而非「上公网」）
         ],
@@ -150,7 +163,10 @@ fn allowed(role: Role) -> Vec<&'static str> {
     v.push("RUST_LOG");
     v.extend_from_slice(extra_required(role));
     match role {
-        Role::ControlPlane => v.push("TGM_LISTEN_ADDR"),
+        Role::ControlPlane => {
+            v.push("TGM_LISTEN_ADDR");
+            v.extend_from_slice(&["TGM_KMS_KEY_ARN", "TGM_LOCAL_KEK"]);
+        }
         Role::BotGateway => {
             v.push("TGM_BOT_GATEWAY_LISTEN_ADDR");
             v.extend_from_slice(&["TGM_KMS_KEY_ARN", "TGM_LOCAL_KEK"]);
@@ -160,10 +176,7 @@ fn allowed(role: Role) -> Vec<&'static str> {
         }
         Role::Fanout | Role::Rule => {}
     }
-    if matches!(
-        role,
-        Role::BotGateway | Role::MtprotoWorker | Role::Delivery
-    ) {
+    if role.uses_kek() {
         v.extend_from_slice(&[
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
@@ -278,10 +291,8 @@ pub fn check(
         }
     }
 
-    if matches!(
-        role,
-        Role::BotGateway | Role::MtprotoWorker | Role::Delivery
-    ) && present.contains(&"AWS_ACCESS_KEY_ID") != present.contains(&"AWS_SECRET_ACCESS_KEY")
+    if role.uses_kek()
+        && present.contains(&"AWS_ACCESS_KEY_ID") != present.contains(&"AWS_SECRET_ACCESS_KEY")
     {
         problems.push(ConfigProblem::IncompleteAwsStaticCredentials);
     }
@@ -314,10 +325,7 @@ pub fn check_kek_backend(
     local_kek: Option<&str>,
     imds_disabled: Option<&str>,
 ) -> Vec<ConfigProblem> {
-    if !matches!(
-        role,
-        Role::BotGateway | Role::MtprotoWorker | Role::Delivery
-    ) {
+    if !role.uses_kek() {
         return Vec::new();
     }
 
@@ -515,13 +523,13 @@ mod tests {
         );
     }
 
-    /// §4.1「多配的项也要报」。用的例子就是那条原话里的：
-    /// control-plane 上出现 TGM_LOCAL_KEK。
+    /// §4.1「多配的项也要报」。ADR-0032 之后 control-plane 也持有 KEK 配置，
+    /// 原例子换成 fanout：它不碰凭据，出现 TGM_LOCAL_KEK 必须报。
     #[test]
-    fn control_plane_with_local_kek_is_reported() {
-        let mut env = minimal(Role::ControlPlane);
+    fn fanout_with_local_kek_is_reported() {
+        let mut env = minimal(Role::Fanout);
         env.push("TGM_LOCAL_KEK");
-        let p = check(Role::ControlPlane, Some("development"), &env, None);
+        let p = check(Role::Fanout, Some("development"), &env, None);
         assert_eq!(
             p,
             vec![ConfigProblem::Unexpected("TGM_LOCAL_KEK")],
@@ -529,15 +537,28 @@ mod tests {
         );
     }
 
-    /// 反证上一条不是「凡是 TGM_LOCAL_KEK 都报」：bot-gateway 上它是允许的。
+    /// 反证上一条不是「凡是 TGM_LOCAL_KEK 都报」：bot-gateway 与 control-plane 上它是允许的。
     /// 没有这一条，一个把 TGM_LOCAL_KEK 写进 NEVER 的版本也会让上一条绿，
     /// 而那会让 backend=env 的本地开发整个起不来。
     #[test]
     fn same_var_is_allowed_on_a_role_that_needs_it() {
-        let mut env = minimal(Role::BotGateway);
-        env.push("TGM_LOCAL_KEK");
-        let p = check(Role::BotGateway, Some("development"), &env, None);
-        assert!(p.is_empty(), "bot-gateway 带 TGM_LOCAL_KEK 不该报：{p:?}");
+        for role in [Role::BotGateway, Role::ControlPlane] {
+            let mut env = minimal(role);
+            env.push("TGM_LOCAL_KEK");
+            let p = check(role, Some("development"), &env, None);
+            assert!(p.is_empty(), "{role:?} 带 TGM_LOCAL_KEK 不该报：{p:?}");
+        }
+    }
+
+    /// ADR-0032：control-plane 走 kms 时同样要求关掉 IMDS，与三个解密角色同一套预检。
+    #[test]
+    fn control_plane_kms_backend_is_checked() {
+        const ARN: Option<&str> = Some("arn:aws:kms:eu-west-1:123456789012:key/example");
+        assert_eq!(
+            check_kek_backend(Role::ControlPlane, Some("kms"), ARN, None, None),
+            vec![ConfigProblem::AwsImdsNotDisabled]
+        );
+        assert!(check_kek_backend(Role::Fanout, Some("kms"), None, None, None).is_empty());
     }
 
     const IMDS_OFF: Option<&str> = Some("true");
@@ -692,7 +713,12 @@ mod tests {
             "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
             "AWS_EC2_METADATA_DISABLED",
         ];
-        for role in [Role::BotGateway, Role::MtprotoWorker, Role::Delivery] {
+        for role in [
+            Role::ControlPlane,
+            Role::BotGateway,
+            Role::MtprotoWorker,
+            Role::Delivery,
+        ] {
             let mut env = minimal(role);
             env.extend_from_slice(&sources);
             assert!(
@@ -703,7 +729,7 @@ mod tests {
             );
         }
 
-        for role in [Role::ControlPlane, Role::Fanout, Role::Rule] {
+        for role in [Role::Fanout, Role::Rule] {
             for source in sources {
                 let mut env = minimal(role);
                 env.push(source);

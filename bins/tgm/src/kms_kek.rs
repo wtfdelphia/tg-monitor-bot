@@ -1,7 +1,7 @@
 use aws_sdk_kms::config::endpoint::{DefaultResolver, EndpointFuture, Params, ResolveEndpoint};
 use aws_sdk_kms::primitives::Blob;
 use aws_sdk_kms::{Client, config::Region};
-use tgm_core::kek::{DEK_LEN, Kek, KekError};
+use tgm_core::kek::{DEK_LEN, Kek, KekContext, KekError};
 use tgm_core::secret::Secret;
 use zeroize::Zeroize;
 
@@ -68,30 +68,40 @@ impl ResolveEndpoint for RegionalKmsEndpointResolver {
 
 #[async_trait::async_trait]
 impl Kek for KmsKek {
-    async fn wrap(&self, dek: &Secret<[u8; DEK_LEN]>) -> Result<Vec<u8>, KekError> {
-        let output = self
+    async fn wrap(
+        &self,
+        dek: &Secret<[u8; DEK_LEN]>,
+        context: &KekContext,
+    ) -> Result<Vec<u8>, KekError> {
+        let mut request = self
             .client
             .encrypt()
             .key_id(&self.key_arn)
-            .plaintext(Blob::new(dek.expose().to_vec()))
-            .send()
-            .await
-            .map_err(|_| KekError::Crypto)?;
+            .plaintext(Blob::new(dek.expose().to_vec()));
+        for (key, value) in context.pairs() {
+            request = request.encryption_context(key, value);
+        }
+        let output = request.send().await.map_err(|_| KekError::Crypto)?;
         output
             .ciphertext_blob()
             .map(|blob| blob.as_ref().to_vec())
             .ok_or(KekError::Crypto)
     }
 
-    async fn unwrap(&self, ciphertext: &[u8]) -> Result<Secret<[u8; DEK_LEN]>, KekError> {
-        let output = self
+    async fn unwrap(
+        &self,
+        ciphertext: &[u8],
+        context: &KekContext,
+    ) -> Result<Secret<[u8; DEK_LEN]>, KekError> {
+        let mut request = self
             .client
             .decrypt()
             .key_id(&self.key_arn)
-            .ciphertext_blob(Blob::new(ciphertext.to_vec()))
-            .send()
-            .await
-            .map_err(|_| KekError::Crypto)?;
+            .ciphertext_blob(Blob::new(ciphertext.to_vec()));
+        for (key, value) in context.pairs() {
+            request = request.encryption_context(key, value);
+        }
+        let output = request.send().await.map_err(|_| KekError::Crypto)?;
         let mut plaintext = output.plaintext.ok_or(KekError::Crypto)?.into_inner();
         if plaintext.len() != DEK_LEN {
             plaintext.zeroize();
@@ -163,7 +173,7 @@ mod tests {
     use aws_smithy_types::body::SdkBody;
     use aws_types::origin::Origin;
     use aws_types::service_config::{LoadServiceConfig, ServiceConfigKey};
-    use tgm_core::kek::{DEK_LEN, Kek, KekError, self_test};
+    use tgm_core::kek::{DEK_LEN, Kek, KekContext, KekError, self_test};
     use tgm_core::secret::Secret;
 
     use super::{
@@ -446,7 +456,7 @@ mod tests {
         });
         let kek = mock_kek(address.to_string());
         let error = kek
-            .wrap(&Secret::new([0x5a; DEK_LEN]))
+            .wrap(&Secret::new([0x5a; DEK_LEN]), &KekContext::SELF_TEST)
             .await
             .expect_err("KMS 错误应被返回");
         assert!(matches!(error, KekError::Crypto));
@@ -465,7 +475,7 @@ mod tests {
             );
         });
         let error = mock_kek(address.to_string())
-            .unwrap(&[1, 2, 3])
+            .unwrap(&[1, 2, 3], &KekContext::SELF_TEST)
             .await
             .expect_err("非 DEK 长度的明文应拒绝");
         assert!(matches!(error, KekError::Crypto));
@@ -498,6 +508,12 @@ mod tests {
         assert!(
             body.contains(KEY_ARN),
             "key ARN missing from request: {body}"
+        );
+        assert!(
+            body.contains(r#""EncryptionContext":{"#)
+                && body.contains(r#""tgm:tenant_id":"0""#)
+                && body.contains(r#""tgm:identity_id":"0""#),
+            "encryption context missing from request: {body}"
         );
         let response = if expected_target.ends_with("Encrypt") {
             assert!(
