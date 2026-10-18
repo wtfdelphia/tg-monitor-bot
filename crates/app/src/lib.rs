@@ -12,5 +12,6 @@ pub mod console;
 pub mod console_login;
 pub mod control;
 pub mod delivery;
+pub mod mtproto_session;
 pub mod pipeline;
 pub mod rule;

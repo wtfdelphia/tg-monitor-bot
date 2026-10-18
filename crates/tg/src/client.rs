@@ -1,7 +1,8 @@
 //! `grammers` 的最小接入边界。
 //!
-//! 当前 session 使用 `MemorySession` 仅用于 P0 spike 和本地验证；它不是生产凭据存储。
-//! 生产路径必须在 session 落库前接入信封加密和授权生命周期管理。
+//! session 用 [`StoredSession`]：`connect` 起一个空 session（P0 spike 与无凭据验证），
+//! `connect_with_session` 接解密后恢复的 session；[`TelegramClient::snapshot`]
+//! 产出明文快照，由调用方交给凭据层信封加密落库（spec/08 §1.3）。
 
 use std::sync::Arc;
 
@@ -9,8 +10,10 @@ use grammers_client::client::{UpdateStream, UpdatesConfiguration};
 use grammers_client::session::types::{PeerId, PeerRef};
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool, parsers, tl};
-use grammers_session::storages::MemorySession;
+use tgm_core::secret::Secret;
 use thiserror::Error;
+
+use crate::session::{StoredSession, StoredSessionError};
 
 #[derive(Debug, Error)]
 pub enum TelegramClientError {
@@ -34,6 +37,8 @@ pub enum TelegramClientError {
     MediaCopyUnavailable,
     #[error("当前适配器尚未支持媒体 RESEND")]
     MediaResendUnavailable,
+    #[error("session 快照失败: {0}")]
+    Snapshot(#[source] StoredSessionError),
     #[error("Telegram runner 关闭失败: {0}")]
     Runner(#[source] tokio::task::JoinError),
 }
@@ -64,6 +69,7 @@ impl TelegramClientConfig {
 
 pub struct TelegramClient {
     client: Client,
+    session: Arc<StoredSession>,
     handle: grammers_client::sender::SenderPoolHandle,
     updates: UpdateStream,
     runner_task: tokio::task::JoinHandle<()>,
@@ -71,12 +77,20 @@ pub struct TelegramClient {
 
 impl TelegramClient {
     pub async fn connect(config: TelegramClientConfig) -> Result<Self, TelegramClientError> {
-        let session = Arc::new(MemorySession::default());
+        Self::connect_with_session(config, StoredSession::default()).await
+    }
+
+    /// 用已恢复的 session 建连（通常来自 `StoredSession::restore`）。
+    pub async fn connect_with_session(
+        config: TelegramClientConfig,
+        session: StoredSession,
+    ) -> Result<Self, TelegramClientError> {
+        let session = Arc::new(session);
         let SenderPool {
             runner,
             updates,
             handle,
-        } = SenderPool::new(session, config.api_id);
+        } = SenderPool::new(Arc::clone(&session), config.api_id);
         let client = Client::new(handle.clone());
         let runner_task = tokio::spawn(async move {
             runner.run().await;
@@ -101,6 +115,7 @@ impl TelegramClient {
 
         Ok(Self {
             client,
+            session,
             handle: handle.thin,
             updates,
             runner_task,
@@ -233,6 +248,17 @@ impl TelegramClient {
                     .await
             }
         }
+    }
+
+    /// 把更新流状态同步进 session 后取快照。输出含 auth key，只能交给信封加密落库。
+    pub async fn snapshot(&self) -> Result<Secret<Vec<u8>>, TelegramClientError> {
+        self.updates
+            .sync_update_state()
+            .await
+            .map_err(TelegramClientError::SessionSync)?;
+        self.session
+            .snapshot()
+            .map_err(TelegramClientError::Snapshot)
     }
 
     pub async fn shutdown(self) -> Result<(), TelegramClientError> {
@@ -439,6 +465,37 @@ mod tests {
         let client = TelegramClient::connect(config).await?;
         client.shutdown().await?;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restored_session_snapshot_survives_a_client_without_network()
+    -> Result<(), TelegramClientError> {
+        use crate::session::StoredSession;
+        use grammers_session::Session;
+
+        let seeded = StoredSession::default();
+        seeded
+            .set_home_dc_id(4)
+            .await
+            .map_err(TelegramClientError::Snapshot)?;
+        let bytes = seeded.snapshot().map_err(TelegramClientError::Snapshot)?;
+        let restored =
+            StoredSession::restore(bytes.expose()).map_err(TelegramClientError::Snapshot)?;
+        let config = TelegramClientConfig::new(932_939)?.without_catch_up();
+
+        let client = TelegramClient::connect_with_session(config, restored).await?;
+        let after = client.snapshot().await?;
+        client.shutdown().await?;
+
+        let reloaded =
+            StoredSession::restore(after.expose()).map_err(TelegramClientError::Snapshot)?;
+        assert_eq!(
+            reloaded
+                .home_dc_id()
+                .map_err(TelegramClientError::Snapshot)?,
+            4
+        );
         Ok(())
     }
 }
