@@ -146,7 +146,14 @@ fn extra_required(role: Role) -> &'static [&'static str] {
             "TGM_DATA_BOT_IDENTITY_ID",
         ],
         Role::MtprotoWorker => &["TGM_KEK_BACKEND", "TGM_S3_ENDPOINT", "TGM_S3_BUCKET"],
-        Role::Delivery => &["TGM_KEK_BACKEND", "TGM_S3_ENDPOINT", "TGM_S3_BUCKET"],
+        // ADR-0033：平台自己的 api_id / api_hash 只用于以租户 Bot 身份 bot_sign_in。
+        Role::Delivery => &[
+            "TGM_KEK_BACKEND",
+            "TGM_S3_ENDPOINT",
+            "TGM_S3_BUCKET",
+            "TGM_PLATFORM_API_ID",
+            "TGM_PLATFORM_API_HASH",
+        ],
         // fanout 与 rule 只要 COMMON。它们不碰凭据也不碰对象存储 ——
         // 这正是 §二 那句「某个角色不需要的项，就不该配给它」想达到的形状
         Role::Fanout | Role::Rule => &[],
@@ -423,6 +430,8 @@ fn known_names() -> &'static [&'static str] {
         "TGM_DATA_BOT_SECRET_TOKEN",
         "TGM_DATA_BOT_IDENTITY_ID",
         "TGM_BOT_GATEWAY_LISTEN_ADDR",
+        "TGM_PLATFORM_API_ID",
+        "TGM_PLATFORM_API_HASH",
     ]
 }
 
@@ -534,6 +543,28 @@ mod tests {
             p,
             vec![ConfigProblem::Unexpected("TGM_LOCAL_KEK")],
             "应当恰好报这一项"
+        );
+    }
+
+    /// ADR-0033：平台 api_hash 只给 delivery。mtproto-worker 用租户自带的 api_id，
+    /// 拿到平台凭据就能绕开 ADR-0013 —— 必须报多配。
+    #[test]
+    fn platform_api_credentials_are_delivery_only() {
+        let mut env = minimal(Role::MtprotoWorker);
+        env.extend_from_slice(&["TGM_PLATFORM_API_ID", "TGM_PLATFORM_API_HASH"]);
+        let p = check(Role::MtprotoWorker, Some("development"), &env, None);
+        assert_eq!(
+            p,
+            vec![
+                ConfigProblem::Unexpected("TGM_PLATFORM_API_ID"),
+                ConfigProblem::Unexpected("TGM_PLATFORM_API_HASH"),
+            ]
+        );
+        let mut missing = minimal(Role::Delivery);
+        missing.retain(|name| *name != "TGM_PLATFORM_API_HASH");
+        assert_eq!(
+            check(Role::Delivery, Some("development"), &missing, None),
+            vec![ConfigProblem::Missing("TGM_PLATFORM_API_HASH")]
         );
     }
 

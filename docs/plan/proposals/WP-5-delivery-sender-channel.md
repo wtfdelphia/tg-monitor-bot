@@ -86,5 +86,62 @@ delivery 一旦接上，这就是一条以用户身份发消息的路径。
   L2：`target_router_crud_is_tenant_scoped_and_logically_deletes` 以 `app_user` 连接，
   断言 mtproto 身份建目标与改发送身份都被拒、库内不变。
   反证：把 `Some("bot")` 换成接受任意 kind，该测试在 201 ≠ 400 处变红；已还原。
-- 仍待定：平台 `api_id` 由谁去 my.telegram.org 申请；Bot session 的存放形状
-  （`identity_secrets` 现只有一个 `secret_ciphertext`，需迁移提案）。两项未定前不接入 `--role delivery`。
+- 平台 `api_id`：已由人申请（2026-10-19），经 `TGM_PLATFORM_API_ID` / `TGM_PLATFORM_API_HASH`
+  注入，仅 delivery 允许出现。
+- Bot session：**不落库**（批准）。delivery 启动时用 Token 现登录，session 只在内存；
+  不改 `identity_secrets`、不加迁移。成立前提两条，须 Bot 账号真机验证：
+  重启频率下 `auth.importBotAuthorization` 不触发限流；`random_id` 去重按 Bot 账号生效、
+  不随 auth key 变化（否则 G4 不成立，退回新表方案并另交迁移提案）。
+
+## 实现记录（2026-10-19，分支 `codex/WP-5-delivery-runtime`）
+
+- `tgm serve --role delivery` 接入：`crates/app/src/delivery_runtime.rs` 扫描发送身份，
+  每身份解密 Token → `TelegramClient::connect_bot_sender`（`bot_sign_in`，丢弃更新通道）→
+  既有 `DeliveryWorker`。
+- 候选 `list_delivery_sender_candidates`：`kind = 'bot'`、非 banned/unauthorized、有 Token，
+  且被启用目标引用或还有未完成任务。历史数据里被填成发送身份的 mtproto 不会起 worker。
+- Token 格式不对、登录返回的 Bot id 与 Token 前缀不符、Telegram 拒绝 Token：
+  `mark_bot_sender_unauthorized` 同一事务内转 `unauthorized` 并写审计 `identity.unauthorized`。
+- 预检：`TGM_PLATFORM_API_ID/HASH` 为 delivery 必填，其他角色出现即报多配。
+- 未验证：真机 `bot_sign_in`、G4 两个时点强杀、媒体 COPY/RESEND（仍判永久失败）。
+
+## 真机验收步骤（工具：`crates/app/tests/delivery_live.rs`）
+
+准备：测试用 Bot（不用正式租户的 Bot），一个测试频道并把该 Bot 设为可发消息的管理员；
+本地 compose 栈；KEK 用开发 `EnvKek`。凭据只在本机 shell 里 `export`，不写进任何文件，
+不贴进对话或证据。
+
+```bash
+export DATABASE_URL=postgres://tgm_test:tpw@127.0.0.1:55432/tgm_test_control
+export SQLX_OFFLINE=true
+export TGM_PLATFORM_API_ID=...        # 平台 api_id
+export TGM_PLATFORM_API_HASH=...      # 平台 api_hash
+export TGM_LIVE_BOT_TOKEN=...         # 测试 Bot 当前 Token
+export TGM_LIVE_TARGET_CHAT=-100...   # 测试频道 chat id
+
+# V1 登录与限流（默认 5 次，可设 TGM_LIVE_LOGIN_REPEAT）
+cargo test -p tgm-app --test delivery_live live_bot_login_repeat -- --ignored --nocapture
+# V2 G4：请求前 / 平台已接受后两个时点强杀，重启用全新 session 重发
+cargo test -p tgm-app --test delivery_live live_delivery_g4_kill_restart -- --ignored --nocapture
+# V3：在 BotFather 里 /revoke 重置 Token，把旧 Token 填进来
+export TGM_LIVE_REVOKED_BOT_TOKEN=...
+cargo test -p tgm-app --test delivery_live live_revoked_token -- --ignored --nocapture
+```
+
+判据：
+
+- V1：每轮 `login=ok bot_id_matches=true`；出现 `FLOOD_WAIT` 即「session 不落库」不成立。
+- V2：每个 phase 一行 `[V2] ... dedupe=...`。`same-message-id` 或 `random-id-duplicate` 表示未重复；
+  `DUPLICATE-SENT` 表示 G4 不成立，退回新表方案。另需**人工**看测试频道：每个 `tgm-g4 <phase> <random_id>`
+  只出现一次。`random-id-duplicate` 且任务未到 `DONE` 时测试会红，说明去重有效但应用层要补
+  「重复即已送达」的收口。
+- V3：`exit=Ok(Unauthorized) status=unauthorized audits=1`。
+
+缺任一变量时测试直接失败，不会空跑成绿。输出只含 Bot id 是否匹配、错误码、消息 id 与任务状态，
+可原样贴回来做证据；跑完删掉测试频道里的测试消息，在 BotFather 里作废测试 Token。
+
+## 真机验收结果（2026-10-19）
+
+V1 / V2 / V3 全部通过，证据 `docs/plan/evidence/WP-5-delivery真机验收-2026-10-19.md`。
+`random_id` 去重按 Bot 账号生效、不随 auth key 变化（after-send 强杀后新 session 重发返回同一消息 id，
+频道人工核对无重复），「session 不落库」的两条前提在本次样本下成立，不需要退回新表方案。

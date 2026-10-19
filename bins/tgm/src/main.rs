@@ -79,13 +79,6 @@ impl From<&Role> for CoreRole {
     }
 }
 
-fn unimplemented_serve_error(role: &Role) -> anyhow::Error {
-    anyhow::anyhow!(
-        "tgm: serve --role {}: NOT IMPLEMENTED（该角色尚未接入运行链，拒绝以成功状态退出）",
-        role.as_str()
-    )
-}
-
 /// 按 `TGM_KEK_BACKEND` 构造 KEK。预检已保证变量组合合法，这里的报错是兜底。
 async fn build_kek(
     profile: tgm_core::profile::Profile,
@@ -311,6 +304,49 @@ async fn serve_mtproto_worker() -> anyhow::Result<()> {
         tgm_app::mtproto_worker::MtprotoWorkerConfig::default(),
     );
     let result = worker.run(shutdown_rx).await;
+    signal_task.abort();
+    result?;
+    Ok(())
+}
+
+async fn serve_delivery() -> anyhow::Result<()> {
+    let profile = tgm_core::profile::Profile::parse(
+        &std::env::var("TGM_PROFILE")
+            .map_err(|_| anyhow::anyhow!("缺少 TGM_PROFILE —— 启动期校验本应先拦住"))?,
+    )?;
+    let app_url = std::env::var("TGM_DB_URL_APP")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_APP —— 启动期校验本应先拦住"))?;
+    let api_id = std::env::var("TGM_PLATFORM_API_ID")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_PLATFORM_API_ID —— 启动期校验本应先拦住"))?
+        .parse::<i32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow::anyhow!("TGM_PLATFORM_API_ID 必须是正整数"))?;
+    let api_hash = std::env::var("TGM_PLATFORM_API_HASH")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_PLATFORM_API_HASH —— 启动期校验本应先拦住"))?;
+    if api_hash.len() != 32 || !api_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow::anyhow!(
+            "TGM_PLATFORM_API_HASH 必须是 32 位十六进制"
+        ));
+    }
+    let pool = sqlx::PgPool::connect(&app_url).await?;
+    let kek = build_kek(profile).await?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let signal_task = tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = shutdown_tx.send(true);
+    });
+    tracing::info!("delivery 已启动");
+    let runtime = tgm_app::delivery_runtime::DeliveryRuntime::new(
+        pool,
+        kek,
+        tgm_app::delivery_runtime::PlatformApp {
+            api_id,
+            api_hash: Arc::new(tgm_core::secret::Secret::new(api_hash)),
+        },
+        tgm_app::delivery_runtime::DeliveryRuntimeConfig::default(),
+    );
+    let result = runtime.run(shutdown_rx).await;
     signal_task.abort();
     result?;
     Ok(())
@@ -623,23 +659,15 @@ fn main() -> anyhow::Result<()> {
     }
     match cmd {
         Command::Serve { role } => {
-            if matches!(role, Role::ControlPlane) {
-                let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(serve_control_plane())?;
-            } else if matches!(role, Role::BotGateway) {
-                let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(serve_bot_gateway())?;
-            } else if matches!(role, Role::Rule) {
-                let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(serve_rule())?;
-            } else if matches!(role, Role::Fanout) {
-                let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(serve_fanout())?;
-            } else if matches!(role, Role::MtprotoWorker) {
-                let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(serve_mtproto_worker())?;
-            } else {
-                return Err(unimplemented_serve_error(&role));
+            // 穷举 match：新增角色忘了接线时编译器报 non-exhaustive，而不是运行期才发现。
+            let rt = tokio::runtime::Runtime::new()?;
+            match role {
+                Role::ControlPlane => rt.block_on(serve_control_plane())?,
+                Role::BotGateway => rt.block_on(serve_bot_gateway())?,
+                Role::Rule => rt.block_on(serve_rule())?,
+                Role::Fanout => rt.block_on(serve_fanout())?,
+                Role::MtprotoWorker => rt.block_on(serve_mtproto_worker())?,
+                Role::Delivery => rt.block_on(serve_delivery())?,
             }
         }
         Command::Migrate => unreachable!("已在上面处理"),
@@ -649,17 +677,4 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Role, unimplemented_serve_error};
-
-    #[test]
-    fn unimplemented_serve_role_is_an_error() {
-        let error = unimplemented_serve_error(&Role::Delivery);
-
-        assert!(error.to_string().contains("serve --role delivery"));
-        assert!(error.to_string().contains("NOT IMPLEMENTED"));
-    }
 }
