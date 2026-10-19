@@ -1757,6 +1757,29 @@ pub async fn load_target_channel(
     .await
 }
 
+/// 发送身份必须属于本租户且 `kind = 'bot'`（spec/08 §1.4：投递一律走 Bot 身份）。
+/// 外层 `Err` 是数据库错误；内层 `Err` 是要返回给调用方的业务错误。
+async fn check_sender_identity(
+    conn: &mut sqlx::PgConnection,
+    tenant: TenantId,
+    identity_id: i64,
+) -> Result<Result<(), tgm_core::error::AppError>, sqlx::Error> {
+    let kind = sqlx::query_scalar::<_, String>(
+        "SELECT kind FROM identities WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(identity_id)
+    .bind(tenant.get())
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(match kind.as_deref() {
+        None => Err(tgm_core::error::AppError::NotFound),
+        Some("bot") => Ok(()),
+        Some(_) => Err(tgm_core::error::AppError::ConditionInvalid(
+            "发送身份必须是 Bot".to_owned(),
+        )),
+    })
+}
+
 pub async fn create_target_channel(
     pool: &PgPool,
     tenant: TenantId,
@@ -1764,15 +1787,10 @@ pub async fn create_target_channel(
 ) -> Result<TargetChannelRecord, tgm_core::error::AppError> {
     let result = tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
-            let identity_exists = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM identities WHERE id = $1 AND tenant_id = $2)",
-            )
-            .bind(input.sender_identity_id.get())
-            .bind(tenant.get())
-            .fetch_one(&mut *conn)
-            .await?;
-            if !identity_exists {
-                return Err(sqlx::Error::RowNotFound);
+            if let Err(error) =
+                check_sender_identity(conn, tenant, input.sender_identity_id.get()).await?
+            {
+                return Ok(Err(error));
             }
 
             sqlx::query_as::<_, TargetChannelRecord>(
@@ -1789,12 +1807,14 @@ pub async fn create_target_channel(
             .bind(input.sender_identity_id.get())
             .fetch_one(&mut *conn)
             .await
+            .map(Ok)
         })
     })
     .await;
 
     match result {
-        Ok(record) => Ok(record),
+        Ok(Ok(record)) => Ok(record),
+        Ok(Err(error)) => Err(error),
         Err(sqlx::Error::RowNotFound) => Err(tgm_core::error::AppError::NotFound),
         Err(error) if is_target_conflict(&error) => {
             match find_existing_target(pool, tenant, input.tg_chat_id, None).await? {
@@ -1821,18 +1841,14 @@ pub async fn update_target_channel(
             "至少提供一个目标频道字段".to_owned(),
         ));
     }
-    if let Some(sender_identity_id) = input.sender_identity_id {
-        let identity_exists = load_tenant_identity(pool, tenant, sender_identity_id)
-            .await
-            .map_err(tgm_core::error::AppError::Db)?
-            .is_some();
-        if !identity_exists {
-            return Err(tgm_core::error::AppError::NotFound);
-        }
-    }
-
     let result = tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            if let Some(sender_identity_id) = input.sender_identity_id
+                && let Err(error) = check_sender_identity(conn, tenant, sender_identity_id).await?
+            {
+                return Ok(Err(error));
+            }
+
             sqlx::query_as::<_, TargetChannelRecord>(
                 r#"
                 UPDATE target_channels
@@ -1863,12 +1879,14 @@ pub async fn update_target_channel(
             .fetch_optional(&mut *conn)
             .await?
             .ok_or(sqlx::Error::RowNotFound)
+            .map(Ok)
         })
     })
     .await;
 
     match result {
-        Ok(record) => Ok(record),
+        Ok(Ok(record)) => Ok(record),
+        Ok(Err(error)) => Err(error),
         Err(sqlx::Error::RowNotFound) => Err(tgm_core::error::AppError::NotFound),
         Err(error) if is_target_conflict(&error) => {
             match find_existing_target(

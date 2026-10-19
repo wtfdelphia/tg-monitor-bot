@@ -77,6 +77,10 @@ migrate-idempotent（19 个迁移文件）、audit-rls、test、double-pass、dr
 test 卡口合计 293 项通过、0 失败。double-pass 逐条破坏 MAIN、A1–A9、C1/C2/C4/C5/C6，
 各自恰好红对应一条（A2b 连带 A1 为已登记冗余）。最终裁决仍以 CI 为准。
 
+同日加入「发送身份限定为 Bot」的应用层校验（提案 `WP-5-delivery-sender-channel.md` 批准记录）后重跑：
+首次 clippy 报 `collapsible_if` 失败，修正后 13 道卡口全部通过，rc=0；test 合计仍为 293 项
+（新断言加在已有的 `target_router_crud_is_tenant_scoped_and_logically_deletes` 里）。
+
 ## 六、未验证
 
 - 真机：授权账号收消息、断线后 `catch_up` 补齐、`unauthorized` 真实触发、

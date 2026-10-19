@@ -2389,6 +2389,66 @@ async fn target_router_crud_is_tenant_scoped_and_logically_deletes(admin: PgPool
         .expect("执行跨租户发送身份请求失败");
     assert_eq!(hidden_identity.status(), StatusCode::NOT_FOUND);
 
+    let mtproto_a: tgm_core::ids::IdentityId = sqlx::query_scalar(
+        "INSERT INTO identities (kind, tenant_id, status) VALUES ('mtproto', $1, 'offline') RETURNING id",
+    )
+    .bind(tenant_a)
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建 mtproto 测试身份失败");
+    let user_sender = router(ControlPlaneState::new(app.clone()))
+        .oneshot(with_auth(
+            request(
+                "POST",
+                "/api/v1/targets",
+                Body::from(
+                    json!({
+                        "chat": "-1005903",
+                        "title": "User sender",
+                        "sender_identity_id": mtproto_a.get()
+                    })
+                    .to_string(),
+                ),
+            ),
+            owner_a,
+        ))
+        .await
+        .expect("执行 mtproto 发送身份创建请求失败");
+    assert_eq!(user_sender.status(), StatusCode::BAD_REQUEST);
+    let user_sender_body = response_json(user_sender).await;
+    assert_eq!(user_sender_body["error"]["code"], "CONDITION_INVALID");
+
+    let user_sender_patch = router(ControlPlaneState::new(app.clone()))
+        .oneshot(with_auth(
+            request(
+                "PATCH",
+                &format!("/api/v1/targets/{target_id}"),
+                Body::from(json!({"sender_identity_id": mtproto_a.get()}).to_string()),
+            ),
+            owner_a,
+        ))
+        .await
+        .expect("执行 mtproto 发送身份更新请求失败");
+    assert_eq!(user_sender_patch.status(), StatusCode::BAD_REQUEST);
+    let sender_after: i64 = sqlx::query_scalar(
+        "SELECT sender_identity_id FROM target_channels WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(tenant_a)
+    .bind(target_id)
+    .fetch_one(admin.raw())
+    .await
+    .expect("读取目标频道发送身份失败");
+    assert_eq!(sender_after, identity_a.get());
+    let user_targets: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM target_channels WHERE tenant_id = $1 AND sender_identity_id = $2",
+    )
+    .bind(tenant_a)
+    .bind(mtproto_a)
+    .fetch_one(admin.raw())
+    .await
+    .expect("读取 mtproto 发送目标数量失败");
+    assert_eq!(user_targets, 0);
+
     let listed = router(ControlPlaneState::new(app.clone()))
         .oneshot(with_auth(
             request("GET", "/api/v1/targets?per_page=1", Body::empty()),
