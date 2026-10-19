@@ -340,6 +340,7 @@ pub async fn serve(
     secret_token: String,
     receiver_identity_id: IdentityId,
     listener: tokio::net::TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), std::io::Error> {
     let app = router(BotGatewayState {
         pool,
@@ -348,12 +349,8 @@ pub async fn serve(
         receiver_identity_id,
     });
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await
-}
-
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
 }
 
 pub async fn list_member_contexts(
