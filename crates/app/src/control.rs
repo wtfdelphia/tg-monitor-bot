@@ -4530,7 +4530,7 @@ pub fn router(state: ControlPlaneState) -> Router {
 pub async fn serve(pool: PgPool, listener: TcpListener) -> Result<(), std::io::Error> {
     let app = router(ControlPlaneState::new(pool));
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(crate::shutdown_signal())
         .await
 }
 
@@ -4541,7 +4541,7 @@ pub async fn serve_with_auth(
 ) -> Result<(), std::io::Error> {
     let app = router(ControlPlaneState::with_auth_pool(pool, auth_pool));
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(crate::shutdown_signal())
         .await
 }
 
@@ -4557,7 +4557,7 @@ pub async fn serve_with_auth_and_bot(
         bot_console_config,
     ));
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(crate::shutdown_signal())
         .await
 }
 
@@ -4568,6 +4568,7 @@ pub async fn serve_with_auth_and_bot_and_oidc(
     oidc_config: OidcConfig,
     credential_intake: CredentialIntake,
     listener: TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), std::io::Error> {
     let app = router(
         ControlPlaneState::with_auth_pool_and_bot_and_oidc(
@@ -4579,12 +4580,8 @@ pub async fn serve_with_auth_and_bot_and_oidc(
         .with_credential_intake(credential_intake),
     );
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await
-}
-
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

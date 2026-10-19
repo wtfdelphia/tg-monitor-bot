@@ -101,7 +101,9 @@ async fn build_kek(
     }
 }
 
-async fn serve_control_plane() -> anyhow::Result<()> {
+async fn serve_control_plane(
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     // preflight 已解析并校验过同一个值，这里重读只为不把 profile 穿过 main 的分支。
     let profile = tgm_core::profile::Profile::parse(
         &std::env::var("TGM_PROFILE")
@@ -210,12 +212,15 @@ async fn serve_control_plane() -> anyhow::Result<()> {
             bot_api_base_url: tgm_app::bot_console::TELEGRAM_BOT_API_DEFAULT_BASE_URL.to_owned(),
         },
         listener,
+        signal,
     )
     .await?;
     Ok(())
 }
 
-async fn serve_bot_gateway() -> anyhow::Result<()> {
+async fn serve_bot_gateway(
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let app_url = std::env::var("TGM_DB_URL_APP")
         .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_APP —— 启动期校验本应先拦住"))?;
     let auth_url = std::env::var("TGM_DB_URL_AUTH")
@@ -252,18 +257,21 @@ async fn serve_bot_gateway() -> anyhow::Result<()> {
         secret_token,
         receiver_identity_id,
         listener,
+        signal,
     )
     .await?;
     Ok(())
 }
 
-async fn serve_rule() -> anyhow::Result<()> {
+async fn serve_rule(
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let app_url = std::env::var("TGM_DB_URL_APP")
         .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_APP —— 启动期校验本应先拦住"))?;
     let pool = sqlx::PgPool::connect(&app_url).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let signal_task = tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        signal.await;
         let _ = shutdown_tx.send(true);
     });
     let worker =
@@ -278,7 +286,9 @@ async fn serve_rule() -> anyhow::Result<()> {
 ///
 /// worker_id 取主机名加进程号：同机重启换 id，旧进程的租约只能等过期或被接管，
 /// 不会被新进程当成「自己的」续上。
-async fn serve_mtproto_worker() -> anyhow::Result<()> {
+async fn serve_mtproto_worker(
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let profile = tgm_core::profile::Profile::parse(
         &std::env::var("TGM_PROFILE")
             .map_err(|_| anyhow::anyhow!("缺少 TGM_PROFILE —— 启动期校验本应先拦住"))?,
@@ -294,7 +304,7 @@ async fn serve_mtproto_worker() -> anyhow::Result<()> {
     tracing::info!(worker_id = %worker_id, "mtproto-worker 已启动");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let signal_task = tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        signal.await;
         let _ = shutdown_tx.send(true);
     });
     let worker = tgm_app::mtproto_worker::MtprotoWorker::new(
@@ -309,7 +319,9 @@ async fn serve_mtproto_worker() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn serve_delivery() -> anyhow::Result<()> {
+async fn serve_delivery(
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let profile = tgm_core::profile::Profile::parse(
         &std::env::var("TGM_PROFILE")
             .map_err(|_| anyhow::anyhow!("缺少 TGM_PROFILE —— 启动期校验本应先拦住"))?,
@@ -333,7 +345,7 @@ async fn serve_delivery() -> anyhow::Result<()> {
     let kek = build_kek(profile).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let signal_task = tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        signal.await;
         let _ = shutdown_tx.send(true);
     });
     tracing::info!("delivery 已启动");
@@ -352,13 +364,15 @@ async fn serve_delivery() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn serve_fanout() -> anyhow::Result<()> {
+async fn serve_fanout(
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let app_url = std::env::var("TGM_DB_URL_APP")
         .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_APP —— 启动期校验本应先拦住"))?;
     let pool = sqlx::PgPool::connect(&app_url).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let signal_task = tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        signal.await;
         let _ = shutdown_tx.send(true);
     });
     let worker = tgm_app::pipeline::FanoutWorker::new(
@@ -641,12 +655,20 @@ fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    // SIGTERM 监听必须在 preflight 连库之前注册：preflight 一连上库，外部就可能把进程视为已启动，
+    // 这之后、监听注册之前到达的 SIGTERM 会走默认处置直接杀进程（strace 实测）。
+    let mut serve_runtime = None;
     if let Command::Serve { role } = &cmd {
+        let rt = tokio::runtime::Runtime::new()?;
+        // signal::unix::signal 要求在运行时上下文里调用，enter 只为注册，不轮询。
+        let signal = {
+            let _guard = rt.enter();
+            tgm_app::shutdown_signal()
+        };
         // 启动期校验要跑，**哪怕 serve 本体还没实现**。
         // 理由：这六项校验管的是「这个部署的配置对不对」，与业务代码是否落地无关；
         // 而且 `?` 往外抛让退出码非 0 —— 这是 serve 这条路径上第一个
         // 不是空壳的断言（对比 not_implemented 那个恒 0 的退出码）。
-        let rt = tokio::runtime::Runtime::new()?;
         let profile = rt.block_on(preflight(role))?;
         // subscriber 在校验之后装：装它要 profile，而 profile 的合法性是校验的产出。
         // 代价是 preflight 的输出走 stderr 而非结构化日志 —— 接受，因为
@@ -656,18 +678,21 @@ fn main() -> anyhow::Result<()> {
             role = role.as_str(),
             "subscriber 已装（eng/00 §5.1）—— 本行之前的输出都在 stderr"
         );
+        serve_runtime = Some((rt, signal));
     }
     match cmd {
         Command::Serve { role } => {
+            let (rt, signal) = serve_runtime
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("serve 运行时未初始化"))?;
             // 穷举 match：新增角色忘了接线时编译器报 non-exhaustive，而不是运行期才发现。
-            let rt = tokio::runtime::Runtime::new()?;
             match role {
-                Role::ControlPlane => rt.block_on(serve_control_plane())?,
-                Role::BotGateway => rt.block_on(serve_bot_gateway())?,
-                Role::Rule => rt.block_on(serve_rule())?,
-                Role::Fanout => rt.block_on(serve_fanout())?,
-                Role::MtprotoWorker => rt.block_on(serve_mtproto_worker())?,
-                Role::Delivery => rt.block_on(serve_delivery())?,
+                Role::ControlPlane => rt.block_on(serve_control_plane(signal))?,
+                Role::BotGateway => rt.block_on(serve_bot_gateway(signal))?,
+                Role::Rule => rt.block_on(serve_rule(signal))?,
+                Role::Fanout => rt.block_on(serve_fanout(signal))?,
+                Role::MtprotoWorker => rt.block_on(serve_mtproto_worker(signal))?,
+                Role::Delivery => rt.block_on(serve_delivery(signal))?,
             }
         }
         Command::Migrate => unreachable!("已在上面处理"),

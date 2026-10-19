@@ -24,6 +24,14 @@ impl WorkerProcess {
     }
 
     fn start_role(database_url: &str, role: &str) -> Result<Self> {
+        Self::start_role_with_env(database_url, role, &[])
+    }
+
+    fn start_role_with_env(
+        database_url: &str,
+        role: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self> {
         let child = Command::new(env!("CARGO_BIN_EXE_tgm"))
             .args(["serve", "--role", role])
             .env_clear()
@@ -31,6 +39,7 @@ impl WorkerProcess {
             .env("TGM_DB_URL_APP", database_url)
             .env("TGM_REDIS_URL", "redis://127.0.0.1:56379")
             .env("RUST_LOG", "info,sqlx=warn")
+            .envs(extra_env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -515,5 +524,91 @@ async fn rule_process_rolls_back_uncommitted_tasks_and_recovers_after_hard_kill(
     next_worker.kill_and_wait()?;
     wait_for_worker_disconnect(&app, "tgm-rule-restart-regression").await?;
     app.close().await;
+    Ok(())
+}
+
+async fn wait_for_worker_connect(pool: &PgPool, application_name: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let connections: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE datname = current_database()
+                AND application_name = $1",
+        )
+        .bind(application_name)
+        .fetch_one(pool)
+        .await?;
+        if connections > 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("worker 未在期限内连上数据库");
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// ops/00 §六：SIGTERM 必须触发优雅退出。`docker stop` / systemd 只发 SIGTERM，
+/// 只监听 Ctrl-C 时进程会被默认处置直接终止（退出码 143），在途请求被截断。
+/// 四个后台角色都没有 Bot 候选或账号租约，不会连 Telegram。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn worker_processes_exit_cleanly_on_sigterm(admin: PgPool) -> Result<()> {
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&admin)
+        .await?;
+    let kek_env: &[(&str, &str)] = &[
+        ("TGM_KEK_BACKEND", "env"),
+        (
+            "TGM_LOCAL_KEK",
+            "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+        ),
+        ("TGM_S3_ENDPOINT", "http://127.0.0.1:59000"),
+        ("TGM_S3_BUCKET", "tgm-sigterm"),
+    ];
+    let delivery_env: Vec<(&str, &str)> = kek_env
+        .iter()
+        .copied()
+        .chain([
+            ("TGM_PLATFORM_API_ID", "1"),
+            ("TGM_PLATFORM_API_HASH", "00000000000000000000000000000000"),
+        ])
+        .collect();
+    let cases: [(&str, &[(&str, &str)]); 4] = [
+        ("fanout", &[]),
+        ("rule", &[]),
+        ("mtproto-worker", kek_env),
+        ("delivery", &delivery_env),
+    ];
+    for (role, extra_env) in cases {
+        let application_name = format!("tgm-sigterm-{role}");
+        let app_url = format!(
+            "postgres://app_user:apw@127.0.0.1:55432/{database}?application_name={application_name}"
+        );
+        let mut worker = WorkerProcess::start_role_with_env(&app_url, role, extra_env)?;
+        wait_for_worker_connect(&admin, &application_name).await?;
+        worker.assert_running()?;
+
+        let pid = worker.child.id().to_string();
+        let sent = Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .context("发送 SIGTERM 失败")?;
+        assert!(sent.success(), "kill -TERM 未成功");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = worker.child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("{role} 收到 SIGTERM 后 30s 内未退出");
+            }
+            sleep(Duration::from_millis(25)).await;
+        };
+        assert!(
+            status.success(),
+            "{role} 收到 SIGTERM 应优雅退出，实际 {status}"
+        );
+    }
     Ok(())
 }
