@@ -22,6 +22,7 @@ use tgm_core::ids::{IdentityId, TenantId};
 use tgm_core::kek::{Kek, KekContext, KekError};
 use tgm_core::secret::Secret;
 
+use crate::repo::{LeaseGuard, lease_is_held};
 use crate::tenant::tenant_tx;
 
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +41,9 @@ pub enum CredentialError {
     // ponytail: 不支持多 KEK 并存，KEK 轮换落地时改为按行 kek_id 选 KEK
     #[error("凭据 DEK 的 kek_id 与当前 KEK 不符，KEK 轮换尚未实现")]
     KekMismatch,
+    /// 持租约写入时发现租约已被接管或过期（spec/08 §4.3）。
+    #[error("身份租约已丢失")]
+    LeaseLost,
 }
 
 /// 一份待落库的凭据：凭据密文 + 被 KEK 包裹的 DEK。明文 DEK 在返回前已清零。
@@ -87,6 +91,37 @@ pub async fn store_identity_secret(
     identity: IdentityId,
     plaintext: &Secret<Vec<u8>>,
 ) -> Result<(), CredentialError> {
+    store_secret(pool, kek, tenant, identity, plaintext, None).await
+}
+
+/// 同 [`store_identity_secret`]，写入事务内先校验租约（mtproto-worker 落 session 用）。
+/// 僵尸 worker 不能用旧快照覆盖接管方的 session。
+pub async fn store_identity_secret_leased(
+    pool: &PgPool,
+    kek: &dyn Kek,
+    tenant: TenantId,
+    lease: &LeaseGuard,
+    plaintext: &Secret<Vec<u8>>,
+) -> Result<(), CredentialError> {
+    store_secret(
+        pool,
+        kek,
+        tenant,
+        lease.identity_id,
+        plaintext,
+        Some(lease.clone()),
+    )
+    .await
+}
+
+async fn store_secret(
+    pool: &PgPool,
+    kek: &dyn Kek,
+    tenant: TenantId,
+    identity: IdentityId,
+    plaintext: &Secret<Vec<u8>>,
+    lease: Option<LeaseGuard>,
+) -> Result<(), CredentialError> {
     // 先确认身份归属再调 KEK：对不存在的身份写入不该产生一次 KMS 调用。
     let owned = tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
@@ -107,6 +142,11 @@ pub async fn store_identity_secret(
     let credential = seal_with_fresh_dek(kek, tenant, identity.get(), plaintext.expose()).await?;
     let written = tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            if let Some(lease) = &lease
+                && !lease_is_held(&mut *conn, lease).await?
+            {
+                return Ok(Err(CredentialError::LeaseLost));
+            }
             sqlx::query_scalar::<_, i64>(UPSERT_SECRET)
                 .bind(tenant.get())
                 .bind(identity.get())
@@ -116,9 +156,10 @@ pub async fn store_identity_secret(
                 .bind(credential.kek_id)
                 .fetch_optional(conn)
                 .await
+                .map(Ok)
         })
     })
-    .await?;
+    .await??;
     written.map(|_| ()).ok_or(CredentialError::IdentityNotFound)
 }
 
