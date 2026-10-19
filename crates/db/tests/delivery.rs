@@ -296,6 +296,32 @@ async fn delivery_task_operations_cannot_cross_tenant_boundary(admin: PgPool) {
     assert_eq!(task_status(&admin, task_a).await.0, "SENDING");
 }
 
+/// ADR-0033 条款核对：Bot 开发者条款 §5.2(f) 禁止借他人凭据绕过封禁与限流。
+/// 任务绑定创建时的发送身份，同租户的另一个 Bot 领不走，被封 Bot 的积压不会换号发出。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn delivery_tasks_are_not_claimed_by_another_bot_of_same_tenant(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let tenant = seed_tenant(&admin, "delivery-tenant-a").await;
+    let banned_bot = seed_identity(&admin, tenant, "banned").await;
+    let other_bot = seed_identity(&admin, tenant, "other").await;
+    let task = seed_task(&admin, tenant, banned_bot, "delivery-same-tenant").await;
+
+    assert!(
+        claim_due_delivery_task(&app, tenant, other_bot)
+            .await
+            .expect("同租户另一 Bot 领取查询失败")
+            .is_none()
+    );
+    assert_eq!(task_status(&admin, task).await, ("PENDING".to_owned(), 0));
+
+    let claimed = claim_due_delivery_task(&app, tenant, banned_bot)
+        .await
+        .expect("原发送身份领取查询失败")
+        .expect("原发送身份应能领取");
+    assert_eq!(claimed.id, task);
+}
+
 #[sqlx::test(migrations = "../../migrations-test")]
 async fn stale_sending_tasks_are_recovered_after_worker_restart(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;

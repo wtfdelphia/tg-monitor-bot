@@ -59,7 +59,7 @@ Bot API 发出，不属于 G4 用例）、`before-send` 1 条（7）、`after-se
 - `tgm serve --role delivery` 整进程长时间运行（本次走的是同一套 `run_delivery_once` 与
   `connect_bot_sender`，但没有起常驻进程）。
 - 真实 `KmsKek` 下 delivery 的运行期 Decrypt。
-- 条款逐字核对（ADR-0033 定案的另一项前置）。
+- 条款逐字核对（ADR-0033 定案的另一项前置）：已完成，见 `ADR-0033-条款逐字核对-2026-10-19.md`。
 
 ## 五、凭据处置
 

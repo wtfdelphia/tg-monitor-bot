@@ -157,3 +157,9 @@ V1 / V2 / V3 全部通过，证据 `docs/plan/evidence/WP-5-delivery真机验收
 测试：`delivery::tests::error_codes_classify_permanent_and_flood_wait_failures` 补了两码判永久、
 `TELEGRAM_CLIENT_ERROR` 仍判可重试的断言。反证：从名单删掉 `CHANNEL_INVALID` 后恰好这一条红，已还原。
 人工重新把 Bot 加回频道后，死信任务走现有的控制面重试入口恢复，本次不新增自动恢复。
+
+## 定案记录（2026-10-19，分支 `codex/ADR-0033-clause-check`）
+
+条款逐字核对完成，证据 `docs/plan/evidence/ADR-0033-条款逐字核对-2026-10-19.md`。人工批准定案，
+ADR-0033 状态改为已定案。核对新增一条硬约束（Bot 开发者条款 §5.2(f)：被封 Bot 的任务不换号重发），
+由 L2 `delivery_tasks_are_not_claimed_by_another_bot_of_same_tenant` 守住。
