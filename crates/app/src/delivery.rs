@@ -596,6 +596,8 @@ impl DeliveryErrorKind {
             "CHAT_WRITE_FORBIDDEN",
             "ChatWriteForbidden",
             "CHANNEL_NOT_FOUND",
+            "CHANNEL_INVALID",
+            "CHANNEL_PRIVATE",
             "PEER_ID_INVALID",
             "MEDIA_COPY_UNAVAILABLE",
             "MEDIA_RESEND_UNAVAILABLE",
@@ -715,6 +717,16 @@ mod tests {
             DeliveryErrorKind::from_code("ChatWriteForbidden", None),
             DeliveryErrorKind::Permanent
         ));
+        for removed_from_channel in ["CHANNEL_INVALID", "CHANNEL_PRIVATE"] {
+            assert_eq!(
+                DeliveryErrorKind::from_code(removed_from_channel, None),
+                DeliveryErrorKind::Permanent
+            );
+        }
+        assert_eq!(
+            DeliveryErrorKind::from_code("TELEGRAM_CLIENT_ERROR", None),
+            DeliveryErrorKind::Retryable
+        );
         assert!(matches!(
             DeliveryErrorKind::from_code("FLOOD_WAIT", Some(12)),
             DeliveryErrorKind::FloodWait { seconds: 12 }

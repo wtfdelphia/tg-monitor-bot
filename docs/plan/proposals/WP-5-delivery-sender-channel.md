@@ -145,3 +145,15 @@ cargo test -p tgm-app --test delivery_live live_revoked_token -- --ignored --noc
 V1 / V2 / V3 全部通过，证据 `docs/plan/evidence/WP-5-delivery真机验收-2026-10-19.md`。
 `random_id` 去重按 Bot 账号生效、不随 auth key 变化（after-send 强杀后新 session 重发返回同一消息 id，
 频道人工核对无重复），「session 不落库」的两条前提在本次样本下成立，不需要退回新表方案。
+
+## 后续：`CHANNEL_INVALID` 改判永久失败（2026-10-19，分支 `codex/WP-5-channel-invalid-permanent`）
+
+真机验收里 Bot 不在目标频道时，MTProto 返回 `CHANNEL_INVALID`，`DeliveryErrorKind::from_code`
+把它归为可重试，任务会按 30 秒 / 5 分钟 / 30 分钟白跑三轮才进死信。这个错误要等人把 Bot
+重新加进频道才会消失，重试没有意义，所以改判为 `Permanent`，直接进死信，与已有的
+`CHAT_WRITE_FORBIDDEN`、`CHANNEL_NOT_FOUND` 同档。`CHANNEL_PRIVATE`（Bot 被封禁或频道
+对它不可见）同理一并加入。
+
+测试：`delivery::tests::error_codes_classify_permanent_and_flood_wait_failures` 补了两码判永久、
+`TELEGRAM_CLIENT_ERROR` 仍判可重试的断言。反证：从名单删掉 `CHANNEL_INVALID` 后恰好这一条红，已还原。
+人工重新把 Bot 加回频道后，死信任务走现有的控制面重试入口恢复，本次不新增自动恢复。
