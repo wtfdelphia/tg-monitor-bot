@@ -281,6 +281,41 @@ async fn serve_rule() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// mtproto-worker：持租约收消息落 `canonical_events`（spec/08 §四）。
+///
+/// worker_id 取主机名加进程号：同机重启换 id，旧进程的租约只能等过期或被接管，
+/// 不会被新进程当成「自己的」续上。
+async fn serve_mtproto_worker() -> anyhow::Result<()> {
+    let profile = tgm_core::profile::Profile::parse(
+        &std::env::var("TGM_PROFILE")
+            .map_err(|_| anyhow::anyhow!("缺少 TGM_PROFILE —— 启动期校验本应先拦住"))?,
+    )?;
+    let app_url = std::env::var("TGM_DB_URL_APP")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_APP —— 启动期校验本应先拦住"))?;
+    let pool = sqlx::PgPool::connect(&app_url).await?;
+    let kek = build_kek(profile).await?;
+    let host = std::fs::read_to_string("/etc/hostname")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|_| "unknown-host".to_owned());
+    let worker_id = format!("{host}:{}", std::process::id());
+    tracing::info!(worker_id = %worker_id, "mtproto-worker 已启动");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let signal_task = tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = shutdown_tx.send(true);
+    });
+    let worker = tgm_app::mtproto_worker::MtprotoWorker::new(
+        pool,
+        kek,
+        worker_id,
+        tgm_app::mtproto_worker::MtprotoWorkerConfig::default(),
+    );
+    let result = worker.run(shutdown_rx).await;
+    signal_task.abort();
+    result?;
+    Ok(())
+}
+
 async fn serve_fanout() -> anyhow::Result<()> {
     let app_url = std::env::var("TGM_DB_URL_APP")
         .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_APP —— 启动期校验本应先拦住"))?;
@@ -600,6 +635,9 @@ fn main() -> anyhow::Result<()> {
             } else if matches!(role, Role::Fanout) {
                 let rt = tokio::runtime::Runtime::new()?;
                 rt.block_on(serve_fanout())?;
+            } else if matches!(role, Role::MtprotoWorker) {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(serve_mtproto_worker())?;
             } else {
                 return Err(unimplemented_serve_error(&role));
             }

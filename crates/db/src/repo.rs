@@ -1757,6 +1757,29 @@ pub async fn load_target_channel(
     .await
 }
 
+/// 发送身份必须属于本租户且 `kind = 'bot'`（spec/08 §1.4：投递一律走 Bot 身份）。
+/// 外层 `Err` 是数据库错误；内层 `Err` 是要返回给调用方的业务错误。
+async fn check_sender_identity(
+    conn: &mut sqlx::PgConnection,
+    tenant: TenantId,
+    identity_id: i64,
+) -> Result<Result<(), tgm_core::error::AppError>, sqlx::Error> {
+    let kind = sqlx::query_scalar::<_, String>(
+        "SELECT kind FROM identities WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(identity_id)
+    .bind(tenant.get())
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(match kind.as_deref() {
+        None => Err(tgm_core::error::AppError::NotFound),
+        Some("bot") => Ok(()),
+        Some(_) => Err(tgm_core::error::AppError::ConditionInvalid(
+            "发送身份必须是 Bot".to_owned(),
+        )),
+    })
+}
+
 pub async fn create_target_channel(
     pool: &PgPool,
     tenant: TenantId,
@@ -1764,15 +1787,10 @@ pub async fn create_target_channel(
 ) -> Result<TargetChannelRecord, tgm_core::error::AppError> {
     let result = tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
-            let identity_exists = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM identities WHERE id = $1 AND tenant_id = $2)",
-            )
-            .bind(input.sender_identity_id.get())
-            .bind(tenant.get())
-            .fetch_one(&mut *conn)
-            .await?;
-            if !identity_exists {
-                return Err(sqlx::Error::RowNotFound);
+            if let Err(error) =
+                check_sender_identity(conn, tenant, input.sender_identity_id.get()).await?
+            {
+                return Ok(Err(error));
             }
 
             sqlx::query_as::<_, TargetChannelRecord>(
@@ -1789,12 +1807,14 @@ pub async fn create_target_channel(
             .bind(input.sender_identity_id.get())
             .fetch_one(&mut *conn)
             .await
+            .map(Ok)
         })
     })
     .await;
 
     match result {
-        Ok(record) => Ok(record),
+        Ok(Ok(record)) => Ok(record),
+        Ok(Err(error)) => Err(error),
         Err(sqlx::Error::RowNotFound) => Err(tgm_core::error::AppError::NotFound),
         Err(error) if is_target_conflict(&error) => {
             match find_existing_target(pool, tenant, input.tg_chat_id, None).await? {
@@ -1821,18 +1841,14 @@ pub async fn update_target_channel(
             "至少提供一个目标频道字段".to_owned(),
         ));
     }
-    if let Some(sender_identity_id) = input.sender_identity_id {
-        let identity_exists = load_tenant_identity(pool, tenant, sender_identity_id)
-            .await
-            .map_err(tgm_core::error::AppError::Db)?
-            .is_some();
-        if !identity_exists {
-            return Err(tgm_core::error::AppError::NotFound);
-        }
-    }
-
     let result = tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            if let Some(sender_identity_id) = input.sender_identity_id
+                && let Err(error) = check_sender_identity(conn, tenant, sender_identity_id).await?
+            {
+                return Ok(Err(error));
+            }
+
             sqlx::query_as::<_, TargetChannelRecord>(
                 r#"
                 UPDATE target_channels
@@ -1863,12 +1879,14 @@ pub async fn update_target_channel(
             .fetch_optional(&mut *conn)
             .await?
             .ok_or(sqlx::Error::RowNotFound)
+            .map(Ok)
         })
     })
     .await;
 
     match result {
-        Ok(record) => Ok(record),
+        Ok(Ok(record)) => Ok(record),
+        Ok(Err(error)) => Err(error),
         Err(sqlx::Error::RowNotFound) => Err(tgm_core::error::AppError::NotFound),
         Err(error) if is_target_conflict(&error) => {
             match find_existing_target(
@@ -4166,6 +4184,33 @@ pub async fn insert_canonical_event(
     pool: &PgPool,
     event: &CanonicalEventInput,
 ) -> Result<CanonicalEventWrite, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    insert_canonical_event_in(&mut conn, event).await
+}
+
+/// 持租约写入规范化事件（spec/08 §4.3「所有写操作都带 token」）。
+///
+/// 租约行加 `FOR SHARE` 后再写：接管方的 `UPDATE` 要等本事务提交，提交后旧 token
+/// 不再匹配。返回 `None` 表示调用方已不是持有者，必须立刻停止消费。
+pub async fn insert_canonical_event_leased(
+    pool: &PgPool,
+    lease: &LeaseGuard,
+    event: &CanonicalEventInput,
+) -> Result<Option<CanonicalEventWrite>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !lease_is_held(&mut tx, lease).await? {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let written = insert_canonical_event_in(&mut tx, event).await?;
+    tx.commit().await?;
+    Ok(Some(written))
+}
+
+async fn insert_canonical_event_in(
+    conn: &mut sqlx::PgConnection,
+    event: &CanonicalEventInput,
+) -> Result<CanonicalEventWrite, sqlx::Error> {
     let inserted_id = sqlx::query_scalar!(
         r#"
         INSERT INTO canonical_events (
@@ -4214,7 +4259,7 @@ pub async fn insert_canonical_event(
         event.mime_type,
         event.raw_file_id,
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
 
     if let Some(id) = inserted_id {
@@ -4237,7 +4282,7 @@ pub async fn insert_canonical_event(
         event.event_type.as_str(),
         event.edit_version,
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     Ok(CanonicalEventWrite {
@@ -4298,6 +4343,157 @@ pub async fn fanout_canonical_event(
                 id,
                 inserted: false,
             }))
+        })
+    })
+    .await
+}
+
+/// 一次租约持有：写入前用它校验调用方仍是持有者。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseGuard {
+    pub identity_id: IdentityId,
+    pub worker_id: String,
+    pub fencing_token: i64,
+}
+
+/// 在当前事务里锁住并校验租约。`FOR SHARE` 让并发的接管或续租等本事务结束。
+pub async fn lease_is_held(
+    conn: &mut sqlx::PgConnection,
+    lease: &LeaseGuard,
+) -> Result<bool, sqlx::Error> {
+    let held = sqlx::query_scalar::<_, i32>(
+        "SELECT 1
+           FROM account_leases
+          WHERE identity_id = $1
+            AND worker_id = $2
+            AND fencing_token = $3
+            AND expires_at > clock_timestamp()
+          FOR SHARE",
+    )
+    .bind(lease.identity_id.get())
+    .bind(&lease.worker_id)
+    .bind(lease.fencing_token)
+    .fetch_optional(conn)
+    .await?;
+    Ok(held.is_some())
+}
+
+/// mtproto-worker 可接管的身份：租户自有、未失效或封禁、已有 session 与 `api_id`。
+///
+/// 平台演示身份（`tenant_id IS NULL`）不在此列：它的凭据不属于任何租户，
+/// 现有凭据读取路径按租户连接，接不上。
+pub async fn list_mtproto_worker_candidates(
+    pool: &PgPool,
+    tenant: TenantId,
+) -> Result<Vec<(IdentityId, i32)>, sqlx::Error> {
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query_as::<_, (IdentityId, i32)>(
+                "SELECT i.id, s.api_id
+                   FROM identities i
+                   JOIN identity_secrets s ON s.identity_id = i.id
+                  WHERE i.tenant_id = $1
+                    AND i.kind = 'mtproto'
+                    AND i.status NOT IN ('banned', 'unauthorized')
+                    AND s.api_id IS NOT NULL
+                  ORDER BY i.id",
+            )
+            .bind(tenant.get())
+            .fetch_all(conn)
+            .await
+        })
+    })
+    .await
+}
+
+/// 持租约改写 MTProto 身份的运行状态（`online` / `offline` / `flood_wait`）。
+///
+/// 已转入 `banned` / `unauthorized` 的身份不被改回，那两个状态只能由重新授权退出
+/// （spec/08 §五）。返回 `false` 表示租约已丢失或身份已不可改。
+pub async fn set_leased_identity_status(
+    pool: &PgPool,
+    tenant: TenantId,
+    lease: &LeaseGuard,
+    status: &'static str,
+) -> Result<bool, sqlx::Error> {
+    let lease = lease.clone();
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            if !lease_is_held(&mut *conn, &lease).await? {
+                return Ok(false);
+            }
+            let updated = sqlx::query(
+                "UPDATE identities
+                    SET status = $3, updated_at = clock_timestamp()
+                  WHERE tenant_id = $1
+                    AND id = $2
+                    AND kind = 'mtproto'
+                    AND status NOT IN ('banned', 'unauthorized')",
+            )
+            .bind(tenant.get())
+            .bind(lease.identity_id.get())
+            .bind(status)
+            .execute(&mut *conn)
+            .await?;
+            Ok(updated.rows_affected() == 1)
+        })
+    })
+    .await
+}
+
+/// Telegram 判定授权失效：同一事务内转 `unauthorized`、释放租约、写审计（spec/08 §五）。
+///
+/// 释放只把 `expires_at` 置为当前时间，保留行与 token。返回 `false` 表示租约已丢失，
+/// 状态由新持有者处理。
+pub async fn mark_leased_identity_unauthorized(
+    pool: &PgPool,
+    tenant: TenantId,
+    lease: &LeaseGuard,
+) -> Result<bool, sqlx::Error> {
+    let lease = lease.clone();
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            if !lease_is_held(&mut *conn, &lease).await? {
+                return Ok(false);
+            }
+            let before = sqlx::query_scalar::<_, String>(
+                "UPDATE identities AS i
+                    SET status = 'unauthorized', updated_at = clock_timestamp()
+                   FROM (SELECT id, status FROM identities
+                          WHERE tenant_id = $1 AND id = $2 FOR UPDATE) AS old
+                  WHERE i.id = old.id
+                    AND i.kind = 'mtproto'
+                 RETURNING old.status",
+            )
+            .bind(tenant.get())
+            .bind(lease.identity_id.get())
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(before) = before else {
+                return Ok(false);
+            };
+            sqlx::query(
+                "UPDATE account_leases
+                    SET expires_at = clock_timestamp()
+                  WHERE identity_id = $1 AND worker_id = $2 AND fencing_token = $3",
+            )
+            .bind(lease.identity_id.get())
+            .bind(&lease.worker_id)
+            .bind(lease.fencing_token)
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query(
+                "INSERT INTO audit_logs
+                    (tenant_id, actor_user_id, action, resource, resource_id, before, after, source)
+                 VALUES ($1, NULL, 'identity.unauthorized', 'identity', $2, $3, $4, 'system')",
+            )
+            .bind(tenant.get())
+            .bind(lease.identity_id.get())
+            .bind(json!({ "status": before }))
+            .bind(json!({ "status": "unauthorized" }))
+            .execute(&mut *conn)
+            .await?;
+            Ok(true)
         })
     })
     .await

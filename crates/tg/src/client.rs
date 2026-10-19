@@ -129,6 +129,20 @@ impl TelegramClient {
             .map_err(TelegramClientError::Invocation)
     }
 
+    /// 等下一条别人发的新消息或编辑。自己发出的消息与其他更新类型直接跳过（spec/08 §1.4）。
+    pub async fn next_incoming(&mut self) -> Result<IncomingMessage, TelegramClientError> {
+        loop {
+            let (raw, edited) = match self.next_update().await? {
+                Update::NewMessage(message) => (message.into_inner().raw, false),
+                Update::MessageEdited(message) => (message.into_inner().raw, true),
+                _ => continue,
+            };
+            if let Some(incoming) = incoming_from_raw(&raw, edited) {
+                return Ok(incoming);
+            }
+        }
+    }
+
     pub async fn copy_text(
         &self,
         target_tg_chat_id: i64,
@@ -288,6 +302,121 @@ impl TelegramClient {
     }
 }
 
+/// 采集到的一条消息，只含落 `canonical_events` 需要的字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingMessage {
+    /// Bot API 形式的对话 id（频道为 `-100…`），与 `source_subscriptions.tg_chat_id` 同一口径。
+    pub tg_chat_id: i64,
+    pub tg_message_id: i64,
+    pub edited: bool,
+    pub grouped_id: Option<i64>,
+    pub sender_id: Option<i64>,
+    /// Unix 秒。
+    pub date: i64,
+    /// 编辑时间（Unix 秒），只有编辑事件有。
+    pub edit_date: Option<i64>,
+    pub text: Option<String>,
+    pub media_type: Option<String>,
+    pub file_name: Option<String>,
+    pub file_size: Option<i64>,
+    pub mime_type: Option<String>,
+}
+
+/// 只认普通消息：空消息、服务消息与自己发出的消息返回 `None`。
+fn incoming_from_raw(raw: &tl::enums::Message, edited: bool) -> Option<IncomingMessage> {
+    let tl::enums::Message::Message(message) = raw else {
+        return None;
+    };
+    if message.out {
+        return None;
+    }
+    let tg_chat_id = PeerId::from(&message.peer_id).bot_api_dialog_id()?;
+    let sender_id = message
+        .from_id
+        .as_ref()
+        .and_then(|peer| PeerId::from(peer).bot_api_dialog_id());
+    let media = message.media.as_ref().and_then(media_fields);
+    let (media_type, file_name, file_size, mime_type) = match media {
+        Some(fields) => (
+            Some(fields.media_type.to_owned()),
+            fields.file_name,
+            fields.file_size,
+            fields.mime_type,
+        ),
+        None => (None, None, None, None),
+    };
+    // 有媒体时 message 字段是说明文字，与 Bot API 的 caption 对应；这里统一放 text，
+    // 由调用方按 media_type 决定落 text 还是 caption。
+    Some(IncomingMessage {
+        tg_chat_id,
+        tg_message_id: i64::from(message.id),
+        edited,
+        grouped_id: message.grouped_id,
+        sender_id,
+        date: i64::from(message.date),
+        edit_date: message.edit_date.map(i64::from),
+        text: (!message.message.is_empty()).then(|| message.message.clone()),
+        media_type,
+        file_name,
+        file_size,
+        mime_type,
+    })
+}
+
+struct MediaFields {
+    media_type: &'static str,
+    file_name: Option<String>,
+    file_size: Option<i64>,
+    mime_type: Option<String>,
+}
+
+/// 媒体类型名与 Bot API 采集路径一致（`bot_gateway` 的 PHOTO / VIDEO / …），
+/// 规则的 `media_type` 条件才能对两种来源一视同仁。不认识的媒体返回 `None`，按纯文本处理。
+fn media_fields(media: &tl::enums::MessageMedia) -> Option<MediaFields> {
+    match media {
+        tl::enums::MessageMedia::Photo(_) => Some(MediaFields {
+            media_type: "PHOTO",
+            file_name: None,
+            file_size: None,
+            mime_type: None,
+        }),
+        tl::enums::MessageMedia::Document(document) => {
+            let Some(tl::enums::Document::Document(document)) = document.document.as_ref() else {
+                return None;
+            };
+            let mut media_type = "DOCUMENT";
+            let mut file_name = None;
+            for attribute in &document.attributes {
+                match attribute {
+                    tl::enums::DocumentAttribute::Sticker(_) => media_type = "STICKER",
+                    tl::enums::DocumentAttribute::Animated => media_type = "ANIMATION",
+                    tl::enums::DocumentAttribute::Video(video) if media_type == "DOCUMENT" => {
+                        media_type = if video.round_message {
+                            "VIDEO_NOTE"
+                        } else {
+                            "VIDEO"
+                        };
+                    }
+                    tl::enums::DocumentAttribute::Audio(audio) if media_type == "DOCUMENT" => {
+                        media_type = if audio.voice { "VOICE" } else { "AUDIO" };
+                    }
+                    tl::enums::DocumentAttribute::Filename(name) => {
+                        file_name = Some(name.file_name.clone());
+                    }
+                    _ => {}
+                }
+            }
+            Some(MediaFields {
+                media_type,
+                file_name,
+                file_size: Some(document.size),
+                mime_type: Some(document.mime_type.clone()),
+            })
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelegramDeliveryAction {
     Copy,
@@ -303,6 +432,18 @@ pub struct TelegramDeliveryError {
 }
 
 impl TelegramClientError {
+    /// Telegram 判定授权已失效（spec/08 §五 的 `unauthorized`）。这类错误不得自动重试。
+    pub fn is_unauthorized(&self) -> bool {
+        matches!(
+            self,
+            Self::Invocation(grammers_client::InvocationError::Rpc(error))
+                if error.code == 401
+                    || error.is("AUTH_KEY_UNREGISTERED")
+                    || error.is("SESSION_REVOKED")
+                    || error.is("USER_DEACTIVATED*")
+        )
+    }
+
     pub fn delivery_error(&self) -> TelegramDeliveryError {
         match self {
             Self::Invocation(grammers_client::InvocationError::Rpc(error)) => {
@@ -377,10 +518,11 @@ fn message_id_for_random_id(updates: &tl::enums::Updates, random_id: i64) -> Opt
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        TelegramClient, TelegramClientConfig, TelegramClientError, message_id_for_random_id,
-        peer_ref, validate_random_id,
+        TelegramClient, TelegramClientConfig, TelegramClientError, incoming_from_raw,
+        message_id_for_random_id, peer_ref, validate_random_id,
     };
     use grammers_client::tl;
 
@@ -448,6 +590,164 @@ mod tests {
             message_id_for_random_id(&tl::enums::Updates::TooLong, 8),
             None
         );
+    }
+
+    fn raw_message(
+        out: bool,
+        peer: tl::enums::Peer,
+        media: Option<tl::enums::MessageMedia>,
+    ) -> tl::enums::Message {
+        tl::enums::Message::Message(tl::types::Message {
+            out,
+            mentioned: false,
+            media_unread: false,
+            silent: false,
+            post: true,
+            from_scheduled: false,
+            legacy: false,
+            edit_hide: false,
+            pinned: false,
+            noforwards: false,
+            invert_media: false,
+            offline: false,
+            video_processing_pending: false,
+            paid_suggested_post_stars: false,
+            paid_suggested_post_ton: false,
+            id: 77,
+            from_id: None,
+            from_boosts_applied: None,
+            from_rank: None,
+            peer_id: peer,
+            saved_peer_id: None,
+            fwd_from: None,
+            via_bot_id: None,
+            via_business_bot_id: None,
+            guestchat_via_from: None,
+            reply_to: None,
+            date: 1_700_000_000,
+            message: "关键词 命中".to_owned(),
+            media,
+            reply_markup: None,
+            entities: None,
+            views: None,
+            forwards: None,
+            replies: None,
+            edit_date: None,
+            post_author: None,
+            grouped_id: Some(9),
+            reactions: None,
+            restriction_reason: None,
+            ttl_period: None,
+            quick_reply_shortcut_id: None,
+            effect: None,
+            factcheck: None,
+            report_delivery_until_date: None,
+            paid_message_stars: None,
+            suggested_post: None,
+            schedule_repeat_period: None,
+            summary_from_language: None,
+            rich_message: None,
+        })
+    }
+
+    fn channel(id: i64) -> tl::enums::Peer {
+        tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: id })
+    }
+
+    #[test]
+    fn incoming_channel_message_uses_bot_api_chat_id() {
+        let incoming = incoming_from_raw(&raw_message(false, channel(1234), None), false)
+            .expect("频道消息应被采集");
+
+        assert_eq!(incoming.tg_chat_id, -1_000_000_001_234);
+        assert_eq!(incoming.tg_message_id, 77);
+        assert_eq!(incoming.grouped_id, Some(9));
+        assert_eq!(incoming.text.as_deref(), Some("关键词 命中"));
+        assert_eq!(incoming.media_type, None);
+        assert!(!incoming.edited);
+    }
+
+    #[test]
+    fn outgoing_and_service_messages_are_not_collected() {
+        assert!(incoming_from_raw(&raw_message(true, channel(1234), None), false).is_none());
+        let service = tl::enums::Message::Empty(tl::types::MessageEmpty {
+            id: 1,
+            peer_id: Some(channel(1234)),
+        });
+        assert!(incoming_from_raw(&service, false).is_none());
+    }
+
+    #[test]
+    fn document_attributes_map_to_bot_api_media_names() {
+        let document = |attributes: Vec<tl::enums::DocumentAttribute>| {
+            Some(tl::enums::MessageMedia::Document(
+                tl::types::MessageMediaDocument {
+                    nopremium: false,
+                    spoiler: false,
+                    video: false,
+                    round: false,
+                    voice: false,
+                    document: Some(tl::enums::Document::Document(tl::types::Document {
+                        id: 1,
+                        access_hash: 2,
+                        file_reference: Vec::new(),
+                        date: 0,
+                        mime_type: "audio/ogg".to_owned(),
+                        size: 4096,
+                        thumbs: None,
+                        video_thumbs: None,
+                        dc_id: 4,
+                        attributes,
+                    })),
+                    alt_documents: None,
+                    video_cover: None,
+                    video_timestamp: None,
+                    ttl_seconds: None,
+                },
+            ))
+        };
+        let voice = tl::enums::DocumentAttribute::Audio(tl::types::DocumentAttributeAudio {
+            voice: true,
+            duration: 3,
+            title: None,
+            performer: None,
+            waveform: None,
+        });
+        let name = tl::enums::DocumentAttribute::Filename(tl::types::DocumentAttributeFilename {
+            file_name: "a.ogg".to_owned(),
+        });
+
+        let incoming = incoming_from_raw(
+            &raw_message(false, channel(1), document(vec![voice, name.clone()])),
+            true,
+        )
+        .expect("语音消息应被采集");
+        assert_eq!(incoming.media_type.as_deref(), Some("VOICE"));
+        assert_eq!(incoming.file_name.as_deref(), Some("a.ogg"));
+        assert_eq!(incoming.file_size, Some(4096));
+        assert_eq!(incoming.mime_type.as_deref(), Some("audio/ogg"));
+        assert!(incoming.edited);
+
+        let plain = incoming_from_raw(&raw_message(false, channel(1), document(vec![name])), false)
+            .expect("文件消息应被采集");
+        assert_eq!(plain.media_type.as_deref(), Some("DOCUMENT"));
+    }
+
+    #[test]
+    fn auth_key_errors_are_unauthorized_but_flood_wait_is_not() {
+        let rpc = |code, name: &str| {
+            TelegramClientError::Invocation(grammers_client::InvocationError::Rpc(
+                grammers_client::sender::RpcError {
+                    code,
+                    name: name.to_owned(),
+                    value: None,
+                    caused_by: None,
+                },
+            ))
+        };
+        assert!(rpc(401, "AUTH_KEY_UNREGISTERED").is_unauthorized());
+        assert!(rpc(401, "SESSION_REVOKED").is_unauthorized());
+        assert!(!rpc(420, "FLOOD_WAIT").is_unauthorized());
     }
 
     #[test]
