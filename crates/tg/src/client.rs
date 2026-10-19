@@ -37,6 +37,8 @@ pub enum TelegramClientError {
     MediaCopyUnavailable,
     #[error("当前适配器尚未支持媒体 RESEND")]
     MediaResendUnavailable,
+    #[error("仅发送客户端不接收更新")]
+    SendOnly,
     #[error("session 快照失败: {0}")]
     Snapshot(#[source] StoredSessionError),
     #[error("Telegram runner 关闭失败: {0}")]
@@ -71,7 +73,9 @@ pub struct TelegramClient {
     client: Client,
     session: Arc<StoredSession>,
     handle: grammers_client::sender::SenderPoolHandle,
-    updates: UpdateStream,
+    /// `None` = 仅发送客户端（delivery）：更新通道的接收端已丢弃，
+    /// runner 推送的更新直接丢掉，不在无界队列里堆积。
+    updates: Option<UpdateStream>,
     runner_task: tokio::task::JoinHandle<()>,
 }
 
@@ -117,13 +121,58 @@ impl TelegramClient {
             client,
             session,
             handle: handle.thin,
-            updates,
+            updates: Some(updates),
             runner_task,
         })
     }
 
+    /// 以 Bot Token 经 MTProto 登录的仅发送客户端（ADR-0033）。
+    ///
+    /// session 只在内存里，不落库：Bot 凭 Token 随时可重新登录，持久化它换不来恢复能力。
+    /// `api_id` / `api_hash` 是平台自己的；返回 Bot 的 user id。
+    pub async fn connect_bot_sender(
+        config: TelegramClientConfig,
+        api_hash: &Secret<String>,
+        bot_token: &Secret<String>,
+    ) -> Result<(Self, i64), TelegramClientError> {
+        let session = Arc::new(StoredSession::default());
+        let SenderPool {
+            runner,
+            updates,
+            handle,
+        } = SenderPool::new(Arc::clone(&session), config.api_id);
+        drop(updates);
+        let client = Client::new(handle.clone());
+        let runner_task = tokio::spawn(async move {
+            runner.run().await;
+        });
+        let me = match client
+            .bot_sign_in(bot_token.expose(), api_hash.expose())
+            .await
+        {
+            Ok(me) => me,
+            Err(error) => {
+                handle.quit();
+                let _ = runner_task.await;
+                return Err(TelegramClientError::Invocation(error));
+            }
+        };
+        Ok((
+            Self {
+                client,
+                session,
+                handle: handle.thin,
+                updates: None,
+                runner_task,
+            },
+            me.id().bare_id().unwrap_or_default(),
+        ))
+    }
+
     pub async fn next_update(&mut self) -> Result<Update, TelegramClientError> {
         self.updates
+            .as_mut()
+            .ok_or(TelegramClientError::SendOnly)?
             .next()
             .await
             .map_err(TelegramClientError::Invocation)
@@ -267,6 +316,8 @@ impl TelegramClient {
     /// 把更新流状态同步进 session 后取快照。输出含 auth key，只能交给信封加密落库。
     pub async fn snapshot(&self) -> Result<Secret<Vec<u8>>, TelegramClientError> {
         self.updates
+            .as_ref()
+            .ok_or(TelegramClientError::SendOnly)?
             .sync_update_state()
             .await
             .map_err(TelegramClientError::SessionSync)?;
@@ -276,7 +327,10 @@ impl TelegramClient {
     }
 
     pub async fn shutdown(self) -> Result<(), TelegramClientError> {
-        let sync_result = self.updates.sync_update_state().await;
+        let sync_result = match &self.updates {
+            Some(updates) => updates.sync_update_state().await,
+            None => Ok(()),
+        };
         self.handle.quit();
         let runner_result = self.runner_task.await;
 
@@ -441,6 +495,15 @@ impl TelegramClientError {
                     || error.is("AUTH_KEY_UNREGISTERED")
                     || error.is("SESSION_REVOKED")
                     || error.is("USER_DEACTIVATED*")
+        )
+    }
+
+    /// `auth.importBotAuthorization` 拒绝了 Bot Token（吊销、重置或格式不对）。
+    pub fn is_bot_token_rejected(&self) -> bool {
+        matches!(
+            self,
+            Self::Invocation(grammers_client::InvocationError::Rpc(error))
+                if error.is("ACCESS_TOKEN_INVALID") || error.is("ACCESS_TOKEN_EXPIRED")
         )
     }
 
@@ -748,6 +811,8 @@ mod tests {
         assert!(rpc(401, "AUTH_KEY_UNREGISTERED").is_unauthorized());
         assert!(rpc(401, "SESSION_REVOKED").is_unauthorized());
         assert!(!rpc(420, "FLOOD_WAIT").is_unauthorized());
+        assert!(rpc(400, "ACCESS_TOKEN_INVALID").is_bot_token_rejected());
+        assert!(!rpc(420, "FLOOD_WAIT").is_bot_token_rejected());
     }
 
     #[test]

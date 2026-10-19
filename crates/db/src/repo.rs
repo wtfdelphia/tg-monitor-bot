@@ -3735,6 +3735,83 @@ pub async fn claim_due_delivery_task(
     .await
 }
 
+/// delivery 要起 worker 的发送身份：`kind = 'bot'`、未失效或封禁、已存 Token，
+/// 且被启用的目标引用或还有未完成任务（目标停用后积压的任务仍要发完或判死）。
+/// 非 Bot 身份即使在历史数据里被填成发送身份也不在此列（spec/08 §1.4）。
+pub async fn list_delivery_sender_candidates(
+    pool: &PgPool,
+    tenant: TenantId,
+) -> Result<Vec<IdentityId>, sqlx::Error> {
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query_scalar::<_, IdentityId>(
+                "SELECT i.id
+                   FROM identities i
+                   JOIN identity_secrets s ON s.identity_id = i.id
+                  WHERE i.tenant_id = $1
+                    AND i.kind = 'bot'
+                    AND i.status NOT IN ('banned', 'unauthorized')
+                    AND (EXISTS (SELECT 1 FROM target_channels t
+                                  WHERE t.tenant_id = $1 AND t.sender_identity_id = i.id
+                                    AND t.enabled)
+                         OR EXISTS (SELECT 1 FROM delivery_tasks d
+                                     WHERE d.tenant_id = $1 AND d.sender_identity_id = i.id
+                                       AND d.status IN ('PENDING', 'FAILED', 'SENDING')))
+                  ORDER BY i.id",
+            )
+            .bind(tenant.get())
+            .fetch_all(conn)
+            .await
+        })
+    })
+    .await
+}
+
+/// Bot Token 被 Telegram 拒绝（吊销或重置）：同一事务内转 `unauthorized` 并写审计。
+///
+/// 发送身份没有租约（形态 A 单实例，ADR-0025），所以不校验 fencing。
+/// 已是 `unauthorized` 时不重复写审计，返回 `false`。
+pub async fn mark_bot_sender_unauthorized(
+    pool: &PgPool,
+    tenant: TenantId,
+    identity: IdentityId,
+) -> Result<bool, sqlx::Error> {
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            let before = sqlx::query_scalar::<_, String>(
+                "UPDATE identities AS i
+                    SET status = 'unauthorized', updated_at = clock_timestamp()
+                   FROM (SELECT id, status FROM identities
+                          WHERE tenant_id = $1 AND id = $2 FOR UPDATE) AS old
+                  WHERE i.id = old.id
+                    AND i.kind = 'bot'
+                    AND old.status <> 'unauthorized'
+                 RETURNING old.status",
+            )
+            .bind(tenant.get())
+            .bind(identity.get())
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(before) = before else {
+                return Ok(false);
+            };
+            sqlx::query(
+                "INSERT INTO audit_logs
+                    (tenant_id, actor_user_id, action, resource, resource_id, before, after, source)
+                 VALUES ($1, NULL, 'identity.unauthorized', 'identity', $2, $3, $4, 'system')",
+            )
+            .bind(tenant.get())
+            .bind(identity.get())
+            .bind(json!({ "status": before }))
+            .bind(json!({ "status": "unauthorized" }))
+            .execute(&mut *conn)
+            .await?;
+            Ok(true)
+        })
+    })
+    .await
+}
+
 /// 把进程崩溃遗留的 `SENDING` 任务放回 outbox。
 ///
 /// `updated_at` 是领取与状态变更共用的心跳点；只有超过调用方给定阈值的任务
