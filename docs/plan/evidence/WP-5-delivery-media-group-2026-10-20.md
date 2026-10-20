@@ -106,4 +106,5 @@ session 与测试 JPEG 只存在仓库外 `~/.config/tgm-qr/`，目录权限 070
 
 本次覆盖真实 `sendMultiMedia`、用户身份下载、相册中转、相册说明、整组 FORWARD 与服务器重试去重。
 不同媒体混合相册、超长说明相册和单成员相册尚未真测；本记录不把它们算成已验。
+三种变体后续真测见 `WP-5-delivery-media-group-variants-2026-10-20.md`。
 扫码使用的是测试工具，不宣布 WP-2 的 QR 出口判据通过。

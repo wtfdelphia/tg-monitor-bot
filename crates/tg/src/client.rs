@@ -391,8 +391,8 @@ impl TelegramClient {
     ///
     /// PHOTO 走 `InputMediaUploadedPhoto`，其余走 Document 并带原 `mime_type` 与文件名。
     /// `caption_html` 为空时不带说明。
-    // ponytail: 视频与音频不带时长、尺寸等 document attributes，可能显示为普通文件，
-    // 出现「视频不能内联播放」时改为在 job 里保存原 attributes
+    // ponytail: 音频不带时长等 document attributes，视频只带占位属性（见 upload_attributes），
+    // 出现「音视频不能内联播放」时改为在 job 里保存原 attributes
     pub async fn send_uploaded_media<S: tokio::io::AsyncRead + Unpin>(
         &self,
         target_tg_chat_id: i64,
@@ -461,7 +461,7 @@ impl TelegramClient {
             .into()
         } else {
             tl::types::InputMediaUploadedDocument {
-                nosound_video: false,
+                nosound_video: media.media_type == "VIDEO",
                 force_file: false,
                 spoiler: false,
                 file: uploaded.raw,
@@ -470,7 +470,7 @@ impl TelegramClient {
                     .mime_type
                     .clone()
                     .unwrap_or_else(|| "application/octet-stream".to_owned()),
-                attributes: vec![tl::types::DocumentAttributeFilename { file_name }.into()],
+                attributes: media.upload_attributes(file_name),
                 stickers: None,
                 ttl_seconds: None,
                 video_cover: None,
@@ -803,6 +803,30 @@ impl UploadMedia {
                 "file"
             })
     }
+
+    /// VIDEO 不带视频属性会被当成普通文件；无音轨的视频还要配 `nosound_video`，
+    /// 否则平台转成 GIF（ANIMATION），`sendMultiMedia` 拒绝它进相册（`MEDIA_EMPTY`）。
+    // ponytail: 时长与宽高填 0，只够让平台按视频归类；出现「视频不能内联播放」时改为在 job 里保存原 attributes
+    fn upload_attributes(&self, file_name: String) -> Vec<tl::enums::DocumentAttribute> {
+        let mut attributes = vec![tl::types::DocumentAttributeFilename { file_name }.into()];
+        if self.media_type == "VIDEO" {
+            attributes.push(
+                tl::types::DocumentAttributeVideo {
+                    round_message: false,
+                    supports_streaming: true,
+                    nosound: false,
+                    duration: 0.0,
+                    w: 0,
+                    h: 0,
+                    preload_prefix_size: None,
+                    video_start_ts: None,
+                    video_codec: None,
+                }
+                .into(),
+            );
+        }
+        attributes
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1122,6 +1146,29 @@ mod tests {
                 file_name: Some("original.png".to_owned()),
             };
             assert_eq!(media.upload_file_name(), "original.png");
+        }
+    }
+
+    #[test]
+    fn only_videos_upload_with_a_video_attribute() {
+        for (media_type, video) in [("VIDEO", true), ("DOCUMENT", false), ("AUDIO", false)] {
+            let media = super::UploadMedia {
+                media_type: media_type.to_owned(),
+                mime_type: None,
+                file_name: None,
+            };
+            let attributes = media.upload_attributes("clip.mp4".to_owned());
+            assert!(matches!(
+                &attributes[0],
+                tl::enums::DocumentAttribute::Filename(name) if name.file_name == "clip.mp4"
+            ));
+            assert_eq!(
+                attributes
+                    .iter()
+                    .any(|attribute| matches!(attribute, tl::enums::DocumentAttribute::Video(_))),
+                video,
+                "{media_type}"
+            );
         }
     }
 

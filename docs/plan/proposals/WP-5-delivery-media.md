@@ -461,3 +461,11 @@ B（对象清理）已实现，按批准记录第 7 条单独开 PR。证据：
 记录：`docs/plan/evidence/WP-5-delivery-media-group-2026-10-20.md`。
 修复后完整门禁通过：337 passed / 0 failed / 12 ignored。
 尚未提交、发布或经 CI 裁决；混合类型、超长说明及单成员相册未真测。
+
+### 片 3 A 相册变体真机（2026-10-20）
+
+PR #30 合入 `dev` 后补测三种相册，记录：
+`docs/plan/evidence/WP-5-delivery-media-group-variants-2026-10-20.md`。
+混合相册暴露无音轨视频被平台转成 GIF、`sendMultiMedia` 报 `MEDIA_EMPTY`；
+在共享上传入口给 VIDEO 补视频属性与 `nosound_video` 后通过，并补 L1。
+超长说明拆分与单成员整组真机通过；单成员 `sendMultiMedia` 平台不给 grouped_id。

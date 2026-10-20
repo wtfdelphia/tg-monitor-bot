@@ -15,6 +15,7 @@
 //! TGM_LIVE_USER_SESSION_FILE                    用户账号 session（先跑 qr_login 的
 //!                                               live_user_session_resume 缓存频道 access_hash）
 //! TGM_LIVE_ALBUM_PHOTO_FILE                     相册验收用的本地 JPEG（非空且不超过 1 MiB）
+//! TGM_LIVE_ALBUM_VIDEO_FILE                     混合相册验收用的本地 MP4（非空且不超过 1 MiB）
 //! ```
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -39,7 +40,7 @@ use tgm_db::repo::{
     load_media_relay_for_task,
 };
 use tgm_tg::client::TelegramClientConfig;
-use tgm_tg::{StoredSession, TelegramClient, UploadMedia, telegram_text_len};
+use tgm_tg::{MediaReader, StoredSession, TelegramClient, UploadMedia, telegram_text_len};
 
 const FILE_NAME: &str = "tgm-relay-live.bin";
 const MIME: &str = "application/octet-stream";
@@ -222,9 +223,15 @@ async fn resend(setup: &Setup, transport: &TelegramDeliveryTransport, task: i64)
     transport.deliver(payload).await.expect("重发失败")
 }
 
-#[sqlx::test(migrations = "../../migrations-test")]
-#[ignore = "真机：需要测试 Bot、重新扫码的用户 session、测试频道与本地 JPEG 文件"]
-async fn live_media_group_relay_end_to_end(admin: PgPool) {
+struct Live {
+    bot: Arc<TelegramClient>,
+    user: TelegramClient,
+    reader: MediaReader,
+    chat: i64,
+    username: String,
+}
+
+async fn connect_live() -> Live {
     let api_id = required("TGM_PLATFORM_API_ID")
         .parse()
         .expect("api_id 必须是整数");
@@ -238,7 +245,6 @@ async fn live_media_group_relay_end_to_end(admin: PgPool) {
         .await
         .expect("Bot 登录失败");
     drop(token);
-    let bot = Arc::new(bot);
     let bytes = std::fs::read(required("TGM_LIVE_USER_SESSION_FILE")).expect("读 session 失败");
     let user = TelegramClient::connect_with_session(
         config.without_catch_up(),
@@ -248,58 +254,133 @@ async fn live_media_group_relay_end_to_end(admin: PgPool) {
     .expect("用户账号建连失败");
     drop(bytes);
     let reader = user.media_reader();
-    let photo = std::fs::read(required("TGM_LIVE_ALBUM_PHOTO_FILE")).expect("读测试 JPEG 失败");
+    Live {
+        bot: Arc::new(bot),
+        user,
+        reader,
+        chat,
+        username: required("TGM_LIVE_TARGET_USERNAME")
+            .trim_start_matches('@')
+            .to_owned(),
+    }
+}
+
+async fn shutdown(live: Live) {
+    live.user.shutdown().await.expect("用户客户端关闭失败");
+    match Arc::try_unwrap(live.bot) {
+        Ok(bot) => bot.shutdown().await.expect("Bot 客户端关闭失败"),
+        Err(_) => panic!("Bot 客户端仍被引用"),
+    }
+}
+
+fn fixture(name: &str, label: &str) -> Vec<u8> {
+    let bytes = std::fs::read(required(name)).unwrap_or_else(|_| panic!("读{label}失败"));
     assert!(
-        !photo.is_empty() && photo.len() <= 1024 * 1024,
-        "测试 JPEG 须为 1 MiB 以内的非空图片"
+        !bytes.is_empty() && bytes.len() <= 1024 * 1024,
+        "{label}须为 1 MiB 以内的非空文件"
     );
-    let caption = format!("tgm-relay album {}", fresh_random_id() % 1_000_000);
+    bytes
+}
+
+fn photo_member(photo: &[u8]) -> (Vec<u8>, UploadMedia) {
+    (
+        photo.to_vec(),
+        UploadMedia {
+            media_type: "PHOTO".to_owned(),
+            mime_type: Some("image/jpeg".to_owned()),
+            file_name: Some("tgm-album.jpg".to_owned()),
+        },
+    )
+}
+
+fn video_member(video: &[u8]) -> (Vec<u8>, UploadMedia) {
+    (
+        video.to_vec(),
+        UploadMedia {
+            media_type: "VIDEO".to_owned(),
+            mime_type: Some("video/mp4".to_owned()),
+            file_name: Some("tgm-album.mp4".to_owned()),
+        },
+    )
+}
+
+struct AlbumRun {
+    source_ids: Vec<i64>,
+    source_group: i64,
+    task: i64,
+    outcome: DeliveryRunOutcome,
+    errors: Vec<(Option<String>, Option<String>)>,
+    transport: TelegramDeliveryTransport,
+    setup: Setup,
+}
+
+/// Bot 发源相册 → 用户读取并写前 `captured` 个成员的 canonical event（`event_caption`
+/// 覆盖首成员说明，模拟 Premium 来源的长说明）→ 窗口后聚合、跑规则 → 成员中转进 MinIO →
+/// 整组投递一次。
+async fn relay_album(
+    admin: PgPool,
+    live: &Live,
+    members: Vec<(Vec<u8>, UploadMedia)>,
+    caption: &str,
+    event_caption: Option<&str>,
+    captured: usize,
+) -> AlbumRun {
+    let chat = live.chat;
     let mut source_media = Vec::new();
-    for _ in 0..3 {
+    for (bytes, media) in &members {
         source_media.push(
-            bot.prepare_album_media(
-                chat,
-                &mut std::io::Cursor::new(&photo),
-                photo.len(),
-                &UploadMedia {
-                    media_type: "PHOTO".to_owned(),
-                    mime_type: Some("image/jpeg".to_owned()),
-                    file_name: Some("tgm-album.jpg".to_owned()),
-                },
-            )
-            .await
-            .expect("上传源相册失败"),
+            live.bot
+                .prepare_album_media(chat, &mut std::io::Cursor::new(bytes), bytes.len(), media)
+                .await
+                .expect("上传源相册成员失败"),
         );
     }
     let base = fresh_random_id();
-    let source_random_ids: Vec<_> = (0..3)
+    let source_random_ids: Vec<_> = (0..members.len())
         .map(|position| tgm_app::delivery::media_group_random_id(base, position))
         .collect();
-    let source_ids = bot
-        .send_media_group(chat, &source_random_ids, source_media, &caption)
+    let source_ids = live
+        .bot
+        .send_media_group(chat, &source_random_ids, source_media, caption)
         .await
         .expect("发送源相册失败");
-    assert_eq!(source_ids.len(), 3);
-    let incoming = reader
+    assert_eq!(source_ids.len(), members.len());
+    let incoming = live
+        .reader
         .read_messages(chat, &source_ids)
         .await
         .expect("用户读取源相册失败");
-    let group_id = incoming[0].grouped_id.expect("源消息未组成相册");
+    println!(
+        "[source] ids={source_ids:?} types={:?} grouped={:?}",
+        incoming
+            .iter()
+            .map(|message| message.media_type.clone())
+            .collect::<Vec<_>>(),
+        incoming
+            .iter()
+            .map(|message| message.grouped_id)
+            .collect::<Vec<_>>()
+    );
+    let source_group = incoming[0].grouped_id.expect("源消息未组成相册");
     assert!(
         incoming
             .iter()
-            .all(|message| message.grouped_id == Some(group_id))
+            .all(|message| message.grouped_id == Some(source_group))
     );
-    let username = required("TGM_LIVE_TARGET_USERNAME");
-    let setup = setup(admin, chat, username.trim_start_matches('@')).await;
+    let setup = setup(admin, chat, &live.username).await;
     let role: String = sqlx::query_scalar("SELECT current_user")
         .fetch_one(&setup.app)
         .await
         .expect("读角色失败");
     assert_eq!(role, "app_user");
-    for message in &incoming {
-        let event = tgm_app::mtproto_worker::canonical_event(setup.receiver, message, 0)
+    for (position, message) in incoming.iter().take(captured).enumerate() {
+        let mut event = tgm_app::mtproto_worker::canonical_event(setup.receiver, message, 0)
             .expect("规范化成员失败");
+        if position == 0
+            && let Some(text) = event_caption
+        {
+            event.caption = Some(text.to_owned());
+        }
         insert_canonical_event(&setup.app, &event)
             .await
             .expect("写源相册失败");
@@ -326,10 +407,10 @@ async fn live_media_group_relay_end_to_end(admin: PgPool) {
         .fetch_all(setup.admin.raw())
         .await
         .expect("读任务失败");
-    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks.len(), 1, "整组只生成一个任务");
     let task = tasks[0];
     let store = support::media_store("tgm-live-album").await;
-    let transport = TelegramDeliveryTransport::new(Arc::clone(&bot), store.clone());
+    let transport = TelegramDeliveryTransport::new(Arc::clone(&live.bot), store.clone());
     assert_eq!(
         run_delivery_once(&setup.app, setup.tenant, setup.sender, &transport)
             .await
@@ -344,7 +425,7 @@ async fn live_media_group_relay_end_to_end(admin: PgPool) {
             .expect("抢租约失败")
             .expect("租约不可用"),
     };
-    for _ in 0..3 {
+    for _ in 0..captured {
         assert!(
             tgm_db::repo::renew_lease(
                 &setup.app,
@@ -356,7 +437,7 @@ async fn live_media_group_relay_end_to_end(admin: PgPool) {
             .expect("续租失败")
         );
         assert!(matches!(
-            run_relay_once(&setup.app, &guard, &reader, &store)
+            run_relay_once(&setup.app, &guard, &live.reader, &store)
                 .await
                 .expect("成员中转失败"),
             RelayOutcome::Ready { .. }
@@ -370,37 +451,73 @@ async fn live_media_group_relay_end_to_end(admin: PgPool) {
     let outcome = run_delivery_once(&setup.app, setup.tenant, setup.sender, &transport)
         .await
         .expect("整组投递失败");
-    let DeliveryRunOutcome::Done {
-        telegram_message_id,
-        ..
-    } = outcome
-    else {
-        let errors = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            "SELECT error_code, error_msg FROM delivery_logs WHERE task_id = $1 ORDER BY attempt",
+    let errors = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT error_code, error_msg FROM delivery_logs WHERE task_id = $1 ORDER BY attempt",
+    )
+    .bind(task)
+    .fetch_all(setup.admin.raw())
+    .await
+    .expect("读取投递记录失败");
+    AlbumRun {
+        source_ids,
+        source_group,
+        task,
+        outcome,
+        errors,
+        transport,
+        setup,
+    }
+}
+
+impl AlbumRun {
+    fn delivered(&self) -> i64 {
+        match self.outcome {
+            DeliveryRunOutcome::Done {
+                telegram_message_id,
+                ..
+            } => telegram_message_id,
+            _ => panic!("整组未完成：{:?} errors={:?}", self.outcome, self.errors),
+        }
+    }
+
+    async fn payload(&self) -> tgm_app::delivery::DeliveryPayload {
+        let record = load_delivery_task_payload(&self.setup.app, self.setup.tenant, self.task)
+            .await
+            .expect("读快照失败")
+            .expect("快照不存在");
+        let mut payload = build_delivery_payload(&record).expect("载荷无效");
+        for state in tgm_db::repo::load_media_group_relay_for_task(
+            &self.setup.app,
+            self.setup.tenant,
+            self.task,
         )
-        .bind(task)
-        .fetch_all(setup.admin.raw())
-        .await
-        .expect("读取投递失败原因失败");
-        panic!("整组未完成：{outcome:?} errors={errors:?}")
-    };
-    let record = load_delivery_task_payload(&setup.app, setup.tenant, task)
-        .await
-        .expect("读快照失败")
-        .expect("快照不存在");
-    let mut payload = build_delivery_payload(&record).expect("载荷无效");
-    for state in tgm_db::repo::load_media_group_relay_for_task(&setup.app, setup.tenant, task)
         .await
         .expect("读整组中转失败")
-    {
-        payload.media_group.push(DeliveryMedia {
-            object_key: state.object_key.expect("对象未就绪"),
-            media_type: state.media_type.expect("类型不存在"),
-            mime_type: state.mime_type,
-            file_name: state.file_name,
-        });
+        {
+            payload.media_group.push(DeliveryMedia {
+                object_key: state.object_key.expect("对象未就绪"),
+                media_type: state.media_type.expect("类型不存在"),
+                mime_type: state.mime_type,
+                file_name: state.file_name,
+            });
+        }
+        payload
     }
-    let repeated = transport
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+#[ignore = "真机：需要测试 Bot、重新扫码的用户 session、测试频道与本地 JPEG 文件"]
+async fn live_media_group_relay_end_to_end(admin: PgPool) {
+    let live = connect_live().await;
+    let chat = live.chat;
+    let photo = fixture("TGM_LIVE_ALBUM_PHOTO_FILE", "测试 JPEG");
+    let caption = format!("tgm-relay album {}", fresh_random_id() % 1_000_000);
+    let members = (0..3).map(|_| photo_member(&photo)).collect();
+    let run = relay_album(admin, &live, members, &caption, None, 3).await;
+    let telegram_message_id = run.delivered();
+    let payload = run.payload().await;
+    let repeated = run
+        .transport
         .deliver(payload.clone())
         .await
         .expect("相册重发失败");
@@ -408,28 +525,32 @@ async fn live_media_group_relay_end_to_end(admin: PgPool) {
         repeated, telegram_message_id,
         "相同 random_id 重发必须返回原消息"
     );
-    let output = reader
+    let output = live
+        .reader
         .read_media_group(chat, telegram_message_id)
         .await
         .expect("读目标相册失败");
     let target_group_id = output[0].grouped_id.expect("目标消息没有相册 id");
     assert_eq!(output.len(), 3, "目标相册必须包含全部成员");
     assert_eq!(output[0].text.as_deref(), Some(caption.as_str()));
-    assert_ne!(target_group_id, group_id);
+    assert_ne!(target_group_id, run.source_group);
     let forward_base = fresh_random_id();
     let forward_ids: Vec<_> = (0..3)
         .map(|position| tgm_app::delivery::media_group_random_id(forward_base, position))
         .collect();
-    let forwarded = bot
-        .forward_media_group(chat, &source_ids, chat, &forward_ids)
+    let forwarded = live
+        .bot
+        .forward_media_group(chat, &run.source_ids, chat, &forward_ids)
         .await
         .expect("整组转发失败");
-    let forwarded_again = bot
-        .forward_media_group(chat, &source_ids, chat, &forward_ids)
+    let forwarded_again = live
+        .bot
+        .forward_media_group(chat, &run.source_ids, chat, &forward_ids)
         .await
         .expect("转发重试失败");
     assert_eq!(forwarded, forwarded_again);
-    let forwarded_messages = reader
+    let forwarded_messages = live
+        .reader
         .read_messages(chat, &forwarded)
         .await
         .expect("读取转发相册失败");
@@ -440,15 +561,184 @@ async fn live_media_group_relay_end_to_end(admin: PgPool) {
             .all(|message| message.grouped_id == forwarded_messages[0].grouped_id)
     );
     println!(
-        "[G] source_ids={source_ids:?} source_group={group_id} tasks=1 members={} first_target={telegram_message_id} target_group={target_group_id} same_random_id={repeated} forwarded={forwarded:?}",
+        "[G] source_ids={:?} source_group={} tasks=1 members={} first_target={telegram_message_id} target_group={target_group_id} same_random_id={repeated} forwarded={forwarded:?}",
+        run.source_ids,
+        run.source_group,
         payload.media_group.len()
     );
-    drop(transport);
-    user.shutdown().await.expect("用户客户端关闭失败");
-    match Arc::try_unwrap(bot) {
-        Ok(bot) => bot.shutdown().await.expect("Bot 客户端关闭失败"),
-        Err(_) => panic!("Bot 客户端仍被引用"),
-    }
+    drop(run);
+    shutdown(live).await;
+}
+
+/// 图片 + 视频混合相册：源与目标都必须是同一相册，视频成员按视频读回而非普通文件。
+#[sqlx::test(migrations = "../../migrations-test")]
+#[ignore = "真机：需要测试 Bot、用户 session、测试频道、本地 JPEG 与 MP4 文件"]
+async fn live_mixed_media_group_relay(admin: PgPool) {
+    let live = connect_live().await;
+    let chat = live.chat;
+    let photo = fixture("TGM_LIVE_ALBUM_PHOTO_FILE", "测试 JPEG");
+    let video = fixture("TGM_LIVE_ALBUM_VIDEO_FILE", "测试 MP4");
+    let caption = format!("tgm-relay mixed {}", fresh_random_id() % 1_000_000);
+    let members = vec![
+        photo_member(&photo),
+        video_member(&video),
+        photo_member(&photo),
+    ];
+    let run = relay_album(admin, &live, members, &caption, None, 3).await;
+    let first = run.delivered();
+    let repeated = run
+        .transport
+        .deliver(run.payload().await)
+        .await
+        .expect("相册重发失败");
+    assert_eq!(repeated, first, "相同 random_id 重发必须返回原消息");
+    let output = live
+        .reader
+        .read_media_group(chat, first)
+        .await
+        .expect("读目标相册失败");
+    let types: Vec<_> = output
+        .iter()
+        .map(|message| message.media_type.clone())
+        .collect();
+    assert_eq!(output.len(), 3, "目标相册必须包含全部成员");
+    assert_eq!(
+        types,
+        vec![
+            Some("PHOTO".to_owned()),
+            Some("VIDEO".to_owned()),
+            Some("PHOTO".to_owned())
+        ],
+        "成员类型与顺序必须保持"
+    );
+    assert_eq!(output[0].text.as_deref(), Some(caption.as_str()));
+    println!(
+        "[M] source_ids={:?} source_group={} first_target={first} target_group={:?} types={types:?} same_random_id={repeated}",
+        run.source_ids, run.source_group, output[0].grouped_id
+    );
+    drop(run);
+    shutdown(live).await;
+}
+
+/// 说明超过 1024：相册不带说明，紧跟一条全文；同一 random_id 重发两条都不重复。
+#[sqlx::test(migrations = "../../migrations-test")]
+#[ignore = "真机：需要测试 Bot、用户 session、测试频道与本地 JPEG 文件"]
+async fn live_long_caption_media_group_relay(admin: PgPool) {
+    let live = connect_live().await;
+    let chat = live.chat;
+    let photo = fixture("TGM_LIVE_ALBUM_PHOTO_FILE", "测试 JPEG");
+    let run_id = fresh_random_id() % 1_000_000;
+    let caption = format!("tgm-relay long {run_id} 源说明");
+    let long = format!("tgm-relay long {run_id} {}", "长".repeat(1100));
+    assert!(telegram_text_len(&long) > 1024 && telegram_text_len(&long) <= 4096);
+    let members = (0..2).map(|_| photo_member(&photo)).collect();
+    let run = relay_album(admin, &live, members, &caption, Some(&long), 2).await;
+    let first = run.delivered();
+    let payload = run.payload().await;
+    let output = live
+        .reader
+        .read_media_group(chat, first)
+        .await
+        .expect("读目标相册失败");
+    assert_eq!(output.len(), 2, "目标相册必须包含全部成员");
+    assert!(
+        output
+            .iter()
+            .all(|message| message.text.as_deref().unwrap_or("").is_empty()),
+        "拆分时相册不带说明"
+    );
+    let text_id = output.last().expect("相册为空").tg_message_id + 1;
+    let text = live
+        .reader
+        .read_messages(chat, &[text_id])
+        .await
+        .expect("读拆出的文字失败");
+    assert_eq!(text[0].text.as_deref(), Some(long.as_str()));
+    assert_eq!(text[0].media_type, None);
+    let repeated = run
+        .transport
+        .deliver(payload.clone())
+        .await
+        .expect("相册重发失败");
+    assert_eq!(repeated, first, "相同 random_id 重发必须返回原相册");
+    let text_again = live
+        .bot
+        .copy_text(
+            chat,
+            tgm_app::delivery::split_text_random_id(payload.telegram_random_id),
+            &payload.message.text,
+        )
+        .await
+        .expect("文字重发失败");
+    assert_eq!(text_again, text_id, "派生 random_id 重发必须返回原文字");
+    println!(
+        "[L] source_ids={:?} first_target={first} album={:?} text_id={text_id} utf16={} same_random_id={repeated} text_again={text_again}",
+        run.source_ids,
+        output
+            .iter()
+            .map(|message| message.tg_message_id)
+            .collect::<Vec<_>>(),
+        telegram_text_len(&long)
+    );
+    drop(run);
+    shutdown(live).await;
+}
+
+/// 单成员 `sendMultiMedia` 平台不给 grouped_id，单成员相册只会来自聚合时只采到一个成员
+/// （其余迟到）：两成员源相册只写首成员，整组按单条 sendMedia 发出。
+#[sqlx::test(migrations = "../../migrations-test")]
+#[ignore = "真机：需要测试 Bot、用户 session、测试频道与本地 JPEG 文件"]
+async fn live_single_member_media_group_relay(admin: PgPool) {
+    let live = connect_live().await;
+    let chat = live.chat;
+    let photo = fixture("TGM_LIVE_ALBUM_PHOTO_FILE", "测试 JPEG");
+    let run_id = fresh_random_id() % 1_000_000;
+    let (bytes, media) = photo_member(&photo);
+    let lone = live
+        .bot
+        .prepare_album_media(chat, &mut std::io::Cursor::new(&bytes), bytes.len(), &media)
+        .await
+        .expect("上传单成员失败");
+    let lone_ids = live
+        .bot
+        .send_media_group(
+            chat,
+            &[fresh_random_id()],
+            vec![lone],
+            &format!("tgm-single-probe {run_id}"),
+        )
+        .await
+        .expect("单成员 sendMultiMedia 失败");
+    let lone_message = live
+        .reader
+        .read_messages(chat, &lone_ids)
+        .await
+        .expect("读单成员消息失败");
+    assert_eq!(lone_message[0].grouped_id, None, "单成员发送不应组成相册");
+    let caption = format!("tgm-relay single {run_id}");
+    let members = (0..2).map(|_| photo_member(&photo)).collect();
+    let run = relay_album(admin, &live, members, &caption, None, 1).await;
+    let first = run.delivered();
+    let repeated = run
+        .transport
+        .deliver(run.payload().await)
+        .await
+        .expect("重发失败");
+    assert_eq!(repeated, first, "相同 random_id 重发必须返回原消息");
+    let output = live
+        .reader
+        .read_messages(chat, &[first])
+        .await
+        .expect("读目标消息失败");
+    assert_eq!(output[0].media_type.as_deref(), Some("PHOTO"));
+    assert_eq!(output[0].text.as_deref(), Some(caption.as_str()));
+    assert_eq!(output[0].grouped_id, None, "单成员整组按单条发出");
+    println!(
+        "[S] probe={lone_ids:?} probe_grouped=None source_ids={:?} source_group={} captured=1 first_target={first} target_grouped={:?} same_random_id={repeated}",
+        run.source_ids, run.source_group, output[0].grouped_id
+    );
+    drop(run);
+    shutdown(live).await;
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]
