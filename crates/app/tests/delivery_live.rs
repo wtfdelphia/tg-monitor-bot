@@ -7,7 +7,13 @@
 //! V1 live_bot_login_repeat          连续 bot_sign_in N 次，看是否触发限流
 //! V2 live_delivery_g4_kill_restart  请求前 / 平台已接受后两个时点强杀，重启（新 session）重发
 //! V3 live_revoked_token             Token 在 BotFather 重置后，身份转 unauthorized 并写审计
+//! V4a live_bot_session_capture      登录、存 session 到文件、确认此刻可复用（重置 Token 之前跑）
+//! V4b live_bot_session_after_revoke 在 BotFather 重置 Token 之后，用 V4a 的旧 session 建连并试发
 //! ```
+//!
+//! V4 回答 ADR-0034 代价节的未验证项：重置 Token 是否注销已有 auth key。两段之间由人去
+//! BotFather 重置，所以拆成两个测试。session 文件含 auth key：权限 0600、放仓库外，
+//! V4b 读完即删。
 //!
 //! 环境变量：
 //!
@@ -17,6 +23,7 @@
 //! TGM_LIVE_TARGET_CHAT                          测试频道的 Bot API chat id，如 -100...（V2）
 //! TGM_LIVE_REVOKED_BOT_TOKEN                    已在 BotFather 重置作废的旧 Token（V3）
 //! TGM_LIVE_LOGIN_REPEAT                         V1 次数，默认 5
+//! TGM_LIVE_SESSION_FILE                         V4 的 session 文件路径（仓库外）
 //! ```
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -41,8 +48,8 @@ use tgm_core::kek::EnvKek;
 use tgm_core::profile::Profile;
 use tgm_core::secret::Secret;
 use tgm_db::credentials::store_identity_secret;
-use tgm_tg::TelegramClient;
 use tgm_tg::client::TelegramClientConfig;
+use tgm_tg::{StoredSession, TelegramClient};
 use tokio::sync::watch;
 
 const LOCAL_KEK: &str = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=";
@@ -461,4 +468,94 @@ async fn live_revoked_token(admin: PgPool) {
         "[V3] 作废 Token 未被识别"
     );
     assert_eq!(state, ("unauthorized".to_owned(), 1));
+}
+
+// ───────────────────────── V4 ─────────────────────────
+
+#[tokio::test]
+#[ignore = "真机：需要测试 Bot 与平台 api_id；之后由人在 BotFather 重置 Token"]
+async fn live_bot_session_capture() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let app = platform_app();
+    let token = Secret::new(required("TGM_LIVE_BOT_TOKEN"));
+    let expected = bot_id_from_token(token.expose()).expect("Token 格式无效");
+    let path = PathBuf::from(required("TGM_LIVE_SESSION_FILE"));
+    let config = TelegramClientConfig::new(app.api_id).expect("api_id 无效");
+    let (client, bot_id) =
+        TelegramClient::connect_bot_sender(config.clone(), &app.api_hash, &token)
+            .await
+            .expect("bot_sign_in 失败");
+    drop(token);
+    assert_eq!(bot_id, expected);
+    let session = client.bot_session_snapshot().expect("取 session 失败");
+    client.shutdown().await.expect("关闭客户端失败");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .expect("创建 session 文件失败（已存在时先删掉旧的）");
+    file.write_all(session.expose())
+        .expect("写 session 文件失败");
+    drop(file);
+
+    let restored = StoredSession::restore(session.expose()).expect("session 快照无效");
+    let (client, resumed_id) = TelegramClient::resume_bot_sender(config, restored)
+        .await
+        .expect("[V4a] 重置前复用 session 就失败了");
+    client.shutdown().await.expect("关闭客户端失败");
+    assert_eq!(resumed_id, expected);
+    println!(
+        "[V4a] session 已存，重置前复用成功 bot_id={resumed_id}；现在去 BotFather 重置 Token 再跑 V4b"
+    );
+}
+
+#[tokio::test]
+#[ignore = "真机：需要 V4a 留下的 session 文件，且 Token 已在 BotFather 重置"]
+async fn live_bot_session_after_revoke() {
+    let app = platform_app();
+    let target: i64 = required("TGM_LIVE_TARGET_CHAT")
+        .parse()
+        .expect("TGM_LIVE_TARGET_CHAT 必须是整数");
+    let path = PathBuf::from(required("TGM_LIVE_SESSION_FILE"));
+    let bytes = Secret::new(std::fs::read(&path).expect("读 session 文件失败"));
+    std::fs::remove_file(&path).expect("删 session 文件失败");
+    let restored = StoredSession::restore(bytes.expose()).expect("session 快照无效");
+    drop(bytes);
+    let config = TelegramClientConfig::new(app.api_id).expect("api_id 无效");
+
+    let (client, bot_id) = match TelegramClient::resume_bot_sender(config, restored).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            println!(
+                "[V4b] 重置后旧 session 建连失败 unauthorized={} error={error}",
+                error.is_unauthorized()
+            );
+            assert!(
+                error.is_unauthorized(),
+                "[V4b] 失败但不是授权失效，结论不成立，检查网络后重做：{error}"
+            );
+            println!("[V4b] 结论：重置 Token 注销了已有 auth key");
+            return;
+        }
+    };
+    let sent = client
+        .copy_text(
+            target,
+            fresh_random_id(),
+            "tgm-revoke-probe：重置 Token 后旧 session 仍能发送",
+        )
+        .await;
+    let _ = client.shutdown().await;
+    match sent {
+        Ok(message_id) => println!(
+            "[V4b] 结论：重置 Token 没有注销已有 auth key，旧 session 仍能以 bot_id={bot_id} 发出 message_id={message_id}"
+        ),
+        Err(error) => println!(
+            "[V4b] 旧 session 能建连（getMe 成功 bot_id={bot_id}），但发送失败 unauthorized={} error={error}",
+            error.is_unauthorized()
+        ),
+    }
 }
