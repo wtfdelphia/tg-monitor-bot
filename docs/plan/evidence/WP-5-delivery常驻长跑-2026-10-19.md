@@ -32,7 +32,7 @@ test result: ok. 1 passed; 0 failed; finished in 1803.37s
 | S3 SIGTERM 优雅退出 | 2 次 + 收尾 1 次，最慢 106ms，均以 0 退出 |
 | S4 身份未被误标 | `identity_status=offline`，`identity.unauthorized` 审计 0 条 |
 
-频道人工核对（`tgm-soak #1..#90` 每条只出现一次）：待测试环境提供方确认。
+频道人工核对（`tgm-soak #1..#90` 每条只出现一次）：测试环境提供方于 2026-10-20 确认通过。
 
 ## 二、重启频繁时登录被限流
 
