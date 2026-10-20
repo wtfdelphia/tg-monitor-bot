@@ -1,7 +1,9 @@
 //! delivery 运行链（ADR-0033）：按发送身份各起一个 [`DeliveryWorker`]。
 //!
-//! 每个发送身份：解密 Bot Token → 用平台 `api_id` 经 MTProto `bot_sign_in` →
-//! 跑既有的 outbox 消费循环。session 只在内存里，进程重启即重新登录，不落库。
+//! 每个发送身份：解密 Bot Token 与落库的 session → 有 session 先复用（ADR-0034），
+//! 没有或已失效时用平台 `api_id` 经 MTProto `bot_sign_in` 登录并写回 session →
+//! 跑既有的 outbox 消费循环。复用 session 不调 `auth.importBotAuthorization`，
+//! 重启不再消耗登录配额（限流实测见 `docs/plan/evidence/WP-5-delivery常驻长跑-2026-10-19.md`）。
 //!
 //! 两条纪律：
 //!
@@ -22,12 +24,14 @@ use sqlx::PgPool;
 use tgm_core::ids::{IdentityId, TenantId};
 use tgm_core::kek::Kek;
 use tgm_core::secret::Secret;
-use tgm_db::credentials::{CredentialError, load_identity_secret};
+use tgm_db::credentials::{
+    BotCredentials, CredentialError, clear_bot_session, load_bot_credentials, store_bot_session,
+};
 use tgm_db::repo::{
     list_all_active_tenants, list_delivery_sender_candidates, mark_bot_sender_unauthorized,
 };
 use tgm_tg::client::TelegramClientConfig;
-use tgm_tg::{TelegramClient, TelegramClientError};
+use tgm_tg::{StoredSession, TelegramClient, TelegramClientError};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -100,15 +104,59 @@ pub async fn load_bot_token(
     tenant: TenantId,
     identity: IdentityId,
 ) -> Result<Option<Option<Secret<String>>>, CredentialError> {
-    let Some(plain) = load_identity_secret(pool, kek, tenant, identity).await? else {
-        return Ok(None);
+    Ok(load_bot_credentials(pool, kek, tenant, identity)
+        .await?
+        .map(|credentials| parse_bot_token(&credentials.token)))
+}
+
+fn parse_bot_token(plain: &Secret<Vec<u8>>) -> Option<Secret<String>> {
+    std::str::from_utf8(plain.expose())
+        .ok()
+        .filter(|token| bot_id_from_token(token).is_some())
+        .map(|token| Secret::new(token.to_owned()))
+}
+
+/// 落库 session 复用的结局。
+enum Resume {
+    Connected(TelegramClient),
+    /// 没有 session，或 session 已失效（已清掉），改用 Token 登录。
+    SignIn,
+}
+
+/// 用落库的 session 建连。失效（auth key 被注销、快照坏、登的不是这个 Bot）时清掉
+/// session 退回 Token 登录；网络等其他错误原样返回，交给外层冷却重试。
+async fn resume_from_stored(
+    pool: &PgPool,
+    tenant: TenantId,
+    identity: IdentityId,
+    client_config: TelegramClientConfig,
+    session: Option<&Secret<Vec<u8>>>,
+    expected_bot_id: i64,
+) -> Result<Resume, DeliverySenderError> {
+    let Some(session) = session else {
+        return Ok(Resume::SignIn);
     };
-    Ok(Some(
-        std::str::from_utf8(plain.expose())
-            .ok()
-            .filter(|token| bot_id_from_token(token).is_some())
-            .map(|token| Secret::new(token.to_owned())),
-    ))
+    let Ok(stored) = StoredSession::restore(session.expose()) else {
+        clear_bot_session(pool, tenant, identity).await?;
+        return Ok(Resume::SignIn);
+    };
+    match TelegramClient::resume_bot_sender(client_config, stored).await {
+        Ok((client, bot_id)) if bot_id == expected_bot_id => Ok(Resume::Connected(client)),
+        Ok((client, _)) => {
+            let _ = client.shutdown().await;
+            clear_bot_session(pool, tenant, identity).await?;
+            Ok(Resume::SignIn)
+        }
+        Err(error) if error.is_unauthorized() || matches!(error, TelegramClientError::NotBot) => {
+            tracing::info!(
+                sender_identity_id = identity.get(),
+                "落库的 Bot session 已失效，改用 Token 登录"
+            );
+            clear_bot_session(pool, tenant, identity).await?;
+            Ok(Resume::SignIn)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub async fn run_sender(
@@ -120,53 +168,80 @@ pub async fn run_sender(
     config: DeliveryRuntimeConfig,
     shutdown: watch::Receiver<bool>,
 ) -> Result<SenderExit, DeliverySenderError> {
-    let token = match load_bot_token(pool, kek, tenant, identity).await? {
-        None => return Ok(SenderExit::NoToken),
-        Some(None) => {
-            mark_bot_sender_unauthorized(pool, tenant, identity).await?;
-            return Ok(SenderExit::TokenInvalid);
-        }
-        Some(Some(token)) => token,
+    let Some(credentials) = load_bot_credentials(pool, kek, tenant, identity).await? else {
+        return Ok(SenderExit::NoToken);
+    };
+    let Some(token) = parse_bot_token(&credentials.token) else {
+        mark_bot_sender_unauthorized(pool, tenant, identity).await?;
+        return Ok(SenderExit::TokenInvalid);
     };
     let expected_bot_id = bot_id_from_token(token.expose()).unwrap_or_default();
     let client_config = TelegramClientConfig::new(app.api_id)?;
     let mut login_shutdown = shutdown.clone();
-    let connected = tokio::select! {
-        connected = TelegramClient::connect_bot_sender(client_config, &app.api_hash, &token) => connected,
+    let resumed = tokio::select! {
+        resumed = resume_from_stored(
+            pool,
+            tenant,
+            identity,
+            client_config.clone(),
+            credentials.session.as_ref(),
+            expected_bot_id,
+        ) => resumed?,
         _ = wait_for_shutdown(&mut login_shutdown) => return Ok(SenderExit::Shutdown),
     };
-    let (client, bot_id) = match connected {
-        Ok(connected) => connected,
-        Err(error) if error.is_unauthorized() || error.is_bot_token_rejected() => {
-            mark_bot_sender_unauthorized(pool, tenant, identity).await?;
-            return Ok(SenderExit::Unauthorized);
-        }
-        Err(error) => {
-            if let Some(wait) = error.flood_wait() {
-                tracing::warn!(
-                    sender_identity_id = identity.get(),
-                    flood_wait_seconds = wait.as_secs(),
-                    "bot_sign_in 被限流，等满服务器给的时间再重试"
-                );
-                tokio::select! {
-                    _ = tokio::time::sleep(wait) => {}
-                    _ = wait_for_shutdown(&mut login_shutdown) => return Ok(SenderExit::Shutdown),
+    let (client, resumed_session) = match resumed {
+        Resume::Connected(client) => (client, true),
+        Resume::SignIn => {
+            let connected = tokio::select! {
+                connected = TelegramClient::connect_bot_sender(client_config, &app.api_hash, &token) => connected,
+                _ = wait_for_shutdown(&mut login_shutdown) => return Ok(SenderExit::Shutdown),
+            };
+            let (client, bot_id) = match connected {
+                Ok(connected) => connected,
+                Err(error) if error.is_unauthorized() || error.is_bot_token_rejected() => {
+                    mark_bot_sender_unauthorized(pool, tenant, identity).await?;
+                    return Ok(SenderExit::Unauthorized);
                 }
+                Err(error) => {
+                    if let Some(wait) = error.flood_wait() {
+                        tracing::warn!(
+                            sender_identity_id = identity.get(),
+                            flood_wait_seconds = wait.as_secs(),
+                            "bot_sign_in 被限流，等满服务器给的时间再重试"
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(wait) => {}
+                            _ = wait_for_shutdown(&mut login_shutdown) => return Ok(SenderExit::Shutdown),
+                        }
+                    }
+                    return Err(error.into());
+                }
+            };
+            if bot_id != expected_bot_id {
+                let _ = client.shutdown().await;
+                mark_bot_sender_unauthorized(pool, tenant, identity).await?;
+                return Ok(SenderExit::TokenInvalid);
             }
-            return Err(error.into());
+            save_session(pool, kek, tenant, identity, &credentials, &client).await;
+            (client, false)
         }
     };
     drop(token);
-    if bot_id != expected_bot_id {
-        let _ = client.shutdown().await;
-        mark_bot_sender_unauthorized(pool, tenant, identity).await?;
-        return Ok(SenderExit::TokenInvalid);
+    drop(credentials);
+    // 两种结局用不同消息而非字段区分：pretty 格式把字段打在下一行，长跑按行计数。
+    if resumed_session {
+        tracing::info!(
+            tenant_id = tenant.get(),
+            sender_identity_id = identity.get(),
+            "delivery 发送身份已登录（复用 session）"
+        );
+    } else {
+        tracing::info!(
+            tenant_id = tenant.get(),
+            sender_identity_id = identity.get(),
+            "delivery 发送身份已登录（Token）"
+        );
     }
-    tracing::info!(
-        tenant_id = tenant.get(),
-        sender_identity_id = identity.get(),
-        "delivery 发送身份已登录"
-    );
     let client = Arc::new(client);
     let worker = DeliveryWorker::new(
         pool.clone(),
@@ -181,6 +256,35 @@ pub async fn run_sender(
     }
     result?;
     Ok(SenderExit::Shutdown)
+}
+
+/// 登录成功后写回 session。失败只告警：投递照常，下次重启退回 Token 登录。
+async fn save_session(
+    pool: &PgPool,
+    kek: &dyn Kek,
+    tenant: TenantId,
+    identity: IdentityId,
+    credentials: &BotCredentials,
+    client: &TelegramClient,
+) {
+    let result = match client.bot_session_snapshot() {
+        Ok(session) => store_bot_session(pool, kek, tenant, identity, credentials, &session)
+            .await
+            .map_err(DeliverySenderError::from),
+        Err(error) => Err(error.into()),
+    };
+    match result {
+        Ok(true) => {}
+        Ok(false) => tracing::info!(
+            sender_identity_id = identity.get(),
+            "Token 在登录期间被替换，丢弃这份 session"
+        ),
+        Err(error) => tracing::warn!(
+            sender_identity_id = identity.get(),
+            error = %error,
+            "Bot session 写回失败，下次重启改用 Token 登录"
+        ),
+    }
 }
 
 /// 信号已发出或发送端已关闭时返回。

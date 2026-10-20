@@ -10,12 +10,11 @@
 //! S1 每条任务都到 DONE，且各自拿到不同的 telegram_message_id（不丢、不重）
 //! S2 没有任务进 DEAD / FAILED 残留，delivery_logs 里没有 FLOOD_WAIT 以外的失败
 //! S3 每次 SIGTERM 都在 30s 内以 0 退出
-//! S4 身份不被标成 unauthorized；限流（`bot_sign_in` 的 FLOOD_WAIT）只记录不判失败 ——
-//!    重启频繁时 Telegram 会限流登录，这是 ADR-0033 已登记的代价，不是缺陷。
-//!    输出里的 logins / login_flood_waits 就是这条代价的实测数据。
+//! S4 身份不被标成 unauthorized；限流（`bot_sign_in` 的 FLOOD_WAIT）只记录不判失败。
+//! S5 只有第一次启动用 Token 登录，之后每次重启都复用落库的 session，不再调 `auth.importBotAuthorization`（ADR-0034）。
 //!
-//! 默认重启间隔 600 秒：实测几分钟内第 4 次左右登录就被限流 66–305 秒，
-//! 间隔太短时整段长跑都在等限流，测不到投递本身。
+//! 默认重启间隔 600 秒，是 session 落库之前的取值：当时几分钟内第 4 次左右登录
+//! 就被限流 66–305 秒。S5 成立后可以调短（`TGM_SOAK_RESTART_SECS`）验证重启风暴。
 //! ```
 //!
 //! 环境变量：
@@ -47,6 +46,7 @@ use tokio::time::{Instant, sleep};
 
 const LOCAL_KEK: &str = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=";
 const LOGIN_LINE: &str = "delivery 发送身份已登录";
+const VIA_TOKEN: &str = "delivery 发送身份已登录（Token）";
 const FLOOD_LINE: &str = "bot_sign_in 被限流";
 
 /// 缺变量直接失败：`--ignored` 跑起来却因为没配凭据而「通过」就是假绿。
@@ -84,8 +84,15 @@ struct DeliveryProcess {
     child: Child,
 }
 
+#[derive(Default)]
+struct Counters {
+    logins: Arc<AtomicUsize>,
+    token_logins: Arc<AtomicUsize>,
+    floods: Arc<AtomicUsize>,
+}
+
 impl DeliveryProcess {
-    fn start(app_url: &str, logins: Arc<AtomicUsize>, floods: Arc<AtomicUsize>) -> Self {
+    fn start(app_url: &str, counters: &Counters) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_tgm"))
             .args(["serve", "--role", "delivery"])
             .env_clear()
@@ -118,12 +125,16 @@ impl DeliveryProcess {
         .into_iter()
         .flatten()
         {
-            let counter = Arc::clone(&logins);
-            let flood_counter = Arc::clone(&floods);
+            let counter = Arc::clone(&counters.logins);
+            let token_counter = Arc::clone(&counters.token_logins);
+            let flood_counter = Arc::clone(&counters.floods);
             std::thread::spawn(move || {
                 for line in BufReader::new(stream).lines().map_while(Result::ok) {
                     if line.contains(LOGIN_LINE) {
                         counter.fetch_add(1, Ordering::SeqCst);
+                        if line.contains(VIA_TOKEN) {
+                            token_counter.fetch_add(1, Ordering::SeqCst);
+                        }
                     }
                     if line.contains(FLOOD_LINE) {
                         flood_counter.fetch_add(1, Ordering::SeqCst);
@@ -250,10 +261,9 @@ async fn live_delivery_soak(admin: PgPool) {
         .await
         .expect("写入 Token 失败");
 
-    let logins = Arc::new(AtomicUsize::new(0));
-    let floods = Arc::new(AtomicUsize::new(0));
+    let counters = Counters::default();
     let mut starts = 1_usize;
-    let mut process = DeliveryProcess::start(&app_url, Arc::clone(&logins), Arc::clone(&floods));
+    let mut process = DeliveryProcess::start(&app_url, &counters);
     let mut graceful_exits = Vec::new();
     let mut hard_kills = 0_usize;
     let mut tasks = Vec::new();
@@ -280,7 +290,7 @@ async fn live_delivery_soak(admin: PgPool) {
                 println!("[soak] 第 {starts} 次重启：SIGKILL");
             }
             starts += 1;
-            process = DeliveryProcess::start(&app_url, Arc::clone(&logins), Arc::clone(&floods));
+            process = DeliveryProcess::start(&app_url, &counters);
             next_restart += restart_every;
         }
         sleep(Duration::from_millis(500)).await;
@@ -341,13 +351,14 @@ async fn live_delivery_soak(admin: PgPool) {
     .fetch_one(&admin)
     .await
     .expect("读取身份状态失败");
-    let login_count = logins.load(Ordering::SeqCst);
-    let flood_count = floods.load(Ordering::SeqCst);
+    let login_count = counters.logins.load(Ordering::SeqCst);
+    let token_login_count = counters.token_logins.load(Ordering::SeqCst);
+    let flood_count = counters.floods.load(Ordering::SeqCst);
     let slowest_exit = graceful_exits.iter().max().copied().unwrap_or_default();
 
     println!(
         "[soak] minutes={minutes} tasks={} done={done} distinct_message_ids={distinct_messages} dead={dead} \
-         starts={starts} logins={login_count} login_flood_waits={flood_count} sigterm={} sigkill={hard_kills} slowest_sigterm_exit={slowest_exit:?} \
+         starts={starts} logins={login_count} token_logins={token_login_count} login_flood_waits={flood_count} sigterm={} sigkill={hard_kills} slowest_sigterm_exit={slowest_exit:?} \
          failures={failures:?} identity_status={status} unauthorized_audits={unauthorized}",
         tasks.len(),
         graceful_exits.len(),
@@ -366,4 +377,9 @@ async fn live_delivery_soak(admin: PgPool) {
         "[S2] 出现 FLOOD_WAIT 以外的失败：{failures:?}"
     );
     assert_eq!(unauthorized, 0, "[S4] 身份被标为 unauthorized");
+    assert_eq!(login_count, starts, "[S5] 有一次启动没登录上");
+    assert_eq!(
+        token_login_count, 1,
+        "[S5] 重启后没有复用落库的 session，又用 Token 登录了"
+    );
 }
