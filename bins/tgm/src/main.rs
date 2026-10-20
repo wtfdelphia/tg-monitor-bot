@@ -393,7 +393,8 @@ async fn serve_fanout(
     let worker = tgm_app::pipeline::FanoutWorker::new(
         pool,
         tgm_app::pipeline::FanoutWorkerConfig::default(),
-    );
+    )
+    .with_media_cleanup(media_store().await?);
     let result = worker.run(shutdown_rx).await;
     signal_task.abort();
     result?;

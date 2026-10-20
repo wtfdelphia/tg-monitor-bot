@@ -4519,6 +4519,87 @@ pub async fn load_media_relay_for_task(
     .await
 }
 
+/// 对象已过期、等待删对象的档案（spec/04 §一 `media_archive` 行：对象存储文件 3 天）。
+///
+/// 只返回 `object_key`：调用方先删对象，删成功后再用 [`clear_media_archive_object`] 置空。
+/// 顺序不能反 —— 先置空再删对象，删除失败就留下再也查不到的孤儿对象。
+pub async fn list_expired_media_objects(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, String)>(
+        r#"
+        SELECT id, object_key
+          FROM media_archive
+         WHERE object_key IS NOT NULL
+           AND object_expires_at < clock_timestamp()
+         ORDER BY object_expires_at, id
+         LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// 对象已删：把档案的 `object_key` 置空。
+///
+/// 条件带上 key 与过期判定：清理期间如果中转把同 hash 档案改指向了新对象
+/// （`complete_media_relay_job` 的 upsert 在旧对象过期时换 key），这里不覆盖新 key。
+pub async fn clear_media_archive_object(
+    pool: &PgPool,
+    archive_id: i64,
+    object_key: &str,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(
+        r#"
+        UPDATE media_archive
+           SET object_key = NULL,
+               object_expires_at = NULL
+         WHERE id = $1
+           AND object_key = $2
+           AND object_expires_at < clock_timestamp()
+        "#,
+    )
+    .bind(archive_id)
+    .bind(object_key)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(updated == 1)
+}
+
+/// 物理删除超过保留期、且已没有对象和 job 引用的档案记录（spec/04 §一：记录 180 天）。
+///
+/// 仍挂着对象的不删（要先走对象清理），仍被 `media_relay_jobs` 引用的不删
+/// （job 随 `canonical_events` 级联消失后再清）。单批不超过 `limit` 行（spec/04 §1.1）。
+pub async fn delete_stale_media_archive(
+    pool: &PgPool,
+    retention_days: i32,
+    limit: i64,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        r#"
+        DELETE FROM media_archive
+         WHERE id IN (
+               SELECT archive.id
+                 FROM media_archive AS archive
+                WHERE archive.first_seen_at < clock_timestamp() - make_interval(days => $1)
+                  AND archive.object_key IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM media_relay_jobs AS job
+                       WHERE job.media_archive_id = archive.id)
+                ORDER BY archive.first_seen_at, archive.id
+                LIMIT $2)
+        "#,
+    )
+    .bind(retention_days)
+    .bind(limit)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
 /// 媒体还没下载好：把 `SENDING` 的任务放回 `PENDING` 推后再看，不计尝试、不写投递日志。
 pub async fn defer_delivery_task(
     pool: &PgPool,

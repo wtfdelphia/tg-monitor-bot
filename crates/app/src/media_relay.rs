@@ -247,6 +247,7 @@ impl MediaStore {
         Ok((object.body.into_async_read(), size))
     }
 
+    /// 删对象。S3 对不存在的 key 也返回成功（MinIO 同），所以重复删是幂等的。
     pub async fn delete(&self, key: &str) -> Result<(), MediaStoreError> {
         self.client
             .delete_object()
@@ -256,6 +257,35 @@ impl MediaStore {
             .await
             .map(|_| ())
             .map_err(s3_error)
+    }
+
+    /// 列出 `prefix` 下最后修改时间早于 `cutoff` 的对象 key（分页读完）。
+    pub async fn list_older_than(
+        &self,
+        prefix: &str,
+        cutoff: aws_sdk_s3::primitives::DateTime,
+    ) -> Result<Vec<String>, MediaStoreError> {
+        let mut keys = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix)
+                .set_continuation_token(token.take())
+                .send()
+                .await
+                .map_err(s3_error)?;
+            keys.extend(page.contents().iter().filter_map(|object| {
+                let old = object.last_modified().is_some_and(|at| *at < cutoff);
+                old.then(|| object.key().map(str::to_owned)).flatten()
+            }));
+            match page.next_continuation_token() {
+                Some(next) => token = Some(next.to_owned()),
+                None => return Ok(keys),
+            }
+        }
     }
 }
 
