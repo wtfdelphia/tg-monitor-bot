@@ -564,6 +564,8 @@ async fn worker_processes_exit_cleanly_on_sigterm(admin: PgPool) -> Result<()> {
         ),
         ("TGM_S3_ENDPOINT", "http://127.0.0.1:59000"),
         ("TGM_S3_BUCKET", "tgm-sigterm"),
+        ("TGM_S3_ACCESS_KEY_ID", "minioadmin"),
+        ("TGM_S3_SECRET_ACCESS_KEY", "minioadmin"),
     ];
     let delivery_env: Vec<(&str, &str)> = kek_env
         .iter()

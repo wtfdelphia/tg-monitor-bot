@@ -588,6 +588,34 @@ SELECT q::text FROM (
    ORDER BY 1, 2
 ) q;
 
+-- name: C7 丙类表必须存在且 RLS 关闭
+-- 丙类（spec/03 §1.3）刻意不启用 RLS，隔离靠应用层。它们被误开 RLS 的后果不是报错，
+-- 是 app_user 静默读到 0 行（0012 末尾的注释）—— 而 0012 的 ensure_rls event trigger
+-- 会给**任何**新建表自动 ENABLE + FORCE，不分甲乙丙。0022 的 media_relay_jobs 是 0012
+-- 之后第一张丙类新表，迁移里显式关掉了；这条断言防的是将来有人漏写那两行，
+-- 或「改列类型要重建表」时 trigger 把旧丙类表重新打开。
+--
+-- 与 C1 同形，从白名单一侧出发（VALUES LEFT JOIN）：表被删或改名必须报，
+-- 不能因为「匹配不到」变成零行通过。MAIN 按有无 tenant_id 列筛表，丙类恰好都没有
+-- tenant_id（identity_secrets 除外，见下），所以谁都没在看它们的 RLS 标志。
+--
+-- identity_secrets 有 tenant_id 列吗？没有 —— 它经 identities 间接受约（0009 注释）。
+-- 若将来给丙类表加了 tenant_id，MAIN 会要求它开三件套而本断言要求它关，两条同时红，
+-- 这是刻意的：加 tenant_id 等于改分类，必须同时改这份白名单。
+SELECT q::text FROM (
+  SELECT w.tbl,
+         CASE WHEN c.oid IS NULL THEN '表不存在于 public —— 被删或被改名'
+              WHEN c.relrowsecurity THEN 'RLS 被 ENABLE —— 丙类表开 RLS 后 app_user 静默读到 0 行'
+              ELSE 'RLS 被 FORCE'
+         END AS why
+  FROM (VALUES ('tenants'), ('canonical_events'), ('media_archive'), ('identity_secrets'),
+               ('account_leases'), ('console_login_challenges'), ('media_relay_jobs')) w(tbl)
+  LEFT JOIN pg_class c ON c.relname = w.tbl AND c.relkind IN ('r','p')
+                      AND c.relnamespace = 'public'::regnamespace
+  WHERE c.oid IS NULL OR c.relrowsecurity OR c.relforcerowsecurity
+  ORDER BY 1
+) q;
+
 -- name: C5 登录角色不得持有组成员身份
 -- 本步骤新增，补的是 A0 那条派生的一个盲区，不在 eng/04 原文里。
 --

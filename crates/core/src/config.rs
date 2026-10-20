@@ -145,12 +145,22 @@ fn extra_required(role: Role) -> &'static [&'static str] {
             "TGM_DATA_BOT_SECRET_TOKEN",
             "TGM_DATA_BOT_IDENTITY_ID",
         ],
-        Role::MtprotoWorker => &["TGM_KEK_BACKEND", "TGM_S3_ENDPOINT", "TGM_S3_BUCKET"],
+        // 媒体中转（WP-5-delivery-media 片 2）：S3 用独立静态凭据，不走 AWS 默认链 ——
+        // 默认链给的是 KMS 的身份，两者混用会让 KMS 角色顺带拿到桶权限
+        Role::MtprotoWorker => &[
+            "TGM_KEK_BACKEND",
+            "TGM_S3_ENDPOINT",
+            "TGM_S3_BUCKET",
+            "TGM_S3_ACCESS_KEY_ID",
+            "TGM_S3_SECRET_ACCESS_KEY",
+        ],
         // ADR-0033：平台自己的 api_id / api_hash 只用于以租户 Bot 身份 bot_sign_in。
         Role::Delivery => &[
             "TGM_KEK_BACKEND",
             "TGM_S3_ENDPOINT",
             "TGM_S3_BUCKET",
+            "TGM_S3_ACCESS_KEY_ID",
+            "TGM_S3_SECRET_ACCESS_KEY",
             "TGM_PLATFORM_API_ID",
             "TGM_PLATFORM_API_HASH",
         ],
@@ -179,7 +189,7 @@ fn allowed(role: Role) -> Vec<&'static str> {
             v.extend_from_slice(&["TGM_KMS_KEY_ARN", "TGM_LOCAL_KEK"]);
         }
         Role::MtprotoWorker | Role::Delivery => {
-            v.extend_from_slice(&["TGM_KMS_KEY_ARN", "TGM_LOCAL_KEK"]);
+            v.extend_from_slice(&["TGM_KMS_KEY_ARN", "TGM_LOCAL_KEK", "TGM_S3_REGION"]);
         }
         Role::Fanout | Role::Rule => {}
     }
@@ -394,6 +404,9 @@ fn known_names() -> &'static [&'static str] {
         "TGM_REDIS_URL",
         "TGM_S3_ENDPOINT",
         "TGM_S3_BUCKET",
+        "TGM_S3_ACCESS_KEY_ID",
+        "TGM_S3_SECRET_ACCESS_KEY",
+        "TGM_S3_REGION",
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
@@ -566,6 +579,40 @@ mod tests {
             check(Role::Delivery, Some("development"), &missing, None),
             vec![ConfigProblem::Missing("TGM_PLATFORM_API_HASH")]
         );
+    }
+
+    /// 片 2：S3 静态凭据只给媒体两端，fanout / rule / control-plane 出现即多配；
+    /// TGM_S3_REGION 是可选项，媒体两端不配也不报缺。
+    #[test]
+    fn s3_credentials_are_media_roles_only() {
+        for role in [Role::MtprotoWorker, Role::Delivery] {
+            let mut env = minimal(role);
+            assert!(env.contains(&"TGM_S3_SECRET_ACCESS_KEY"));
+            env.push("TGM_S3_REGION");
+            assert!(check(role, Some("development"), &env, None).is_empty());
+            env.retain(|name| *name != "TGM_S3_ACCESS_KEY_ID");
+            assert_eq!(
+                check(role, Some("development"), &env, None),
+                vec![ConfigProblem::Missing("TGM_S3_ACCESS_KEY_ID")]
+            );
+        }
+        for role in [Role::Fanout, Role::Rule, Role::ControlPlane] {
+            let mut env = minimal(role);
+            env.extend_from_slice(&[
+                "TGM_S3_ACCESS_KEY_ID",
+                "TGM_S3_SECRET_ACCESS_KEY",
+                "TGM_S3_REGION",
+            ]);
+            assert_eq!(
+                check(role, Some("development"), &env, None),
+                vec![
+                    ConfigProblem::Unexpected("TGM_S3_ACCESS_KEY_ID"),
+                    ConfigProblem::Unexpected("TGM_S3_SECRET_ACCESS_KEY"),
+                    ConfigProblem::Unexpected("TGM_S3_REGION"),
+                ],
+                "{role:?}"
+            );
+        }
     }
 
     /// 反证上一条不是「凡是 TGM_LOCAL_KEK 都报」：bot-gateway 与 control-plane 上它是允许的。

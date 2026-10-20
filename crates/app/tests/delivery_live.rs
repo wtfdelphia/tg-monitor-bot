@@ -74,6 +74,13 @@ fn platform_app() -> PlatformApp {
     PlatformApp {
         api_id,
         api_hash: Arc::new(Secret::new(required("TGM_PLATFORM_API_HASH"))),
+        media_store: tgm_app::media_relay::MediaStore::new(&tgm_app::media_relay::S3Config {
+            endpoint: "http://127.0.0.1:59000".to_owned(),
+            bucket: "tgm-live".to_owned(),
+            region: "us-east-1".to_owned(),
+            access_key_id: "minioadmin".to_owned(),
+            secret_access_key: Secret::new("minioadmin".to_owned()),
+        }),
     }
 }
 
@@ -247,7 +254,7 @@ async fn live_delivery_child() {
     drop(token);
     let directory = PathBuf::from(required("TGM_LIVE_CHILD_DIR"));
     let transport = GateTransport {
-        inner: TelegramDeliveryTransport::new(Arc::new(client)),
+        inner: TelegramDeliveryTransport::new(Arc::new(client), app.media_store.clone()),
         directory,
         phase: required("TGM_LIVE_CHILD_PHASE"),
     };

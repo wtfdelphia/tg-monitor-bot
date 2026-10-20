@@ -10,14 +10,23 @@ use tgm_core::error::AppError;
 use tgm_core::ids::IdentityId;
 use tgm_db::repo::{
     DeliveryTaskFailureInput, DeliveryTaskFailureStatus, DeliveryTaskPayloadRecord,
-    claim_due_delivery_task, complete_delivery_task, load_delivery_task_payload,
-    record_delivery_failure, recover_stale_delivery_tasks,
+    claim_due_delivery_task, complete_delivery_task, defer_delivery_task,
+    load_delivery_task_payload, load_media_relay_for_task, record_delivery_failure,
+    recover_stale_delivery_tasks,
 };
-use tgm_tg::{TelegramClient, TelegramDeliveryAction};
+use tgm_tg::{TelegramClient, TelegramDeliveryAction, UploadMedia, telegram_text_len};
+
+use crate::media_relay::MediaStore;
 use tokio::sync::watch;
 
 const MIN_WORKER_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_WORKER_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Telegram 媒体说明上限（片 1 实测 `MEDIA_CAPTION_TOO_LONG`）。
+pub const CAPTION_MAX_LEN: usize = 1024;
+/// 文本消息上限（eng/02 `message_length_max`）。
+pub const MESSAGE_MAX_LEN: usize = 4096;
+/// 媒体还没下载好时推后多久再看。
+const MEDIA_WAIT_SECONDS: i64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeliveryParseMode {
@@ -48,6 +57,19 @@ pub struct DeliveryPayload {
     pub action: DeliveryAction,
     pub source: DeliverySourceMessage,
     pub message: RenderedDeliveryMessage,
+    /// free 档媒体消息：只发文字（正文已在快照里替换成 caption 或占位说明）。
+    pub text_only: bool,
+    /// pro 档跨身份中转：已下载到对象存储的媒体。`None` = 不走中转。
+    pub media: Option<DeliveryMedia>,
+}
+
+/// 中转 job 就绪后 delivery 要上传的对象。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryMedia {
+    pub object_key: String,
+    pub media_type: String,
+    pub mime_type: Option<String>,
+    pub file_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +85,58 @@ pub struct DeliverySourceMessage {
 struct DeliverySnapshot {
     source: DeliverySourceMessage,
     message: RenderedDeliveryMessage,
+    /// 片 2 新增。缺省为 `false`，片 2 之前冻结的快照照常可读；`false` 时不序列化，
+    /// 文字与 pro 档快照的形状与之前一致。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    text_only: bool,
+}
+
+/// 媒体 + 说明怎么发（片 2 批准记录：超过 1024 拆成「媒体 + 一条文字」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptionPlan {
+    /// 说明跟媒体一条发完。
+    Single,
+    /// 先发不带说明的媒体，再发一条全文。
+    Split,
+    /// 全文也超过文本上限：判死，不截断原文（eng/02）。
+    TooLong,
+}
+
+/// `len` 是 [`telegram_text_len`] 的结果（HTML 解析后的 UTF-16 码元数）。
+pub fn caption_plan(len: usize) -> CaptionPlan {
+    if len <= CAPTION_MAX_LEN {
+        CaptionPlan::Single
+    } else if len <= MESSAGE_MAX_LEN {
+        CaptionPlan::Split
+    } else {
+        CaptionPlan::TooLong
+    }
+}
+
+/// 拆两条时第二条文字的 `random_id`，由第一条确定性派生：重试时两条用同一对值整组重发，
+/// 服务器按 `random_id` 去重，不用记录「第一条已成功」。恒为正，且与原值不同。
+// ponytail: 派生值与同一 (sender, target) 下其他任务的 random_id 碰撞概率约 2^-63，
+// 出现「编辑第二条文字」的需求时改为 delivery_tasks 独立列
+pub fn split_text_random_id(random_id: i64) -> i64 {
+    let derived = (random_id ^ 0x5a5a_5a5a_5a5a_5a5a) & i64::MAX;
+    if derived == 0 { 1 } else { derived }
+}
+
+fn send_error(code: &str, message: impl Into<String>) -> DeliverySendError {
+    DeliverySendError {
+        code: code.to_owned(),
+        message: Some(message.into()),
+        flood_wait_seconds: None,
+    }
+}
+
+fn tg_send_error(error: tgm_tg::TelegramClientError) -> DeliverySendError {
+    let error = error.delivery_error();
+    DeliverySendError {
+        code: error.code,
+        message: error.message,
+        flood_wait_seconds: error.flood_wait_seconds,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,17 +153,83 @@ pub trait DeliveryTransport: Send + Sync {
 
 pub struct TelegramDeliveryTransport {
     client: Arc<TelegramClient>,
+    store: MediaStore,
 }
 
 impl TelegramDeliveryTransport {
-    pub fn new(client: Arc<TelegramClient>) -> Self {
-        Self { client }
+    pub fn new(client: Arc<TelegramClient>, store: MediaStore) -> Self {
+        Self { client, store }
+    }
+
+    async fn deliver_media(
+        &self,
+        payload: &DeliveryPayload,
+        media: &DeliveryMedia,
+    ) -> Result<i64, DeliverySendError> {
+        let plan = caption_plan(telegram_text_len(&payload.message.text));
+        if plan == CaptionPlan::TooLong {
+            return Err(send_error(
+                "MESSAGE_TOO_LONG",
+                "说明超过文本消息上限，不截断",
+            ));
+        }
+        let (mut reader, size) = self
+            .store
+            .get_stream(&media.object_key)
+            .await
+            .map_err(|error| send_error("MEDIA_STORE_FAILED", error.to_string()))?;
+        let upload = UploadMedia {
+            media_type: media.media_type.clone(),
+            mime_type: media.mime_type.clone(),
+            file_name: media.file_name.clone(),
+        };
+        let caption = match plan {
+            CaptionPlan::Single => payload.message.text.as_str(),
+            CaptionPlan::Split | CaptionPlan::TooLong => "",
+        };
+        let message_id = self
+            .client
+            .send_uploaded_media(
+                payload.target_tg_chat_id,
+                payload.telegram_random_id,
+                &mut reader,
+                size,
+                &upload,
+                caption,
+            )
+            .await
+            .map_err(tg_send_error)?;
+        if plan == CaptionPlan::Split {
+            self.client
+                .copy_text(
+                    payload.target_tg_chat_id,
+                    split_text_random_id(payload.telegram_random_id),
+                    &payload.message.text,
+                )
+                .await
+                .map_err(tg_send_error)?;
+        }
+        Ok(message_id)
     }
 }
 
 #[async_trait::async_trait]
 impl DeliveryTransport for TelegramDeliveryTransport {
     async fn deliver(&self, payload: DeliveryPayload) -> Result<i64, DeliverySendError> {
+        if let Some(media) = &payload.media {
+            return self.deliver_media(&payload, media).await;
+        }
+        if payload.text_only && payload.action != DeliveryAction::Forward {
+            return self
+                .client
+                .copy_text(
+                    payload.target_tg_chat_id,
+                    payload.telegram_random_id,
+                    &payload.message.text,
+                )
+                .await
+                .map_err(tg_send_error);
+        }
         let action = match payload.action {
             DeliveryAction::Copy => TelegramDeliveryAction::Copy,
             DeliveryAction::Forward => TelegramDeliveryAction::Forward,
@@ -106,14 +246,7 @@ impl DeliveryTransport for TelegramDeliveryTransport {
                 payload.source.media_type.as_deref(),
             )
             .await
-            .map_err(|error| {
-                let error = error.delivery_error();
-                DeliverySendError {
-                    code: error.code,
-                    message: error.message,
-                    flood_wait_seconds: error.flood_wait_seconds,
-                }
-            })
+            .map_err(tg_send_error)
     }
 }
 
@@ -128,6 +261,10 @@ pub enum DeliveryRunOutcome {
         task_id: i64,
         status: DeliveryDecisionStatus,
         attempt_count: i32,
+    },
+    /// 等跨身份中转下载，任务已推后、未计尝试。
+    Deferred {
+        task_id: i64,
     },
 }
 
@@ -224,7 +361,9 @@ impl<T: DeliveryTransport + ?Sized> DeliveryWorker<T> {
                         _ = tokio::time::sleep(self.config.poll_interval) => {}
                     }
                 }
-                DeliveryRunOutcome::Done { .. } | DeliveryRunOutcome::Failed { .. } => {}
+                DeliveryRunOutcome::Done { .. }
+                | DeliveryRunOutcome::Failed { .. }
+                | DeliveryRunOutcome::Deferred { .. } => {}
             }
         }
     }
@@ -291,22 +430,42 @@ pub fn build_delivery_payload(
         action: parse_delivery_action(&record.action)?,
         source: snapshot.source,
         message: snapshot.message,
+        text_only: snapshot.text_only,
+        media: None,
     })
 }
 
+/// 这条任务要不要等跨身份中转：COPY / RESEND 的非文字媒体，且不是 free 档的只发文字。
+pub fn needs_media_relay(payload: &DeliveryPayload) -> bool {
+    payload.action != DeliveryAction::Forward
+        && !payload.text_only
+        && payload
+            .source
+            .media_type
+            .as_deref()
+            .is_some_and(|media_type| media_type != "TEXT")
+}
+
+/// `text_only`：free 档的媒体消息只发文字。正文用 caption，没有 caption 时用占位说明
+/// 「[媒体：<media_type>] <来源链接>」，照常走模板渲染（片 2 提案）。
 pub(crate) fn freeze_delivery_snapshot(
     event: &tgm_db::repo::TenantEventRecord,
     rule_snapshot: &Value,
     matched_keywords: &[String],
+    text_only: bool,
 ) -> Result<Value, AppError> {
     let replacements = parse_replacements(Some(rule_snapshot))?;
+    let placeholder = (text_only
+        && event.text.as_deref().unwrap_or_default().is_empty()
+        && event.caption.as_deref().unwrap_or_default().is_empty())
+    .then(|| media_placeholder(event));
     let message = render_delivery_message(DeliveryRenderInput {
         template: rule_snapshot
             .get("rule")
             .and_then(|rule| rule.get("template"))
             .and_then(Value::as_str),
         text: event.text.as_deref(),
-        caption: event.caption.as_deref(),
+        caption: placeholder.as_deref().or(event.caption.as_deref()),
         chat_title: event.chat_title.as_deref(),
         username: event.username.as_deref(),
         sender_id: event.sender_id,
@@ -322,8 +481,85 @@ pub(crate) fn freeze_delivery_snapshot(
             media_type: event.media_type.clone(),
         },
         message,
+        text_only,
     })
     .map_err(|_| invalid_payload("序列化投递快照失败"))
+}
+
+fn media_placeholder(event: &tgm_db::repo::TenantEventRecord) -> String {
+    let username = event.username.as_deref().filter(|value| !value.is_empty());
+    format!(
+        "[媒体：{}] {}",
+        event.media_type.as_deref().unwrap_or("DOCUMENT"),
+        message_link(username, event.tg_chat_id, event.tg_message_id)
+    )
+}
+
+/// 中转状态对这条任务的裁决。
+enum RelayDecision {
+    Send(DeliveryMedia),
+    Wait,
+    Dead(String),
+}
+
+async fn decide_media_relay(
+    pool: &PgPool,
+    tenant: tgm_core::ids::TenantId,
+    task_id: i64,
+) -> Result<RelayDecision, AppError> {
+    let Some(state) = load_media_relay_for_task(pool, tenant, task_id).await? else {
+        return Ok(RelayDecision::Dead("MEDIA_RELAY_UNAVAILABLE".to_owned()));
+    };
+    let decision = match state.job_status.as_deref() {
+        // 没有 job：事件不是 MTProto 采集的，或任务早于片 2 入队。
+        None => RelayDecision::Dead("MEDIA_RELAY_UNAVAILABLE".to_owned()),
+        Some("READY") => match state.object_key {
+            Some(object_key) => RelayDecision::Send(DeliveryMedia {
+                object_key,
+                media_type: state.media_type.unwrap_or_else(|| "DOCUMENT".to_owned()),
+                mime_type: state.mime_type,
+                file_name: state.file_name,
+            }),
+            None => RelayDecision::Dead("MEDIA_RELAY_UNAVAILABLE".to_owned()),
+        },
+        Some("DEAD") => RelayDecision::Dead(
+            state
+                .job_error_code
+                .unwrap_or_else(|| "MEDIA_RELAY_FAILED".to_owned()),
+        ),
+        Some(_) if state.timed_out => RelayDecision::Dead("MEDIA_RELAY_TIMEOUT".to_owned()),
+        Some(_) => RelayDecision::Wait,
+    };
+    Ok(decision)
+}
+
+async fn record_dead(
+    pool: &PgPool,
+    tenant: tgm_core::ids::TenantId,
+    task: &tgm_db::repo::DeliveryTaskRecord,
+    error_code: String,
+    error_message: Option<String>,
+) -> Result<DeliveryRunOutcome, AppError> {
+    let attempt_count = task.attempt_count.saturating_add(1);
+    record_delivery_failure(
+        pool,
+        tenant,
+        task.id,
+        DeliveryTaskFailureInput {
+            status: DeliveryTaskFailureStatus::Dead,
+            attempt_count,
+            next_retry_at: None,
+            error_code,
+            error_message,
+            latency_ms: None,
+        },
+    )
+    .await?;
+    Ok(DeliveryRunOutcome::Failed {
+        task_id: task.id,
+        status: DeliveryDecisionStatus::Dead,
+        attempt_count,
+    })
 }
 
 pub async fn run_delivery_once<T: DeliveryTransport + ?Sized>(
@@ -341,31 +577,32 @@ pub async fn run_delivery_once<T: DeliveryTransport + ?Sized>(
         Some(record) => build_delivery_payload(&record),
         None => Err(invalid_payload("投递任务载荷不存在")),
     };
-    let payload = match payload {
+    let mut payload = match payload {
         Ok(payload) => payload,
         Err(error) => {
-            let attempt_count = task.attempt_count.saturating_add(1);
-            record_delivery_failure(
+            return record_dead(
                 pool,
                 tenant,
-                task.id,
-                DeliveryTaskFailureInput {
-                    status: DeliveryTaskFailureStatus::Dead,
-                    attempt_count,
-                    next_retry_at: None,
-                    error_code: "PAYLOAD_INVALID".to_owned(),
-                    error_message: Some(error.to_string()),
-                    latency_ms: None,
-                },
+                &task,
+                "PAYLOAD_INVALID".to_owned(),
+                Some(error.to_string()),
             )
-            .await?;
-            return Ok(DeliveryRunOutcome::Failed {
-                task_id: task.id,
-                status: DeliveryDecisionStatus::Dead,
-                attempt_count,
-            });
+            .await;
         }
     };
+    if needs_media_relay(&payload) {
+        match decide_media_relay(pool, tenant, task.id).await? {
+            RelayDecision::Send(media) => payload.media = Some(media),
+            // 媒体还没下好：放回队列，不计尝试。
+            RelayDecision::Wait => {
+                defer_delivery_task(pool, tenant, task.id, MEDIA_WAIT_SECONDS).await?;
+                return Ok(DeliveryRunOutcome::Deferred { task_id: task.id });
+            }
+            RelayDecision::Dead(code) => {
+                return record_dead(pool, tenant, &task, code, None).await;
+            }
+        }
+    }
 
     let started = std::time::Instant::now();
     match transport.deliver(payload).await {
@@ -601,6 +838,9 @@ impl DeliveryErrorKind {
             "PEER_ID_INVALID",
             "MEDIA_COPY_UNAVAILABLE",
             "MEDIA_RESEND_UNAVAILABLE",
+            // 长度超限重试不会变短（片 1 实测 caption 报 MEDIA_CAPTION_TOO_LONG）
+            "MEDIA_CAPTION_TOO_LONG",
+            "MESSAGE_TOO_LONG",
         ]
         .iter()
         .any(|permanent| code.eq_ignore_ascii_case(permanent))
@@ -855,6 +1095,65 @@ mod tests {
         })
         .expect_err("非法替换正则未报错");
         assert!(matches!(error, tgm_core::error::AppError::RegexInvalid(_)));
+    }
+
+    #[test]
+    fn caption_plan_splits_above_1024_and_dies_above_4096() {
+        use super::{CaptionPlan, caption_plan};
+        assert_eq!(caption_plan(0), CaptionPlan::Single);
+        assert_eq!(caption_plan(1024), CaptionPlan::Single);
+        assert_eq!(caption_plan(1025), CaptionPlan::Split);
+        assert_eq!(caption_plan(4096), CaptionPlan::Split);
+        assert_eq!(caption_plan(4097), CaptionPlan::TooLong);
+    }
+
+    /// 长度按 HTML 解析后的 UTF-16 码元计：实体标签不计，转义按一个字符，
+    /// 非 BMP 的 emoji 计 2。1024 个 😀 是 2048 码元，按 code point 计会误判成一条发完。
+    #[test]
+    fn caption_length_counts_utf16_after_html_parsing() {
+        use super::{CaptionPlan, caption_plan};
+        use tgm_tg::telegram_text_len;
+        assert_eq!(telegram_text_len("<b>ab</b> &amp;"), 4);
+        assert_eq!(telegram_text_len("😀"), 2);
+        assert_eq!(
+            caption_plan(telegram_text_len(&"😀".repeat(512))),
+            CaptionPlan::Single
+        );
+        assert_eq!(
+            caption_plan(telegram_text_len(&"😀".repeat(513))),
+            CaptionPlan::Split
+        );
+        assert_eq!(
+            caption_plan(telegram_text_len(&"<b>a</b>".repeat(1024))),
+            CaptionPlan::Single
+        );
+    }
+
+    #[test]
+    fn split_text_random_id_is_positive_and_differs() {
+        use super::split_text_random_id;
+        for random_id in [1, 2, 0x5a5a_5a5a_5a5a_5a5a, i64::MAX, 0x2a5a_5a5a_5a5a_5a5a] {
+            let derived = split_text_random_id(random_id);
+            assert!(derived > 0, "{random_id} 派生出 {derived}");
+            assert_ne!(derived, random_id);
+            assert_eq!(derived, split_text_random_id(random_id), "派生必须确定");
+        }
+        assert_eq!(
+            split_text_random_id(0x5a5a_5a5a_5a5a_5a5a),
+            1,
+            "异或为 0 时取 1"
+        );
+    }
+
+    #[test]
+    fn length_errors_are_permanent() {
+        for code in ["MEDIA_CAPTION_TOO_LONG", "MESSAGE_TOO_LONG"] {
+            assert_eq!(
+                DeliveryErrorKind::from_code(code, None),
+                DeliveryErrorKind::Permanent,
+                "{code}"
+            );
+        }
     }
 
     #[test]

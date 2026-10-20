@@ -287,6 +287,10 @@ pub struct DeliveryTaskInput {
     pub sender_identity_id: IdentityId,
     pub action: String,
     pub payload_snapshot: Value,
+    /// 跨身份媒体中转：同一事务里为该事件建 `media_relay_jobs`（片 2）。
+    pub media_relay: bool,
+    /// 入队即判死的错误码（如 `MEDIA_TOO_LARGE`）。`None` = 正常 PENDING。
+    pub dead_error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3600,9 +3604,15 @@ pub async fn enqueue_delivery_tasks(
                             action,
                             telegram_random_id,
                             payload_snapshot,
-                            idem_key
+                            idem_key,
+                            status,
+                            last_error_code,
+                            completed_at
                         )
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                                CASE WHEN $11::text IS NULL THEN 'PENDING' ELSE 'DEAD' END,
+                                $11,
+                                CASE WHEN $11::text IS NULL THEN NULL ELSE clock_timestamp() END)
                         ON CONFLICT DO NOTHING
                         RETURNING id
                         "#,
@@ -3617,6 +3627,7 @@ pub async fn enqueue_delivery_tasks(
                     .bind(telegram_random_id)
                     .bind(&task.payload_snapshot)
                     .bind(&idem_key)
+                    .bind(task.dead_error_code.as_deref())
                     .fetch_optional(&mut *conn)
                     .await?;
 
@@ -3644,6 +3655,28 @@ pub async fn enqueue_delivery_tasks(
                 };
 
                 writes.push(DeliveryTaskWrite { id, inserted });
+            }
+
+            // 一条 canonical event 一个 job，多租户命中同一条消息只下载一次。
+            // 只有 MTProto 采集的事件能由 mtproto-worker 下载；Bot 采集的没有 job，
+            // delivery 查不到 job 时直接判死，不空等 30 分钟。
+            if tasks.iter().any(|task| task.media_relay) {
+                sqlx::query(
+                    r#"
+                    INSERT INTO media_relay_jobs (canonical_event_id, receiver_identity_id)
+                    SELECT ce.id, ce.receiver_identity_id
+                      FROM tenant_events AS te
+                      JOIN canonical_events AS ce ON ce.id = te.canonical_event_id
+                     WHERE te.tenant_id = $1
+                       AND te.id = $2
+                       AND ce.adapter = 'mtproto'
+                    ON CONFLICT (canonical_event_id) DO NOTHING
+                    "#,
+                )
+                .bind(tenant.get())
+                .bind(tenant_event_id)
+                .execute(&mut *conn)
+                .await?;
             }
 
             sqlx::query(
@@ -4220,6 +4253,299 @@ pub async fn record_delivery_failure(
             .execute(&mut *conn)
             .await?;
             Ok(Some(updated))
+        })
+    })
+    .await
+}
+
+/// 租户套餐（`tenants.plan`）。`tenants` 是丙类表，按主键读。
+pub async fn load_tenant_plan(pool: &PgPool, tenant: TenantId) -> Result<String, sqlx::Error> {
+    sqlx::query_scalar::<_, String>("SELECT plan FROM tenants WHERE id = $1")
+        .bind(tenant.get())
+        .fetch_one(pool)
+        .await
+}
+
+/// 媒体中转 job 被 mtproto-worker 领到时带出的源消息信息。
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MediaRelayJobRecord {
+    pub canonical_event_id: i64,
+    /// 已含本次领取。
+    pub attempt_count: i32,
+    pub tg_chat_id: i64,
+    pub tg_message_id: i64,
+    pub media_type: String,
+    pub mime_type: Option<String>,
+    pub file_name: Option<String>,
+    pub file_size: Option<i64>,
+}
+
+/// 下载完成后写入 `media_archive` 的一行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaArchiveInput {
+    pub content_hash: String,
+    pub media_type: String,
+    pub mime_type: Option<String>,
+    pub file_name: Option<String>,
+    pub file_size: i64,
+    pub object_key: String,
+}
+
+/// 领取本身份一条到期的中转 job，转 `DOWNLOADING` 并计一次尝试。
+///
+/// `DOWNLOADING` 的 `next_retry_at` 是回收期限：worker 下载途中崩溃时，
+/// 10 分钟后同一身份的下一任持有者能重新领到。租约不在手时返回 `None`。
+pub async fn claim_media_relay_job(
+    pool: &PgPool,
+    lease: &LeaseGuard,
+) -> Result<Option<MediaRelayJobRecord>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !lease_is_held(&mut tx, lease).await? {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let job = sqlx::query_as::<_, MediaRelayJobRecord>(
+        r#"
+        WITH candidate AS (
+            SELECT canonical_event_id
+              FROM media_relay_jobs
+             WHERE receiver_identity_id = $1
+               AND status IN ('PENDING', 'DOWNLOADING')
+               AND (next_retry_at IS NULL OR next_retry_at <= clock_timestamp())
+             ORDER BY created_at, canonical_event_id
+             FOR UPDATE SKIP LOCKED
+             LIMIT 1
+        )
+        UPDATE media_relay_jobs AS job
+           SET status = 'DOWNLOADING',
+               attempt_count = job.attempt_count + 1,
+               next_retry_at = clock_timestamp() + interval '10 minutes',
+               updated_at = clock_timestamp()
+          FROM candidate, canonical_events AS ce
+         WHERE job.canonical_event_id = candidate.canonical_event_id
+           AND ce.id = job.canonical_event_id
+        RETURNING job.canonical_event_id,
+                  job.attempt_count,
+                  ce.tg_chat_id,
+                  ce.tg_message_id,
+                  COALESCE(ce.media_type, 'DOCUMENT') AS media_type,
+                  ce.mime_type,
+                  ce.file_name,
+                  ce.file_size
+        "#,
+    )
+    .bind(lease.identity_id.get())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(job)
+}
+
+/// 记一次下载失败：`dead` 时转 `DEAD`，否则回 `PENDING` 等 `next_retry_at`。
+/// 返回 `false` 表示租约已不在手或 job 已不在 `DOWNLOADING`。
+pub async fn fail_media_relay_job(
+    pool: &PgPool,
+    lease: &LeaseGuard,
+    canonical_event_id: i64,
+    dead: bool,
+    next_retry_at: Option<DateTime<Utc>>,
+    error_code: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !lease_is_held(&mut tx, lease).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        r#"
+        UPDATE media_relay_jobs
+           SET status = CASE WHEN $2 THEN 'DEAD' ELSE 'PENDING' END,
+               next_retry_at = $3,
+               last_error_code = $4,
+               updated_at = clock_timestamp()
+         WHERE canonical_event_id = $1
+           AND receiver_identity_id = $5
+           AND status = 'DOWNLOADING'
+        "#,
+    )
+    .bind(canonical_event_id)
+    .bind(dead)
+    .bind(next_retry_at)
+    .bind(error_code)
+    .bind(lease.identity_id.get())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(updated == 1)
+}
+
+/// 按 `content_hash` upsert 档案并把 job 转 `READY`，同一事务、校验租约。
+///
+/// 档案已有仍有效的对象时保留旧对象：返回的 `object_key` 与传入的不同，
+/// 调用方要删掉自己刚写的那份。租约不在手时返回 `None`。
+pub async fn complete_media_relay_job(
+    pool: &PgPool,
+    lease: &LeaseGuard,
+    canonical_event_id: i64,
+    archive: &MediaArchiveInput,
+) -> Result<Option<(i64, String)>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !lease_is_held(&mut tx, lease).await? {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let (archive_id, object_key) = sqlx::query_as::<_, (i64, String)>(
+        r#"
+        INSERT INTO media_archive (
+            content_hash, media_type, mime_type, file_name, file_size,
+            object_key, object_expires_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp() + interval '3 days')
+        ON CONFLICT (content_hash) DO UPDATE SET
+            object_key = CASE
+                WHEN media_archive.object_key IS NOT NULL
+                 AND media_archive.object_expires_at > clock_timestamp() + interval '1 hour'
+                THEN media_archive.object_key
+                ELSE EXCLUDED.object_key
+            END,
+            object_expires_at = CASE
+                WHEN media_archive.object_key IS NOT NULL
+                 AND media_archive.object_expires_at > clock_timestamp() + interval '1 hour'
+                THEN media_archive.object_expires_at
+                ELSE EXCLUDED.object_expires_at
+            END
+        RETURNING id, object_key
+        "#,
+    )
+    .bind(&archive.content_hash)
+    .bind(&archive.media_type)
+    .bind(archive.mime_type.as_deref())
+    .bind(archive.file_name.as_deref())
+    .bind(archive.file_size)
+    .bind(&archive.object_key)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !mark_ready_in(&mut tx, lease, canonical_event_id, archive_id).await? {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    tx.commit().await?;
+    Ok(Some((archive_id, object_key)))
+}
+
+async fn mark_ready_in(
+    conn: &mut sqlx::PgConnection,
+    lease: &LeaseGuard,
+    canonical_event_id: i64,
+    media_archive_id: i64,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(
+        r#"
+        UPDATE media_relay_jobs
+           SET status = 'READY',
+               media_archive_id = $2,
+               next_retry_at = NULL,
+               last_error_code = NULL,
+               updated_at = clock_timestamp()
+         WHERE canonical_event_id = $1
+           AND receiver_identity_id = $3
+           AND status = 'DOWNLOADING'
+        "#,
+    )
+    .bind(canonical_event_id)
+    .bind(media_archive_id)
+    .bind(lease.identity_id.get())
+    .execute(conn)
+    .await?
+    .rows_affected();
+    Ok(updated == 1)
+}
+
+/// delivery 看到的中转状态。`job_status = None` 表示该事件没有 job。
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MediaRelayStateRecord {
+    pub job_status: Option<String>,
+    pub job_error_code: Option<String>,
+    pub object_key: Option<String>,
+    pub media_type: Option<String>,
+    pub mime_type: Option<String>,
+    pub file_name: Option<String>,
+    pub file_size: Option<i64>,
+    /// 任务创建已超过 30 分钟（`MEDIA_RELAY_TIMEOUT` 的判据）。
+    pub timed_out: bool,
+}
+
+/// 经本租户的 `delivery_tasks → tenant_events` 找到 canonical event，再读它的 job。
+///
+/// `media_relay_jobs` 与 `media_archive` 是丙类表、不开 RLS，这里是 delivery 读它们的
+/// 唯一入口：任务与事件都在 `tenant_tx` 下按 `tenant_id` 过滤，别的租户的任务 id
+/// 传进来得到 `None`。
+pub async fn load_media_relay_for_task(
+    pool: &PgPool,
+    tenant: TenantId,
+    task_id: i64,
+) -> Result<Option<MediaRelayStateRecord>, sqlx::Error> {
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query_as::<_, MediaRelayStateRecord>(
+                r#"
+                SELECT job.status AS job_status,
+                       job.last_error_code AS job_error_code,
+                       archive.object_key,
+                       archive.media_type,
+                       archive.mime_type,
+                       archive.file_name,
+                       archive.file_size,
+                       task.created_at < clock_timestamp() - interval '30 minutes' AS timed_out
+                  FROM delivery_tasks AS task
+                  JOIN tenant_events AS te
+                    ON te.tenant_id = task.tenant_id
+                   AND te.id = task.tenant_event_id
+                  LEFT JOIN media_relay_jobs AS job
+                    ON job.canonical_event_id = te.canonical_event_id
+                  LEFT JOIN media_archive AS archive
+                    ON archive.id = job.media_archive_id
+                 WHERE task.tenant_id = $1
+                   AND task.id = $2
+                "#,
+            )
+            .bind(tenant.get())
+            .bind(task_id)
+            .fetch_optional(&mut *conn)
+            .await
+        })
+    })
+    .await
+}
+
+/// 媒体还没下载好：把 `SENDING` 的任务放回 `PENDING` 推后再看，不计尝试、不写投递日志。
+pub async fn defer_delivery_task(
+    pool: &PgPool,
+    tenant: TenantId,
+    task_id: i64,
+    delay_seconds: i64,
+) -> Result<bool, sqlx::Error> {
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            let updated = sqlx::query(
+                r#"
+                UPDATE delivery_tasks
+                   SET status = 'PENDING',
+                       next_retry_at = clock_timestamp() + make_interval(secs => $3),
+                       updated_at = clock_timestamp()
+                 WHERE tenant_id = $1
+                   AND id = $2
+                   AND status = 'SENDING'
+                "#,
+            )
+            .bind(tenant.get())
+            .bind(task_id)
+            .bind(delay_seconds as f64)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+            Ok(updated == 1)
         })
     })
     .await

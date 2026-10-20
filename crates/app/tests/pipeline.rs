@@ -335,6 +335,8 @@ async fn pipeline_fanout_rule_match_and_delivery_outbox_are_idempotent(admin: Pg
             target_tg_chat_id: -2001,
             sender_identity_id: receiver_identity,
             action: "FORWARD".to_owned(),
+            media_relay: false,
+            dead_error_code: None,
             payload_snapshot: serde_json::json!({
                 "source": {"tg_chat_id": -9991, "tg_message_id": 99, "media_type": "PHOTO"},
                 "message": {"text": "changed", "parse_mode": "HTML"}

@@ -105,6 +105,8 @@ impl DeliveryProcess {
             .env("TGM_LOCAL_KEK", LOCAL_KEK)
             .env("TGM_S3_ENDPOINT", "http://127.0.0.1:59000")
             .env("TGM_S3_BUCKET", "tgm-soak")
+            .env("TGM_S3_ACCESS_KEY_ID", "minioadmin")
+            .env("TGM_S3_SECRET_ACCESS_KEY", "minioadmin")
             .env("TGM_PLATFORM_API_ID", required("TGM_PLATFORM_API_ID"))
             .env("TGM_PLATFORM_API_HASH", required("TGM_PLATFORM_API_HASH"))
             .stdin(Stdio::null())

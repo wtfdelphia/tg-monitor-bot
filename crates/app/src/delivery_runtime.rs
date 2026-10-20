@@ -36,6 +36,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::delivery::{DeliveryWorker, DeliveryWorkerConfig, TelegramDeliveryTransport};
+use crate::media_relay::MediaStore;
 
 /// 收到退出信号后等在途发送身份收尾的上限（ops/00 §六）。
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
@@ -45,6 +46,8 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 pub struct PlatformApp {
     pub api_id: i32,
     pub api_hash: Arc<Secret<String>>,
+    /// 跨身份媒体中转的对象存储（片 2）。
+    pub media_store: MediaStore,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,7 +250,10 @@ pub async fn run_sender(
         pool.clone(),
         tenant,
         identity,
-        Arc::new(TelegramDeliveryTransport::new(Arc::clone(&client))),
+        Arc::new(TelegramDeliveryTransport::new(
+            Arc::clone(&client),
+            app.media_store.clone(),
+        )),
         config.worker,
     );
     let result = worker.run(shutdown).await;

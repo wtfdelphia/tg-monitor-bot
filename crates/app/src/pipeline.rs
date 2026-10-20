@@ -8,7 +8,7 @@ use tgm_db::repo::{
     DeliveryTaskInput, DeliveryTaskWrite, RuleConditionRecord, RuleRecord, TenantEventRecord,
     enqueue_delivery_tasks, fanout_canonical_event, list_all_active_tenants,
     list_unfanned_canonical_event_ids, list_unprocessed_tenant_event_ids, load_enabled_rules,
-    load_rule_version, load_tenant_event, mark_canonical_event_fanned_out,
+    load_rule_version, load_tenant_event, load_tenant_plan, mark_canonical_event_fanned_out,
 };
 use tokio::sync::watch;
 
@@ -279,6 +279,7 @@ pub async fn process_tenant_event(
     }
 
     let rules_with_conditions = load_enabled_rules(pool, tenant).await?;
+    let plan = load_tenant_plan(pool, tenant).await?;
     let event = to_rule_event(&event_record);
     let mut rules = Vec::with_capacity(rules_with_conditions.len());
     let mut raw_rules = HashMap::with_capacity(rules_with_conditions.len());
@@ -304,6 +305,12 @@ pub async fn process_tenant_event(
         let version = load_rule_version(pool, tenant, matched.rule_id, matched.rule_version)
             .await?
             .ok_or(AppError::NotFound)?;
+        let media = media_route(
+            &plan,
+            matched.action,
+            event_record.media_type.as_deref(),
+            event_record.file_size,
+        );
         tasks.push(DeliveryTaskInput {
             rule_id: matched.rule_id,
             rule_version: matched.rule_version,
@@ -314,7 +321,10 @@ pub async fn process_tenant_event(
                 &event_record,
                 &version.snapshot,
                 &matched_keywords,
+                media == MediaRoute::TextOnly,
             )?,
+            media_relay: media == MediaRoute::Relay,
+            dead_error_code: (media == MediaRoute::TooLarge).then(|| "MEDIA_TOO_LARGE".to_owned()),
         });
     }
     let writes =
@@ -325,6 +335,38 @@ pub async fn process_tenant_event(
         matched_rule_ids: matches.iter().map(|matched| matched.rule_id).collect(),
         tasks: writes,
     })
+}
+
+/// 一条命中任务的媒体怎么走（片 2 批准记录第 1、5 条与 free 档口径）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaRoute {
+    /// 文字消息或 FORWARD：沿用原路径。FORWARD 读不到源消息仍判永久失败，不回落到中转。
+    Direct,
+    /// free 档 COPY / RESEND 的媒体：只发文字。
+    TextOnly,
+    /// pro 档 COPY / RESEND 的媒体：跨身份中转。
+    Relay,
+    /// pro 档但已知超过单文件上限：入队即判死。
+    TooLarge,
+}
+
+pub fn media_route(
+    plan: &str,
+    action: RuleAction,
+    media_type: Option<&str>,
+    file_size: Option<i64>,
+) -> MediaRoute {
+    let is_media = media_type.is_some_and(|media_type| media_type != "TEXT");
+    if !is_media || action == RuleAction::Forward {
+        return MediaRoute::Direct;
+    }
+    if plan != "pro" {
+        return MediaRoute::TextOnly;
+    }
+    if file_size.is_some_and(|size| size > crate::media_relay::MEDIA_RELAY_MAX_BYTES) {
+        return MediaRoute::TooLarge;
+    }
+    MediaRoute::Relay
 }
 
 fn to_rule_event(record: &TenantEventRecord) -> RuleEvent {
@@ -427,5 +469,62 @@ mod worker_tests {
             next_worker_retry_delay(MAX_WORKER_RETRY_DELAY, Duration::from_secs(1)),
             MAX_WORKER_RETRY_DELAY
         );
+    }
+}
+
+#[cfg(test)]
+mod media_route_tests {
+    use super::{MediaRoute, media_route};
+    use crate::rule::RuleAction;
+
+    #[test]
+    fn routes_follow_plan_action_and_size() {
+        const LIMIT: i64 = 50 * 1024 * 1024;
+        let photo = (Some("PHOTO"), Some(10));
+        let cases = [
+            ("pro", RuleAction::Copy, photo, MediaRoute::Relay),
+            ("pro", RuleAction::Resend, photo, MediaRoute::Relay),
+            ("pro", RuleAction::Forward, photo, MediaRoute::Direct),
+            ("free", RuleAction::Copy, photo, MediaRoute::TextOnly),
+            ("free", RuleAction::Forward, photo, MediaRoute::Direct),
+            (
+                "pro",
+                RuleAction::Copy,
+                (Some("TEXT"), None),
+                MediaRoute::Direct,
+            ),
+            ("free", RuleAction::Copy, (None, None), MediaRoute::Direct),
+            (
+                "pro",
+                RuleAction::Copy,
+                (Some("VIDEO"), Some(LIMIT + 1)),
+                MediaRoute::TooLarge,
+            ),
+            (
+                "pro",
+                RuleAction::Copy,
+                (Some("VIDEO"), Some(LIMIT)),
+                MediaRoute::Relay,
+            ),
+            (
+                "pro",
+                RuleAction::Copy,
+                (Some("PHOTO"), None),
+                MediaRoute::Relay,
+            ),
+            (
+                "free",
+                RuleAction::Copy,
+                (Some("VIDEO"), Some(LIMIT + 1)),
+                MediaRoute::TextOnly,
+            ),
+        ];
+        for (plan, action, (media_type, file_size), expected) in cases {
+            assert_eq!(
+                media_route(plan, action, media_type, file_size),
+                expected,
+                "{plan} {action:?} {media_type:?} {file_size:?}"
+            );
+        }
     }
 }
