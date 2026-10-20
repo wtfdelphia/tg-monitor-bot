@@ -3438,14 +3438,162 @@ pub async fn list_unfanned_canonical_event_ids(
     limit: i64,
 ) -> Result<Vec<i64>, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(
-        "SELECT id
-           FROM canonical_events
-          WHERE NOT fanned_out
-          ORDER BY created_at, id
+        "SELECT event.id
+           FROM canonical_events AS event
+          WHERE NOT event.fanned_out
+            AND (event.event_type <> 'MESSAGE_CREATED' OR event.media_group_id IS NULL
+                 OR (EXISTS (
+                     SELECT 1 FROM canonical_events AS completed
+                      WHERE completed.receiver_identity_id = event.receiver_identity_id
+                        AND completed.tg_chat_id = event.tg_chat_id
+                        AND completed.media_group_id = event.media_group_id
+                        AND completed.event_type = 'MEDIA_GROUP_COMPLETED')
+                     AND NOT EXISTS (
+                         SELECT 1 FROM media_group_members AS member
+                          WHERE member.member_event_id = event.id)))
+          ORDER BY event.created_at, event.id
           LIMIT $1",
     )
     .bind(limit)
     .fetch_all(pool)
+    .await
+}
+
+pub async fn aggregate_ready_media_groups(pool: &PgPool, limit: i64) -> Result<(), sqlx::Error> {
+    let candidates = sqlx::query_scalar::<_, i64>(
+        "SELECT min(event.id)
+           FROM canonical_events AS event
+          WHERE event.event_type = 'MESSAGE_CREATED'
+            AND event.media_group_id IS NOT NULL
+            AND NOT event.fanned_out
+            AND NOT EXISTS (
+                SELECT 1 FROM canonical_events AS completed
+                 WHERE completed.receiver_identity_id = event.receiver_identity_id
+                   AND completed.tg_chat_id = event.tg_chat_id
+                   AND completed.media_group_id = event.media_group_id
+                   AND completed.event_type = 'MEDIA_GROUP_COMPLETED')
+          GROUP BY event.receiver_identity_id, event.tg_chat_id, event.media_group_id
+         HAVING max(event.created_at) <= clock_timestamp() - interval '2 seconds'
+          ORDER BY min(event.created_at), min(event.id)
+          LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    for candidate in candidates {
+        let mut tx = pool.begin().await?;
+        let Some((identity, chat, group)) = sqlx::query_as::<_, (i64, i64, String)>(
+            "SELECT receiver_identity_id, tg_chat_id, media_group_id
+               FROM canonical_events WHERE id = $1",
+        )
+        .bind(candidate)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            continue;
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("media-group:{identity}:{chat}:{group}"))
+            .execute(&mut *tx)
+            .await?;
+        let members = sqlx::query_as::<_, MediaGroupMemberRecord>(
+            "SELECT event.id, event.tg_message_id, event.media_type, event.file_size
+               FROM canonical_events AS event
+              WHERE event.receiver_identity_id = $1 AND event.tg_chat_id = $2
+                AND event.media_group_id = $3 AND event.event_type = 'MESSAGE_CREATED'
+                AND NOT event.fanned_out
+                AND NOT EXISTS (
+                    SELECT 1 FROM canonical_events AS completed
+                     WHERE completed.receiver_identity_id = $1 AND completed.tg_chat_id = $2
+                       AND completed.media_group_id = $3
+                       AND completed.event_type = 'MEDIA_GROUP_COMPLETED')
+                AND NOT EXISTS (
+                    SELECT 1 FROM canonical_events AS recent
+                     WHERE recent.receiver_identity_id = $1 AND recent.tg_chat_id = $2
+                       AND recent.media_group_id = $3 AND recent.event_type = 'MESSAGE_CREATED'
+                       AND recent.created_at > clock_timestamp() - interval '2 seconds')
+              ORDER BY event.tg_message_id, event.id
+              FOR UPDATE OF event",
+        )
+        .bind(identity)
+        .bind(chat)
+        .bind(&group)
+        .fetch_all(&mut *tx)
+        .await?;
+        let Some(first) = members.first() else {
+            tx.commit().await?;
+            continue;
+        };
+        let member_ids: Vec<_> = members.iter().map(|member| member.id).collect();
+        let group_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO canonical_events (
+                 adapter, receiver_identity_id, tg_chat_id, tg_message_id, event_type,
+                 media_group_id, sender_id, message_date, text, caption, media_type, file_size)
+             SELECT adapter, receiver_identity_id, tg_chat_id, tg_message_id,
+                    'MEDIA_GROUP_COMPLETED', media_group_id, sender_id, message_date,
+                    (SELECT text FROM canonical_events WHERE id = ANY($2) AND text <> ''
+                      ORDER BY tg_message_id, id LIMIT 1),
+                    (SELECT caption FROM canonical_events WHERE id = ANY($2) AND caption <> ''
+                      ORDER BY tg_message_id, id LIMIT 1),
+                    media_type,
+                    (SELECT max(file_size) FROM canonical_events WHERE id = ANY($2))
+               FROM canonical_events WHERE id = $1
+             ON CONFLICT (receiver_identity_id, tg_chat_id, tg_message_id, event_type, edit_version)
+             DO NOTHING RETURNING id",
+        )
+        .bind(first.id)
+        .bind(&member_ids)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(group_id) = group_id {
+            sqlx::query(
+                "INSERT INTO media_group_members (group_event_id, member_event_id, position)
+                 SELECT $1, member.id, (member.position - 1)::integer
+                   FROM unnest($2::bigint[]) WITH ORDINALITY AS member(id, position)",
+            )
+            .bind(group_id)
+            .bind(&member_ids)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE canonical_events SET fanned_out = TRUE WHERE id = ANY($1)")
+                .bind(&member_ids)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MediaGroupMemberRecord {
+    pub id: i64,
+    pub tg_message_id: i64,
+    pub media_type: Option<String>,
+    pub file_size: Option<i64>,
+}
+
+pub async fn load_media_group_members(
+    pool: &PgPool,
+    tenant: TenantId,
+    tenant_event_id: i64,
+) -> Result<Vec<MediaGroupMemberRecord>, sqlx::Error> {
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query_as::<_, MediaGroupMemberRecord>(
+                "SELECT event.id, event.tg_message_id, event.media_type, event.file_size
+                   FROM tenant_events AS te
+                   JOIN media_group_members AS member ON member.group_event_id = te.canonical_event_id
+                   JOIN canonical_events AS event ON event.id = member.member_event_id
+                  WHERE te.tenant_id = $1 AND te.id = $2 ORDER BY member.position",
+            )
+            .bind(tenant.get())
+            .bind(tenant_event_id)
+            .fetch_all(&mut *conn)
+            .await
+        })
+    })
     .await
 }
 
@@ -3664,9 +3812,12 @@ pub async fn enqueue_delivery_tasks(
                 sqlx::query(
                     r#"
                     INSERT INTO media_relay_jobs (canonical_event_id, receiver_identity_id)
-                    SELECT ce.id, ce.receiver_identity_id
+                    SELECT member_event.id, member_event.receiver_identity_id
                       FROM tenant_events AS te
                       JOIN canonical_events AS ce ON ce.id = te.canonical_event_id
+                      LEFT JOIN media_group_members AS member ON member.group_event_id = ce.id
+                      JOIN canonical_events AS member_event
+                        ON member_event.id = COALESCE(member.member_event_id, ce.id)
                      WHERE te.tenant_id = $1
                        AND te.id = $2
                        AND ce.adapter = 'mtproto'
@@ -3703,7 +3854,9 @@ pub async fn enqueue_delivery_tasks(
                   FROM tenant_events AS te
                  WHERE te.tenant_id = $1
                    AND te.id = $3
-                   AND ce.id = te.canonical_event_id
+                   AND (ce.id = te.canonical_event_id OR ce.id IN (
+                       SELECT member_event_id FROM media_group_members
+                        WHERE group_event_id = te.canonical_event_id))
                 "#,
             )
             .bind(tenant.get())
@@ -4519,6 +4672,35 @@ pub async fn load_media_relay_for_task(
     .await
 }
 
+pub async fn load_media_group_relay_for_task(
+    pool: &PgPool,
+    tenant: TenantId,
+    task_id: i64,
+) -> Result<Vec<MediaRelayStateRecord>, sqlx::Error> {
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query_as::<_, MediaRelayStateRecord>(
+                "SELECT job.status AS job_status, job.last_error_code AS job_error_code,
+                        archive.object_key, archive.media_type, archive.mime_type,
+                        archive.file_name, archive.file_size,
+                        task.created_at < clock_timestamp() - interval '30 minutes' AS timed_out
+                   FROM delivery_tasks AS task
+                   JOIN tenant_events AS te
+                     ON te.tenant_id = task.tenant_id AND te.id = task.tenant_event_id
+                   JOIN media_group_members AS member ON member.group_event_id = te.canonical_event_id
+                   LEFT JOIN media_relay_jobs AS job ON job.canonical_event_id = member.member_event_id
+                   LEFT JOIN media_archive AS archive ON archive.id = job.media_archive_id
+                  WHERE task.tenant_id = $1 AND task.id = $2 ORDER BY member.position",
+            )
+            .bind(tenant.get())
+            .bind(task_id)
+            .fetch_all(&mut *conn)
+            .await
+        })
+    })
+    .await
+}
+
 /// 对象已过期、等待删对象的档案（spec/04 §一 `media_archive` 行：对象存储文件 3 天）。
 ///
 /// 只返回 `object_key`：调用方先删对象，删成功后再用 [`clear_media_archive_object`] 置空。
@@ -4668,8 +4850,10 @@ pub async fn insert_canonical_event(
     pool: &PgPool,
     event: &CanonicalEventInput,
 ) -> Result<CanonicalEventWrite, sqlx::Error> {
-    let mut conn = pool.acquire().await?;
-    insert_canonical_event_in(&mut conn, event).await
+    let mut tx = pool.begin().await?;
+    let written = insert_canonical_event_in(&mut tx, event).await?;
+    tx.commit().await?;
+    Ok(written)
 }
 
 /// 持租约写入规范化事件（spec/08 §4.3「所有写操作都带 token」）。
@@ -4695,6 +4879,16 @@ async fn insert_canonical_event_in(
     conn: &mut sqlx::PgConnection,
     event: &CanonicalEventInput,
 ) -> Result<CanonicalEventWrite, sqlx::Error> {
+    if let Some(group) = &event.media_group_id {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "media-group:{}:{}:{group}",
+                event.receiver_identity_id.get(),
+                event.tg_chat_id
+            ))
+            .execute(&mut *conn)
+            .await?;
+    }
     let inserted_id = sqlx::query_scalar!(
         r#"
         INSERT INTO canonical_events (

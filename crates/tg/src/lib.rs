@@ -10,7 +10,7 @@ pub mod client;
 pub mod session;
 
 pub use client::{
-    IncomingMessage, MediaDownload, MediaReader, TelegramClient, TelegramClientError,
+    AlbumMedia, IncomingMessage, MediaDownload, MediaReader, TelegramClient, TelegramClientError,
     TelegramDeliveryAction, UploadMedia, telegram_text_len,
 };
 pub use session::{StoredSession, StoredSessionError};

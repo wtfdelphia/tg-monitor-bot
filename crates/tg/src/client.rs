@@ -33,6 +33,8 @@ pub enum TelegramClientError {
     MessageNotReturned,
     #[error("Telegram random_id 必须为正整数: {0}")]
     InvalidRandomId(i64),
+    #[error("媒体组成员数或 random_id 无效")]
+    InvalidMediaGroup,
     #[error("当前适配器尚未支持媒体 COPY")]
     MediaCopyUnavailable,
     #[error("当前适配器尚未支持媒体 RESEND")]
@@ -278,11 +280,32 @@ impl TelegramClient {
         target_tg_chat_id: i64,
         telegram_random_id: i64,
     ) -> Result<i64, TelegramClientError> {
-        validate_random_id(telegram_random_id)?;
+        self.forward_media_group(
+            source_tg_chat_id,
+            &[source_tg_message_id],
+            target_tg_chat_id,
+            &[telegram_random_id],
+        )
+        .await?
+        .first()
+        .copied()
+        .ok_or(TelegramClientError::MessageNotReturned)
+    }
+
+    pub async fn forward_media_group(
+        &self,
+        source_tg_chat_id: i64,
+        source_message_ids: &[i64],
+        target_tg_chat_id: i64,
+        random_ids: &[i64],
+    ) -> Result<Vec<i64>, TelegramClientError> {
+        validate_media_group(source_message_ids.len(), random_ids)?;
         let source = self.resolve_peer_ref(source_tg_chat_id).await?;
         let target = self.resolve_peer_ref(target_tg_chat_id).await?;
-        let source_message_id = i32::try_from(source_tg_message_id)
-            .map_err(|_| TelegramClientError::MessageNotReturned)?;
+        let source_message_ids = source_message_ids
+            .iter()
+            .map(|id| i32::try_from(*id).map_err(|_| TelegramClientError::MessageNotReturned))
+            .collect::<Result<Vec<_>, _>>()?;
         let updates = self
             .client
             .invoke(&tl::functions::messages::ForwardMessages {
@@ -294,8 +317,8 @@ impl TelegramClient {
                 noforwards: false,
                 allow_paid_floodskip: false,
                 from_peer: source.into(),
-                id: vec![source_message_id],
-                random_id: vec![telegram_random_id],
+                id: source_message_ids,
+                random_id: random_ids.to_vec(),
                 to_peer: target.into(),
                 top_msg_id: None,
                 reply_to: None,
@@ -310,8 +333,13 @@ impl TelegramClient {
             })
             .await
             .map_err(TelegramClientError::Invocation)?;
-        message_id_for_random_id(&updates, telegram_random_id)
-            .ok_or(TelegramClientError::MessageNotReturned)
+        random_ids
+            .iter()
+            .map(|random_id| {
+                message_id_for_random_id(&updates, *random_id)
+                    .ok_or(TelegramClientError::MessageNotReturned)
+            })
+            .collect()
     }
 
     pub async fn deliver_text_or_forward(
@@ -376,11 +404,46 @@ impl TelegramClient {
     ) -> Result<i64, TelegramClientError> {
         validate_random_id(telegram_random_id)?;
         let target = self.resolve_peer_ref(target_tg_chat_id).await?;
-        let file_name = media
-            .file_name
-            .clone()
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "file".to_owned());
+        let input_media = self.upload_input_media(stream, size, media).await?;
+        let (message, entities) = parsers::parse_html_message(caption_html);
+        let updates = self
+            .client
+            .invoke(&tl::functions::messages::SendMedia {
+                silent: false,
+                background: false,
+                clear_draft: false,
+                peer: target.into(),
+                reply_to: None,
+                media: input_media,
+                message,
+                random_id: telegram_random_id,
+                reply_markup: None,
+                entities: (!entities.is_empty()).then_some(entities),
+                schedule_date: None,
+                schedule_repeat_period: None,
+                send_as: None,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_floodskip: false,
+                allow_paid_stars: None,
+                suggested_post: None,
+            })
+            .await
+            .map_err(TelegramClientError::Invocation)?;
+        message_id_for_random_id(&updates, telegram_random_id)
+            .ok_or(TelegramClientError::MessageNotReturned)
+    }
+
+    async fn upload_input_media<S: tokio::io::AsyncRead + Unpin>(
+        &self,
+        stream: &mut S,
+        size: usize,
+        media: &UploadMedia,
+    ) -> Result<tl::enums::InputMedia, TelegramClientError> {
+        let file_name = media.upload_file_name().to_owned();
         let uploaded = self
             .client
             .upload_stream(stream, size, file_name.clone())
@@ -415,22 +478,101 @@ impl TelegramClient {
             }
             .into()
         };
-        let (message, entities) = parsers::parse_html_message(caption_html);
+        Ok(input_media)
+    }
+
+    pub async fn prepare_album_media<S: tokio::io::AsyncRead + Unpin>(
+        &self,
+        target_tg_chat_id: i64,
+        stream: &mut S,
+        size: usize,
+        media: &UploadMedia,
+    ) -> Result<AlbumMedia, TelegramClientError> {
+        let target = self.resolve_peer_ref(target_tg_chat_id).await?;
+        let input = self.upload_input_media(stream, size, media).await?;
+        let uploaded = self
+            .client
+            .invoke(&tl::functions::messages::UploadMedia {
+                business_connection_id: None,
+                peer: target.into(),
+                media: input,
+            })
+            .await
+            .map_err(TelegramClientError::Invocation)?;
+        let media = match uploaded {
+            tl::enums::MessageMedia::Photo(photo) => match photo.photo {
+                Some(tl::enums::Photo::Photo(photo)) => tl::types::InputMediaPhoto {
+                    spoiler: false,
+                    live_photo: false,
+                    id: tl::types::InputPhoto {
+                        id: photo.id,
+                        access_hash: photo.access_hash,
+                        file_reference: photo.file_reference,
+                    }
+                    .into(),
+                    ttl_seconds: None,
+                    video: None,
+                }
+                .into(),
+                _ => return Err(TelegramClientError::SourceMediaMissing),
+            },
+            tl::enums::MessageMedia::Document(document) => match document.document {
+                Some(tl::enums::Document::Document(document)) => tl::types::InputMediaDocument {
+                    spoiler: false,
+                    id: tl::types::InputDocument {
+                        id: document.id,
+                        access_hash: document.access_hash,
+                        file_reference: document.file_reference,
+                    }
+                    .into(),
+                    ttl_seconds: None,
+                    query: None,
+                    video_cover: None,
+                    video_timestamp: None,
+                }
+                .into(),
+                _ => return Err(TelegramClientError::SourceMediaMissing),
+            },
+            _ => return Err(TelegramClientError::SourceMediaMissing),
+        };
+        Ok(AlbumMedia { media })
+    }
+
+    pub async fn send_media_group(
+        &self,
+        target_tg_chat_id: i64,
+        random_ids: &[i64],
+        media: Vec<AlbumMedia>,
+        caption_html: &str,
+    ) -> Result<Vec<i64>, TelegramClientError> {
+        validate_media_group(media.len(), random_ids)?;
+        let target = self.resolve_peer_ref(target_tg_chat_id).await?;
+        let multi_media = media
+            .into_iter()
+            .zip(random_ids)
+            .enumerate()
+            .map(|(position, (media, random_id))| {
+                let (message, entities) =
+                    parsers::parse_html_message(if position == 0 { caption_html } else { "" });
+                tl::types::InputSingleMedia {
+                    media: media.media,
+                    random_id: *random_id,
+                    message,
+                    entities: (!entities.is_empty()).then_some(entities),
+                }
+                .into()
+            })
+            .collect();
         let updates = self
             .client
-            .invoke(&tl::functions::messages::SendMedia {
+            .invoke(&tl::functions::messages::SendMultiMedia {
                 silent: false,
                 background: false,
                 clear_draft: false,
                 peer: target.into(),
                 reply_to: None,
-                media: input_media,
-                message,
-                random_id: telegram_random_id,
-                reply_markup: None,
-                entities: (!entities.is_empty()).then_some(entities),
+                multi_media,
                 schedule_date: None,
-                schedule_repeat_period: None,
                 send_as: None,
                 noforwards: false,
                 update_stickersets_order: false,
@@ -439,12 +581,16 @@ impl TelegramClient {
                 effect: None,
                 allow_paid_floodskip: false,
                 allow_paid_stars: None,
-                suggested_post: None,
             })
             .await
             .map_err(TelegramClientError::Invocation)?;
-        message_id_for_random_id(&updates, telegram_random_id)
-            .ok_or(TelegramClientError::MessageNotReturned)
+        random_ids
+            .iter()
+            .map(|random_id| {
+                message_id_for_random_id(&updates, *random_id)
+                    .ok_or(TelegramClientError::MessageNotReturned)
+            })
+            .collect()
     }
 
     /// 把更新流状态同步进 session 后取快照。输出含 auth key，只能交给信封加密落库。
@@ -528,6 +674,71 @@ pub struct MediaReader {
 }
 
 impl MediaReader {
+    pub async fn read_media_group(
+        &self,
+        source_tg_chat_id: i64,
+        first_message_id: i64,
+    ) -> Result<Vec<IncomingMessage>, TelegramClientError> {
+        let first = self
+            .read_messages(source_tg_chat_id, &[first_message_id])
+            .await?;
+        let group = first
+            .first()
+            .and_then(|message| message.grouped_id)
+            .ok_or(TelegramClientError::InvalidMediaGroup)?;
+        let offset = i32::try_from(
+            first_message_id
+                .checked_sub(1)
+                .ok_or(TelegramClientError::SourceMessageMissing)?,
+        )
+        .map_err(|_| TelegramClientError::SourceMessageMissing)?;
+        let peer = resolve_peer_ref(&self.client, &self.session, source_tg_chat_id).await?;
+        let mut history = self
+            .client
+            .iter_messages(peer)
+            .offset_id(offset)
+            .reverse(true)
+            .limit(10);
+        let mut members = Vec::new();
+        while let Some(message) = history
+            .next()
+            .await
+            .map_err(TelegramClientError::Invocation)?
+        {
+            if message.grouped_id() != Some(group) {
+                break;
+            }
+            members.push(
+                incoming_from_raw(&message.raw, false)
+                    .ok_or(TelegramClientError::SourceMessageMissing)?,
+            );
+        }
+        Ok(members)
+    }
+
+    pub async fn read_messages(
+        &self,
+        source_tg_chat_id: i64,
+        message_ids: &[i64],
+    ) -> Result<Vec<IncomingMessage>, TelegramClientError> {
+        let source = resolve_peer_ref(&self.client, &self.session, source_tg_chat_id).await?;
+        let ids = message_ids
+            .iter()
+            .map(|id| i32::try_from(*id).map_err(|_| TelegramClientError::SourceMessageMissing))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.client
+            .get_messages_by_id(source, &ids)
+            .await
+            .map_err(TelegramClientError::Invocation)?
+            .into_iter()
+            .map(|message| {
+                let message = message.ok_or(TelegramClientError::SourceMessageMissing)?;
+                incoming_from_raw(&message.raw, false)
+                    .ok_or(TelegramClientError::SourceMessageMissing)
+            })
+            .collect()
+    }
+
     /// 重新取一次源消息，拿当前有效的 `file_reference`，返回分片下载流。
     ///
     /// 不缓存旧消息里的媒体引用：`file_reference` 会过期，每次下载都现取。
@@ -579,6 +790,24 @@ pub struct UploadMedia {
     pub media_type: String,
     pub mime_type: Option<String>,
     pub file_name: Option<String>,
+}
+
+impl UploadMedia {
+    fn upload_file_name(&self) -> &str {
+        self.file_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(if self.media_type == "PHOTO" {
+                "photo.jpg"
+            } else {
+                "file"
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AlbumMedia {
+    media: tl::enums::InputMedia,
 }
 
 /// HTML 解析后 Telegram 计长度用的纯文本长度（UTF-16 码元）。
@@ -803,6 +1032,11 @@ impl TelegramClientError {
                 message: Some(self.to_string()),
                 flood_wait_seconds: None,
             },
+            Self::InvalidMediaGroup => TelegramDeliveryError {
+                code: "MEDIA_GROUP_INVALID".to_owned(),
+                message: Some(self.to_string()),
+                flood_wait_seconds: None,
+            },
             _ => TelegramDeliveryError {
                 code: "TELEGRAM_CLIENT_ERROR".to_owned(),
                 message: Some(self.to_string()),
@@ -821,6 +1055,19 @@ fn peer_ref(tg_chat_id: i64) -> Result<PeerRef, TelegramClientError> {
 fn validate_random_id(random_id: i64) -> Result<(), TelegramClientError> {
     if random_id <= 0 {
         return Err(TelegramClientError::InvalidRandomId(random_id));
+    }
+    Ok(())
+}
+
+fn validate_media_group(count: usize, random_ids: &[i64]) -> Result<(), TelegramClientError> {
+    if !(1..=10).contains(&count) || random_ids.len() != count {
+        return Err(TelegramClientError::InvalidMediaGroup);
+    }
+    for (position, random_id) in random_ids.iter().enumerate() {
+        validate_random_id(*random_id)?;
+        if random_ids[..position].contains(random_id) {
+            return Err(TelegramClientError::InvalidMediaGroup);
+        }
     }
     Ok(())
 }
@@ -854,6 +1101,43 @@ mod tests {
         let result = TelegramClientConfig::new(0);
 
         assert!(matches!(result, Err(TelegramClientError::InvalidApiId)));
+    }
+
+    #[test]
+    fn unnamed_photos_use_a_jpeg_extension_for_upload() {
+        for file_name in [None, Some(String::new())] {
+            let mut media = super::UploadMedia {
+                media_type: "PHOTO".to_owned(),
+                mime_type: None,
+                file_name,
+            };
+            assert_eq!(media.upload_file_name(), "photo.jpg");
+            media.media_type = "DOCUMENT".to_owned();
+            assert_eq!(media.upload_file_name(), "file");
+        }
+        for media_type in ["PHOTO", "DOCUMENT"] {
+            let media = super::UploadMedia {
+                media_type: media_type.to_owned(),
+                mime_type: None,
+                file_name: Some("original.png".to_owned()),
+            };
+            assert_eq!(media.upload_file_name(), "original.png");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_album_vectors_before_network() {
+        for (count, ids) in [
+            (0, vec![]),
+            (11, vec![1; 11]),
+            (2, vec![1]),
+            (2, vec![1, 1]),
+            (2, vec![1, 0]),
+            (2, vec![1, -1]),
+        ] {
+            assert!(super::validate_media_group(count, &ids).is_err());
+        }
+        assert!(super::validate_media_group(3, &[1, 2, 3]).is_ok());
     }
 
     #[test]

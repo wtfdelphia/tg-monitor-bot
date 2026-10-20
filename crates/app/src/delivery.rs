@@ -10,9 +10,9 @@ use tgm_core::error::AppError;
 use tgm_core::ids::IdentityId;
 use tgm_db::repo::{
     DeliveryTaskFailureInput, DeliveryTaskFailureStatus, DeliveryTaskPayloadRecord,
-    claim_due_delivery_task, complete_delivery_task, defer_delivery_task,
-    load_delivery_task_payload, load_media_relay_for_task, record_delivery_failure,
-    recover_stale_delivery_tasks,
+    MediaRelayStateRecord, claim_due_delivery_task, complete_delivery_task, defer_delivery_task,
+    load_delivery_task_payload, load_media_group_relay_for_task, load_media_relay_for_task,
+    record_delivery_failure, recover_stale_delivery_tasks,
 };
 use tgm_tg::{TelegramClient, TelegramDeliveryAction, UploadMedia, telegram_text_len};
 
@@ -61,6 +61,7 @@ pub struct DeliveryPayload {
     pub text_only: bool,
     /// pro 档跨身份中转：已下载到对象存储的媒体。`None` = 不走中转。
     pub media: Option<DeliveryMedia>,
+    pub media_group: Vec<DeliveryMedia>,
 }
 
 /// 中转 job 就绪后 delivery 要上传的对象。
@@ -78,6 +79,8 @@ pub struct DeliverySourceMessage {
     pub tg_chat_id: i64,
     pub tg_message_id: i64,
     pub media_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_message_ids: Vec<i64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -122,6 +125,11 @@ pub fn split_text_random_id(random_id: i64) -> i64 {
     if derived == 0 { 1 } else { derived }
 }
 
+pub fn media_group_random_id(random_id: i64, position: usize) -> i64 {
+    let offset = position as u64;
+    (((random_id as u64 - 1 + offset) % i64::MAX as u64) + 1) as i64
+}
+
 fn send_error(code: &str, message: impl Into<String>) -> DeliverySendError {
     DeliverySendError {
         code: code.to_owned(),
@@ -159,6 +167,72 @@ pub struct TelegramDeliveryTransport {
 impl TelegramDeliveryTransport {
     pub fn new(client: Arc<TelegramClient>, store: MediaStore) -> Self {
         Self { client, store }
+    }
+
+    async fn deliver_media_group(
+        &self,
+        payload: &DeliveryPayload,
+    ) -> Result<i64, DeliverySendError> {
+        if let [media] = payload.media_group.as_slice() {
+            return self.deliver_media(payload, media).await;
+        }
+        let plan = caption_plan(telegram_text_len(&payload.message.text));
+        if plan == CaptionPlan::TooLong {
+            return Err(send_error(
+                "MESSAGE_TOO_LONG",
+                "说明超过文本消息上限，不截断",
+            ));
+        }
+        let random_ids: Vec<_> = (0..payload.media_group.len())
+            .map(|position| media_group_random_id(payload.telegram_random_id, position))
+            .collect();
+        let mut uploaded = Vec::with_capacity(payload.media_group.len());
+        for media in &payload.media_group {
+            let (mut reader, size) = self
+                .store
+                .get_stream(&media.object_key)
+                .await
+                .map_err(|error| send_error("MEDIA_STORE_FAILED", error.to_string()))?;
+            uploaded.push(
+                self.client
+                    .prepare_album_media(
+                        payload.target_tg_chat_id,
+                        &mut reader,
+                        size,
+                        &UploadMedia {
+                            media_type: media.media_type.clone(),
+                            mime_type: media.mime_type.clone(),
+                            file_name: media.file_name.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(tg_send_error)?,
+            );
+        }
+        let caption = if plan == CaptionPlan::Single {
+            payload.message.text.as_str()
+        } else {
+            ""
+        };
+        let message_ids = self
+            .client
+            .send_media_group(payload.target_tg_chat_id, &random_ids, uploaded, caption)
+            .await
+            .map_err(tg_send_error)?;
+        if plan == CaptionPlan::Split {
+            self.client
+                .copy_text(
+                    payload.target_tg_chat_id,
+                    split_text_random_id(payload.telegram_random_id),
+                    &payload.message.text,
+                )
+                .await
+                .map_err(tg_send_error)?;
+        }
+        message_ids
+            .first()
+            .copied()
+            .ok_or_else(|| send_error("MESSAGE_NOT_RETURNED", "相册没有返回消息"))
     }
 
     async fn deliver_media(
@@ -216,6 +290,28 @@ impl TelegramDeliveryTransport {
 #[async_trait::async_trait]
 impl DeliveryTransport for TelegramDeliveryTransport {
     async fn deliver(&self, payload: DeliveryPayload) -> Result<i64, DeliverySendError> {
+        if !payload.media_group.is_empty() {
+            return self.deliver_media_group(&payload).await;
+        }
+        if payload.action == DeliveryAction::Forward && !payload.source.group_message_ids.is_empty()
+        {
+            let random_ids: Vec<_> = (0..payload.source.group_message_ids.len())
+                .map(|position| media_group_random_id(payload.telegram_random_id, position))
+                .collect();
+            return self
+                .client
+                .forward_media_group(
+                    payload.source.tg_chat_id,
+                    &payload.source.group_message_ids,
+                    payload.target_tg_chat_id,
+                    &random_ids,
+                )
+                .await
+                .map_err(tg_send_error)?
+                .first()
+                .copied()
+                .ok_or_else(|| send_error("MESSAGE_NOT_RETURNED", "转发相册没有返回消息"));
+        }
         if let Some(media) = &payload.media {
             return self.deliver_media(&payload, media).await;
         }
@@ -432,6 +528,7 @@ pub fn build_delivery_payload(
         message: snapshot.message,
         text_only: snapshot.text_only,
         media: None,
+        media_group: Vec::new(),
     })
 }
 
@@ -453,12 +550,27 @@ pub(crate) fn freeze_delivery_snapshot(
     rule_snapshot: &Value,
     matched_keywords: &[String],
     text_only: bool,
+    members: &[tgm_db::repo::MediaGroupMemberRecord],
 ) -> Result<Value, AppError> {
     let replacements = parse_replacements(Some(rule_snapshot))?;
     let placeholder = (text_only
         && event.text.as_deref().unwrap_or_default().is_empty()
         && event.caption.as_deref().unwrap_or_default().is_empty())
-    .then(|| media_placeholder(event));
+    .then(|| {
+        if members.is_empty() {
+            media_placeholder(event)
+        } else {
+            format!(
+                "[媒体组：{} 项] {}",
+                members.len(),
+                message_link(
+                    event.username.as_deref(),
+                    event.tg_chat_id,
+                    event.tg_message_id
+                )
+            )
+        }
+    });
     let message = render_delivery_message(DeliveryRenderInput {
         template: rule_snapshot
             .get("rule")
@@ -479,6 +591,7 @@ pub(crate) fn freeze_delivery_snapshot(
             tg_chat_id: event.tg_chat_id,
             tg_message_id: event.tg_message_id,
             media_type: event.media_type.clone(),
+            group_message_ids: members.iter().map(|member| member.tg_message_id).collect(),
         },
         message,
         text_only,
@@ -502,17 +615,14 @@ enum RelayDecision {
     Dead(String),
 }
 
-async fn decide_media_relay(
-    pool: &PgPool,
-    tenant: tgm_core::ids::TenantId,
-    task_id: i64,
-) -> Result<RelayDecision, AppError> {
-    let Some(state) = load_media_relay_for_task(pool, tenant, task_id).await? else {
-        return Ok(RelayDecision::Dead("MEDIA_RELAY_UNAVAILABLE".to_owned()));
-    };
-    let decision = match state.job_status.as_deref() {
-        // 没有 job：事件不是 MTProto 采集的，或任务早于片 2 入队。
+fn relay_state_decision(state: MediaRelayStateRecord) -> RelayDecision {
+    match state.job_status.as_deref() {
         None => RelayDecision::Dead("MEDIA_RELAY_UNAVAILABLE".to_owned()),
+        Some("DEAD") => RelayDecision::Dead(
+            state
+                .job_error_code
+                .unwrap_or_else(|| "MEDIA_RELAY_FAILED".to_owned()),
+        ),
         Some("READY") => match state.object_key {
             Some(object_key) => RelayDecision::Send(DeliveryMedia {
                 object_key,
@@ -522,15 +632,20 @@ async fn decide_media_relay(
             }),
             None => RelayDecision::Dead("MEDIA_RELAY_UNAVAILABLE".to_owned()),
         },
-        Some("DEAD") => RelayDecision::Dead(
-            state
-                .job_error_code
-                .unwrap_or_else(|| "MEDIA_RELAY_FAILED".to_owned()),
-        ),
         Some(_) if state.timed_out => RelayDecision::Dead("MEDIA_RELAY_TIMEOUT".to_owned()),
         Some(_) => RelayDecision::Wait,
+    }
+}
+
+async fn decide_media_relay(
+    pool: &PgPool,
+    tenant: tgm_core::ids::TenantId,
+    task_id: i64,
+) -> Result<RelayDecision, AppError> {
+    let Some(state) = load_media_relay_for_task(pool, tenant, task_id).await? else {
+        return Ok(RelayDecision::Dead("MEDIA_RELAY_UNAVAILABLE".to_owned()));
     };
-    Ok(decision)
+    Ok(relay_state_decision(state))
 }
 
 async fn record_dead(
@@ -590,7 +705,33 @@ pub async fn run_delivery_once<T: DeliveryTransport + ?Sized>(
             .await;
         }
     };
-    if needs_media_relay(&payload) {
+    if needs_media_relay(&payload) && !payload.source.group_message_ids.is_empty() {
+        let states = load_media_group_relay_for_task(pool, tenant, task.id).await?;
+        if states.len() != payload.source.group_message_ids.len() {
+            return record_dead(
+                pool,
+                tenant,
+                &task,
+                "MEDIA_RELAY_UNAVAILABLE".to_owned(),
+                None,
+            )
+            .await;
+        }
+        let mut waiting = false;
+        for state in states {
+            match relay_state_decision(state) {
+                RelayDecision::Send(media) => payload.media_group.push(media),
+                RelayDecision::Wait => waiting = true,
+                RelayDecision::Dead(code) => {
+                    return record_dead(pool, tenant, &task, code, None).await;
+                }
+            }
+        }
+        if waiting {
+            defer_delivery_task(pool, tenant, task.id, MEDIA_WAIT_SECONDS).await?;
+            return Ok(DeliveryRunOutcome::Deferred { task_id: task.id });
+        }
+    } else if needs_media_relay(&payload) {
         match decide_media_relay(pool, tenant, task.id).await? {
             RelayDecision::Send(media) => payload.media = Some(media),
             // 媒体还没下好：放回队列，不计尝试。
@@ -838,6 +979,7 @@ impl DeliveryErrorKind {
             "PEER_ID_INVALID",
             "MEDIA_COPY_UNAVAILABLE",
             "MEDIA_RESEND_UNAVAILABLE",
+            "MEDIA_GROUP_INVALID",
             // 长度超限重试不会变短（片 1 实测 caption 报 MEDIA_CAPTION_TOO_LONG）
             "MEDIA_CAPTION_TOO_LONG",
             "MESSAGE_TOO_LONG",
@@ -1143,6 +1285,23 @@ mod tests {
             1,
             "异或为 0 时取 1"
         );
+    }
+
+    #[test]
+    fn album_random_ids_are_positive_distinct_and_stable_across_wrap() {
+        for base in [1, 2, i64::MAX - 4, i64::MAX, 0x5a5a_5a5a_5a5a_5a5a] {
+            let ids: Vec<_> = (0..10)
+                .map(|position| super::media_group_random_id(base, position))
+                .collect();
+            assert_eq!(ids[0], base);
+            for (position, id) in ids.iter().enumerate() {
+                assert!(*id > 0);
+                assert!(!ids[..position].contains(id));
+                assert_ne!(*id, super::split_text_random_id(base));
+                assert_eq!(*id, super::media_group_random_id(base, position));
+            }
+        }
+        assert_eq!(super::media_group_random_id(i64::MAX, 1), 1);
     }
 
     #[test]

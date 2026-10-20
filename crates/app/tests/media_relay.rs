@@ -562,6 +562,205 @@ async fn relay_state_is_not_readable_across_tenants(admin: PgPool) {
     );
 }
 
+async fn album(world: &World, caption: &str) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for message_id in [103, 101, 102] {
+        let id = media_event(
+            world,
+            message_id,
+            if message_id == 102 { caption } else { "" },
+            Some(10),
+        )
+        .await;
+        sqlx::query("UPDATE canonical_events SET media_group_id = 'album', media_type = 'PHOTO', created_at = clock_timestamp() - interval '3 seconds' WHERE id = $1")
+            .bind(id).execute(&world.app).await.expect("设置相册失败");
+        ids.push(id);
+    }
+    ids
+}
+
+async fn group_task(world: &World, setup: &TenantSetup) -> i64 {
+    let task: i64 = sqlx::query_scalar("SELECT id FROM delivery_tasks WHERE tenant_id = $1")
+        .bind(setup.tenant)
+        .fetch_one(world.admin.raw())
+        .await
+        .expect("读组任务失败");
+    sqlx::query("UPDATE delivery_tasks SET next_retry_at = NULL WHERE id = $1")
+        .bind(task)
+        .execute(world.admin.raw())
+        .await
+        .expect("清退避失败");
+    task
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn media_group_fanout_rule_and_relay_keep_member_order(admin: PgPool) {
+    let world = world(admin).await;
+    let pro = tenant(&world, "album-pro", "pro", "COPY").await;
+    let free = tenant(&world, "album-free", "free", "COPY").await;
+    let forward = tenant(&world, "album-forward", "pro", "FORWARD").await;
+    let members = album(&world, "urgent album").await;
+    let (left, right) = tokio::join!(
+        tgm_app::pipeline::run_fanout_once(&world.app, 100),
+        tgm_app::pipeline::run_fanout_once(&world.app, 100)
+    );
+    left.expect("并发扇出一失败");
+    right.expect("并发扇出二失败");
+    tgm_app::pipeline::run_rule_once(&world.app, 100)
+        .await
+        .expect("规则失败");
+    tgm_app::pipeline::run_rule_once(&world.app, 100)
+        .await
+        .expect("规则重跑失败");
+    let tasks: i64 = sqlx::query_scalar("SELECT count(*) FROM delivery_tasks")
+        .fetch_one(world.admin.raw())
+        .await
+        .expect("数任务失败");
+    assert_eq!(tasks, 3, "相册每个租户只生成一条任务");
+    assert_eq!(job_count(&world).await, 3);
+    let transport = RecordingTransport::default();
+    let task = group_task(&world, &pro).await;
+    assert_eq!(
+        run_delivery_once(&world.app, pro.tenant, pro.sender, &transport)
+            .await
+            .expect("投递失败"),
+        DeliveryRunOutcome::Deferred { task_id: task }
+    );
+    assert!(transport.seen.lock().expect("记录锁").is_empty());
+    for (position, member) in members.iter().enumerate() {
+        let archive: i64 = sqlx::query_scalar("INSERT INTO media_archive (content_hash, media_type, object_key, object_expires_at) VALUES ($1, 'PHOTO', $2, clock_timestamp() + interval '3 days') RETURNING id")
+            .bind(format!("hash-{position}")).bind(format!("objects/{member}"))
+            .fetch_one(&world.app).await.expect("插档案失败");
+        sqlx::query("UPDATE media_relay_jobs SET status = 'READY', media_archive_id = $2 WHERE canonical_event_id = $1")
+            .bind(member).bind(archive).execute(&world.app).await.expect("就绪失败");
+    }
+    group_task(&world, &pro).await;
+    assert!(matches!(
+        run_delivery_once(&world.app, pro.tenant, pro.sender, &transport)
+            .await
+            .expect("投递失败"),
+        DeliveryRunOutcome::Done { .. }
+    ));
+    assert_eq!(
+        run_delivery_once(&world.app, pro.tenant, pro.sender, &transport)
+            .await
+            .expect("重复投递失败"),
+        DeliveryRunOutcome::Idle
+    );
+    let seen = transport.seen.lock().expect("记录锁").clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].source.group_message_ids, vec![101, 102, 103]);
+    assert_eq!(
+        seen[0]
+            .media_group
+            .iter()
+            .map(|media| media.object_key.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            format!("objects/{}", members[1]),
+            format!("objects/{}", members[2]),
+            format!("objects/{}", members[0])
+        ]
+    );
+    assert_eq!(seen[0].message.text, "urgent album");
+    drop(seen);
+    let free_transport = RecordingTransport::default();
+    run_delivery_once(&world.app, free.tenant, free.sender, &free_transport)
+        .await
+        .expect("free 投递失败");
+    let seen = free_transport.seen.lock().expect("记录锁").clone();
+    assert!(seen[0].text_only);
+    assert!(seen[0].media_group.is_empty());
+    drop(seen);
+    let forward_transport = RecordingTransport::default();
+    run_delivery_once(
+        &world.app,
+        forward.tenant,
+        forward.sender,
+        &forward_transport,
+    )
+    .await
+    .expect("forward 投递失败");
+    assert_eq!(
+        forward_transport.seen.lock().expect("记录锁")[0]
+            .source
+            .group_message_ids,
+        vec![101, 102, 103]
+    );
+    assert!(
+        tgm_db::repo::load_media_group_relay_for_task(&world.app, free.tenant, task)
+            .await
+            .expect("跨租户查询失败")
+            .is_empty()
+    );
+    let matched: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM canonical_events WHERE matched_any")
+            .fetch_one(&world.app)
+            .await
+            .expect("数命中失败");
+    assert_eq!(matched, 4, "成员与聚合事件一起标命中，避免提前清掉下载源");
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn media_group_dead_member_overrides_pending_member(admin: PgPool) {
+    let world = world(admin).await;
+    let pro = tenant(&world, "album-dead", "pro", "COPY").await;
+    album(&world, "urgent").await;
+    tgm_app::pipeline::run_fanout_once(&world.app, 100)
+        .await
+        .expect("扇出失败");
+    tgm_app::pipeline::run_rule_once(&world.app, 100)
+        .await
+        .expect("规则失败");
+    sqlx::query("UPDATE media_relay_jobs SET status = 'DEAD', last_error_code = 'SOURCE_MESSAGE_MISSING' WHERE canonical_event_id = (SELECT id FROM canonical_events WHERE tg_message_id = 103 AND event_type = 'MESSAGE_CREATED')")
+        .execute(&world.app).await.expect("判死失败");
+    let task = group_task(&world, &pro).await;
+    let transport = RecordingTransport::default();
+    run_delivery_once(&world.app, pro.tenant, pro.sender, &transport)
+        .await
+        .expect("投递失败");
+    let (status, _, error) = task_state(&world, &pro, task).await;
+    assert_eq!(status, "DEAD");
+    assert_eq!(error.as_deref(), Some("SOURCE_MESSAGE_MISSING"));
+    assert!(transport.seen.lock().expect("记录锁").is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn media_group_placeholder_and_oversized_member(admin: PgPool) {
+    let world = world(admin).await;
+    let free = tenant(&world, "album-placeholder", "free", "COPY").await;
+    let pro = tenant(&world, "album-oversize", "pro", "RESEND").await;
+    sqlx::query("UPDATE keywords SET word = '^$', match_type = 'regex'")
+        .execute(world.admin.raw())
+        .await
+        .expect("改关键词失败");
+    let members = album(&world, "").await;
+    sqlx::query("UPDATE canonical_events SET file_size = 52428801 WHERE id = $1")
+        .bind(members[2])
+        .execute(&world.app)
+        .await
+        .expect("设置超限失败");
+    tgm_app::pipeline::run_fanout_once(&world.app, 100)
+        .await
+        .expect("扇出失败");
+    tgm_app::pipeline::run_rule_once(&world.app, 100)
+        .await
+        .expect("规则失败");
+    let task = group_task(&world, &pro).await;
+    let (status, _, code) = task_state(&world, &pro, task).await;
+    assert_eq!(status, "DEAD");
+    assert_eq!(code.as_deref(), Some("MEDIA_TOO_LARGE"));
+    assert_eq!(job_count(&world).await, 0);
+    let transport = RecordingTransport::default();
+    run_delivery_once(&world.app, free.tenant, free.sender, &transport)
+        .await
+        .expect("free 投递失败");
+    assert_eq!(
+        transport.seen.lock().expect("记录锁")[0].message.text,
+        "[媒体组：3 项] https://t.me/relay_src/101"
+    );
+}
+
 /// 多个进程同时首启：同时发现桶不存在、同时建桶，后到的收到 409 也必须算成功。
 /// 每轮用新桶名，保证起跑时桶确实不存在。
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

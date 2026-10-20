@@ -450,3 +450,14 @@ B（对象清理）已实现，按批准记录第 7 条单独开 PR。证据：
 `docs/plan/evidence/WP-5-delivery-media-cleanup-2026-10-20.md`。与 B.4 的差异：
 `system_logs` 没有写入，清理结果只进 tracing（`app_user` 写不进 `tenant_id IS NULL` 的行），
 在 spec/04 §1.1 注明了缺口。A（媒体组聚合）未动。
+
+### 片 3 A 实施状态（2026-10-20）
+
+在 `codex/WP-5-delivery-media-group-a` 基于 PR #29 合并后的 `dev` 实施。
+已写迁移 0023、聚合事务、规则与中转接线、整组发送、L1 / L2 和真机工具；
+同步 C7、double-pass 及规格。局部测试、反证与完整门禁已通过；用户重新扫码后，
+三图相册中转、整组 FORWARD 与相同 random_id 重试去重真机通过。
+真机暴露的 `PHOTO_EXT_INVALID` 已在共享上传入口修复，并补充缺省照片文件名的 L1 检查。
+记录：`docs/plan/evidence/WP-5-delivery-media-group-2026-10-20.md`。
+修复后完整门禁通过：337 passed / 0 failed / 12 ignored。
+尚未提交、发布或经 CI 裁决；混合类型、超长说明及单成员相册未真测。
