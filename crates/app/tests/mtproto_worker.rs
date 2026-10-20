@@ -333,6 +333,7 @@ async fn identity_without_session_exits_and_releases_lease(admin: PgPool) {
         target,
         "worker-a",
         MtprotoWorkerConfig::default(),
+        None,
         shutdown.clone(),
     )
     .await
@@ -348,6 +349,7 @@ async fn identity_without_session_exits_and_releases_lease(admin: PgPool) {
         target,
         "worker-a",
         MtprotoWorkerConfig::default(),
+        None,
         shutdown,
     )
     .await

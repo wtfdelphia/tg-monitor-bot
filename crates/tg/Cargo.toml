@@ -16,4 +16,5 @@ grammers-session = { workspace = true }
 glass_pumpkin = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 rstest = { workspace = true }

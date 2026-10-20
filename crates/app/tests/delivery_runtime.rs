@@ -24,10 +24,11 @@ fn kek() -> EnvKek {
     EnvKek::new(Profile::Development, LOCAL_KEK).expect("构造 EnvKek 失败")
 }
 
-fn app_creds() -> PlatformApp {
+async fn app_creds() -> PlatformApp {
     PlatformApp {
         api_id: 12_345,
         api_hash: Arc::new(Secret::new("0123456789abcdef0123456789abcdef".to_owned())),
+        media_store: support::media_store("tgm-test-runtime").await,
     }
 }
 
@@ -146,7 +147,7 @@ async fn malformed_token_marks_bot_unauthorized_once(admin: sqlx::PgPool) {
     let exit = run_sender(
         &app,
         &kek(),
-        &app_creds(),
+        &app_creds().await,
         tenant,
         bot,
         DeliveryRuntimeConfig::default(),
@@ -208,7 +209,7 @@ async fn missing_token_exits_without_touching_status(admin: sqlx::PgPool) {
     let exit = run_sender(
         &app,
         &kek(),
-        &app_creds(),
+        &app_creds().await,
         tenant,
         bot,
         DeliveryRuntimeConfig::default(),

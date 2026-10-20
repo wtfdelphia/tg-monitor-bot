@@ -37,6 +37,12 @@ pub enum TelegramClientError {
     MediaCopyUnavailable,
     #[error("当前适配器尚未支持媒体 RESEND")]
     MediaResendUnavailable,
+    #[error("源消息不存在或采集身份读不到")]
+    SourceMessageMissing,
+    #[error("源消息没有可下载的媒体")]
+    SourceMediaMissing,
+    #[error("媒体上传失败: {0}")]
+    Upload(#[source] std::io::Error),
     #[error("仅发送客户端不接收更新")]
     SendOnly,
     #[error("落库的 session 登录的不是 Bot")]
@@ -345,6 +351,102 @@ impl TelegramClient {
         }
     }
 
+    /// 采集身份的媒体下载句柄。可 Clone，交给独立任务下载，不占住收消息的 `&mut self`。
+    pub fn media_reader(&self) -> MediaReader {
+        MediaReader {
+            client: self.client.clone(),
+            session: Arc::clone(&self.session),
+        }
+    }
+
+    /// 上传一个媒体文件并以 `messages.sendMedia` 发出（带 `random_id`，重发由服务器去重）。
+    ///
+    /// PHOTO 走 `InputMediaUploadedPhoto`，其余走 Document 并带原 `mime_type` 与文件名。
+    /// `caption_html` 为空时不带说明。
+    // ponytail: 视频与音频不带时长、尺寸等 document attributes，可能显示为普通文件，
+    // 出现「视频不能内联播放」时改为在 job 里保存原 attributes
+    pub async fn send_uploaded_media<S: tokio::io::AsyncRead + Unpin>(
+        &self,
+        target_tg_chat_id: i64,
+        telegram_random_id: i64,
+        stream: &mut S,
+        size: usize,
+        media: &UploadMedia,
+        caption_html: &str,
+    ) -> Result<i64, TelegramClientError> {
+        validate_random_id(telegram_random_id)?;
+        let target = self.resolve_peer_ref(target_tg_chat_id).await?;
+        let file_name = media
+            .file_name
+            .clone()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "file".to_owned());
+        let uploaded = self
+            .client
+            .upload_stream(stream, size, file_name.clone())
+            .await
+            .map_err(TelegramClientError::Upload)?;
+        let input_media: tl::enums::InputMedia = if media.media_type == "PHOTO" {
+            tl::types::InputMediaUploadedPhoto {
+                spoiler: false,
+                live_photo: false,
+                file: uploaded.raw,
+                stickers: None,
+                ttl_seconds: None,
+                video: None,
+            }
+            .into()
+        } else {
+            tl::types::InputMediaUploadedDocument {
+                nosound_video: false,
+                force_file: false,
+                spoiler: false,
+                file: uploaded.raw,
+                thumb: None,
+                mime_type: media
+                    .mime_type
+                    .clone()
+                    .unwrap_or_else(|| "application/octet-stream".to_owned()),
+                attributes: vec![tl::types::DocumentAttributeFilename { file_name }.into()],
+                stickers: None,
+                ttl_seconds: None,
+                video_cover: None,
+                video_timestamp: None,
+            }
+            .into()
+        };
+        let (message, entities) = parsers::parse_html_message(caption_html);
+        let updates = self
+            .client
+            .invoke(&tl::functions::messages::SendMedia {
+                silent: false,
+                background: false,
+                clear_draft: false,
+                peer: target.into(),
+                reply_to: None,
+                media: input_media,
+                message,
+                random_id: telegram_random_id,
+                reply_markup: None,
+                entities: (!entities.is_empty()).then_some(entities),
+                schedule_date: None,
+                schedule_repeat_period: None,
+                send_as: None,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_floodskip: false,
+                allow_paid_stars: None,
+                suggested_post: None,
+            })
+            .await
+            .map_err(TelegramClientError::Invocation)?;
+        message_id_for_random_id(&updates, telegram_random_id)
+            .ok_or(TelegramClientError::MessageNotReturned)
+    }
+
     /// 把更新流状态同步进 session 后取快照。输出含 auth key，只能交给信封加密落库。
     pub async fn snapshot(&self) -> Result<Secret<Vec<u8>>, TelegramClientError> {
         self.updates
@@ -381,18 +483,113 @@ impl TelegramClient {
     }
 
     async fn resolve_peer_ref(&self, tg_chat_id: i64) -> Result<PeerRef, TelegramClientError> {
-        let peer = peer_ref(tg_chat_id)?;
-        let resolved = self
-            .client
-            .resolve_peer(peer)
-            .await
-            .map_err(TelegramClientError::Invocation)?;
-        resolved
-            .to_ref()
-            .await
-            .map_err(TelegramClientError::PeerResolution)?
-            .ok_or(TelegramClientError::InvalidPeer(tg_chat_id))
+        resolve_peer_ref(&self.client, &self.session, tg_chat_id).await
     }
+}
+
+/// 先查 session 缓存里的 `access_hash`；没有再用 ambient 引用向服务器解析。
+///
+/// ambient 引用的 `access_hash` 是 0：Bot 对自己所在的对话够用，用户账号读频道不够
+/// （服务器报 `CHANNEL_INVALID`，片 1 spike 的 M5）。采集身份收到频道更新时 grammers
+/// 已把 `access_hash` 缓存进 session，所以中转下载必须走缓存。
+async fn resolve_peer_ref(
+    client: &Client,
+    session: &StoredSession,
+    tg_chat_id: i64,
+) -> Result<PeerRef, TelegramClientError> {
+    use grammers_session::Session;
+
+    let id = PeerId::from_bot_api_dialog_id(tg_chat_id)
+        .ok_or(TelegramClientError::InvalidPeer(tg_chat_id))?;
+    if let Some(cached) = session
+        .peer_ref(id)
+        .await
+        .map_err(TelegramClientError::Snapshot)?
+    {
+        return Ok(cached);
+    }
+    let peer = peer_ref(tg_chat_id)?;
+    let resolved = client
+        .resolve_peer(peer)
+        .await
+        .map_err(TelegramClientError::Invocation)?;
+    resolved
+        .to_ref()
+        .await
+        .map_err(TelegramClientError::PeerResolution)?
+        .ok_or(TelegramClientError::InvalidPeer(tg_chat_id))
+}
+
+/// [`TelegramClient::media_reader`] 的返回值：只读，只会取消息与下载文件。
+#[derive(Clone)]
+pub struct MediaReader {
+    client: Client,
+    session: Arc<StoredSession>,
+}
+
+impl MediaReader {
+    /// 重新取一次源消息，拿当前有效的 `file_reference`，返回分片下载流。
+    ///
+    /// 不缓存旧消息里的媒体引用：`file_reference` 会过期，每次下载都现取。
+    /// `channels.getMessages` 与 `upload.getFile` 都是读，采集身份只读的纪律不变（spec/08 §1.4）。
+    pub async fn open(
+        &self,
+        source_tg_chat_id: i64,
+        source_tg_message_id: i64,
+    ) -> Result<MediaDownload, TelegramClientError> {
+        let source = resolve_peer_ref(&self.client, &self.session, source_tg_chat_id).await?;
+        let message_id = i32::try_from(source_tg_message_id)
+            .map_err(|_| TelegramClientError::SourceMessageMissing)?;
+        let message = self
+            .client
+            .get_messages_by_id(source, &[message_id])
+            .await
+            .map_err(TelegramClientError::Invocation)?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or(TelegramClientError::SourceMessageMissing)?;
+        let media = message
+            .media()
+            .ok_or(TelegramClientError::SourceMediaMissing)?;
+        Ok(MediaDownload {
+            inner: self.client.iter_download(&media),
+        })
+    }
+}
+
+/// [`MediaReader::open`] 返回的分片流。
+pub struct MediaDownload {
+    inner: grammers_client::client::DownloadIter,
+}
+
+impl MediaDownload {
+    /// 下一个分片；`None` 表示下载完毕。
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, TelegramClientError> {
+        self.inner
+            .next()
+            .await
+            .map_err(TelegramClientError::Invocation)
+    }
+}
+
+/// 上传媒体时要带的元数据（来自 `media_archive`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadMedia {
+    pub media_type: String,
+    pub mime_type: Option<String>,
+    pub file_name: Option<String>,
+}
+
+/// HTML 解析后 Telegram 计长度用的纯文本长度（UTF-16 码元）。
+///
+/// MTProto 的实体偏移按 UTF-16 计（core.telegram.org/api/entities），caption 1024 与
+/// 正文 4096 两条上限这里也按同一口径比较。片 2 真机对照：1024 个字符、1027 个 UTF-16
+/// 码元的说明被服务器接受，即服务器不按 UTF-16 计；本口径偏保守，只会多拆、不会被拒
+/// （docs/plan/evidence/WP-5-delivery-media-relay-2026-10-20.md）。
+pub fn telegram_text_len(html_text: &str) -> usize {
+    let (message, _) = parsers::parse_html_message(html_text);
+    message.encode_utf16().count()
 }
 
 /// 采集到的一条消息，只含落 `canonical_events` 需要的字段。
@@ -588,6 +785,16 @@ impl TelegramClientError {
             },
             Self::MessageNotReturned => TelegramDeliveryError {
                 code: "MESSAGE_NOT_RETURNED".to_owned(),
+                message: Some(self.to_string()),
+                flood_wait_seconds: None,
+            },
+            Self::SourceMessageMissing => TelegramDeliveryError {
+                code: "SOURCE_MESSAGE_MISSING".to_owned(),
+                message: Some(self.to_string()),
+                flood_wait_seconds: None,
+            },
+            Self::SourceMediaMissing => TelegramDeliveryError {
+                code: "SOURCE_MEDIA_MISSING".to_owned(),
                 message: Some(self.to_string()),
                 flood_wait_seconds: None,
             },
@@ -897,6 +1104,35 @@ mod tests {
         let client = TelegramClient::connect(config).await?;
         client.shutdown().await?;
 
+        Ok(())
+    }
+
+    /// 片 2 真机发现：用户账号用 ambient 引用读频道报 CHANNEL_INVALID。
+    /// 缓存里有频道时必须带上缓存的 access_hash，且不发起网络请求（客户端从未连上）。
+    #[tokio::test]
+    async fn resolve_peer_ref_prefers_cached_access_hash() -> Result<(), TelegramClientError> {
+        use crate::session::StoredSession;
+        use grammers_session::Session;
+        use grammers_session::types::{PeerAuth, PeerInfo};
+        use std::sync::Arc;
+
+        use super::{Client, SenderPool, resolve_peer_ref};
+
+        let session = Arc::new(StoredSession::default());
+        session
+            .cache_peer(&PeerInfo::Channel {
+                id: 1_234_567,
+                auth: Some(PeerAuth::from_hash(987_654_321)),
+                kind: None,
+            })
+            .await
+            .map_err(TelegramClientError::Snapshot)?;
+        let SenderPool { handle, .. } = SenderPool::new(Arc::clone(&session), 932_939);
+        let client = Client::new(handle.clone());
+
+        let resolved = resolve_peer_ref(&client, &session, -1_000_001_234_567).await?;
+        handle.quit();
+        assert_eq!(resolved.auth.hash(), 987_654_321);
         Ok(())
     }
 

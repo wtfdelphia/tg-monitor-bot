@@ -94,3 +94,17 @@ pub async fn seed_source(
     .await
     .expect("创建测试来源失败")
 }
+
+/// compose 里 MinIO 的测试 store（镜像默认 root 凭据，eng/02 §一 的 59000 端口）。
+/// 每个测试用自己的桶名，互不干扰；桶不存在就建。
+pub async fn media_store(bucket: &str) -> tgm_app::media_relay::MediaStore {
+    let store = tgm_app::media_relay::MediaStore::new(&tgm_app::media_relay::S3Config {
+        endpoint: "http://127.0.0.1:59000".to_owned(),
+        bucket: bucket.to_owned(),
+        region: "us-east-1".to_owned(),
+        access_key_id: "minioadmin".to_owned(),
+        secret_access_key: tgm_core::secret::Secret::new("minioadmin".to_owned()),
+    });
+    store.ensure_bucket().await.expect("建 MinIO 测试桶失败");
+    store
+}

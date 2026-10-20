@@ -286,6 +286,18 @@ async fn serve_rule(
 ///
 /// worker_id 取主机名加进程号：同机重启换 id，旧进程的租约只能等过期或被接管，
 /// 不会被新进程当成「自己的」续上。
+/// 媒体中转的对象存储（`TGM_S3_*`，eng/01 §二）。development 下桶不存在就建，
+/// 方便 compose 的 MinIO；其余 profile 要求部署方先建好桶。
+async fn media_store() -> anyhow::Result<tgm_app::media_relay::MediaStore> {
+    let config =
+        tgm_app::media_relay::S3Config::from_env().map_err(|error| anyhow::anyhow!(error))?;
+    let store = tgm_app::media_relay::MediaStore::new(&config);
+    if std::env::var("TGM_PROFILE").as_deref() == Ok("development") {
+        store.ensure_bucket().await?;
+    }
+    Ok(store)
+}
+
 async fn serve_mtproto_worker(
     signal: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
@@ -307,11 +319,13 @@ async fn serve_mtproto_worker(
         signal.await;
         let _ = shutdown_tx.send(true);
     });
+    let media_store = media_store().await?;
     let worker = tgm_app::mtproto_worker::MtprotoWorker::new(
         pool,
         kek,
         worker_id,
         tgm_app::mtproto_worker::MtprotoWorkerConfig::default(),
+        Some(media_store),
     );
     let result = worker.run(shutdown_rx).await;
     signal_task.abort();
@@ -355,6 +369,7 @@ async fn serve_delivery(
         tgm_app::delivery_runtime::PlatformApp {
             api_id,
             api_hash: Arc::new(tgm_core::secret::Secret::new(api_hash)),
+            media_store: media_store().await?,
         },
         tgm_app::delivery_runtime::DeliveryRuntimeConfig::default(),
     );

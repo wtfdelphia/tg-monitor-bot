@@ -28,6 +28,7 @@ use tgm_tg::{IncomingMessage, TelegramClient, TelegramClientError};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::media_relay::{MediaStore, RelayOutcome, run_relay_once};
 use crate::mtproto_session::{SessionStoreError, load_session};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +142,7 @@ pub async fn run_identity(
     target: MtprotoTarget,
     worker_id: &str,
     config: MtprotoWorkerConfig,
+    media_store: Option<&MediaStore>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<IdentityExit, MtprotoWorkerError> {
     let MtprotoTarget {
@@ -156,7 +158,17 @@ pub async fn run_identity(
         worker_id: worker_id.to_owned(),
         fencing_token,
     };
-    let result = run_leased(pool, kek, tenant, &lease, api_id, config, &mut shutdown).await;
+    let result = run_leased(
+        pool,
+        kek,
+        tenant,
+        &lease,
+        api_id,
+        config,
+        media_store,
+        &mut shutdown,
+    )
+    .await;
     // 失去租约时已不是持有者；授权失效已在标记事务里释放。其余出口主动释放。
     // 释放是优化不是要求（ops/00 §六），失败只记日志。
     if !matches!(
@@ -178,6 +190,7 @@ async fn run_leased(
     lease: &LeaseGuard,
     api_id: i32,
     config: MtprotoWorkerConfig,
+    media_store: Option<&MediaStore>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<IdentityExit, MtprotoWorkerError> {
     let Some(session) = load_session(pool, kek, tenant, lease.identity_id).await? else {
@@ -195,6 +208,16 @@ async fn run_leased(
     let mut save = tokio::time::interval(config.save_interval);
     renew.tick().await;
     save.tick().await;
+    // 媒体中转下载在独立任务里跑：下载 50 MB 约 1 分钟，不能挡住收消息与续租。
+    // 任务持同一租约；租约丢失时它的每次写入都会被拒，外层退出时一并 abort。
+    let relay_task = media_store.map(|store| {
+        let pool = pool.clone();
+        let lease = lease.clone();
+        let reader = client.media_reader();
+        let store = store.clone();
+        let interval = config.renew_interval;
+        tokio::spawn(async move { relay_loop(&pool, &lease, &reader, &store, interval).await })
+    });
     let exit = loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -249,6 +272,10 @@ async fn run_leased(
         }
     };
 
+    if let Some(task) = relay_task {
+        task.abort();
+        let _ = task.await;
+    }
     match exit {
         Ok(IdentityExit::Shutdown) => {
             // 退出前落最后一次，下次启动从这里续上更新状态。失败只记日志，不影响退出。
@@ -266,6 +293,27 @@ async fn run_leased(
     }
     let _ = client.shutdown().await;
     exit
+}
+
+/// 本身份的中转下载循环：有到期 job 就连续处理，空闲时按续租周期再扫。
+async fn relay_loop(
+    pool: &PgPool,
+    lease: &LeaseGuard,
+    reader: &tgm_tg::MediaReader,
+    store: &MediaStore,
+    interval: Duration,
+) {
+    loop {
+        match run_relay_once(pool, lease, reader, store).await {
+            Ok(RelayOutcome::Ready { .. } | RelayOutcome::Failed { .. }) => continue,
+            Ok(RelayOutcome::LeaseLost) => return,
+            Ok(RelayOutcome::Idle) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, identity_id = lease.identity_id.get(), "媒体中转扫描失败，下个周期重试");
+            }
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 #[derive(Debug)]
@@ -298,6 +346,7 @@ pub struct MtprotoWorker {
     kek: Arc<dyn Kek>,
     worker_id: String,
     config: MtprotoWorkerConfig,
+    media_store: Option<MediaStore>,
 }
 
 impl MtprotoWorker {
@@ -306,12 +355,14 @@ impl MtprotoWorker {
         kek: Arc<dyn Kek>,
         worker_id: String,
         config: MtprotoWorkerConfig,
+        media_store: Option<MediaStore>,
     ) -> Self {
         Self {
             pool,
             kek,
             worker_id,
             config,
+            media_store,
         }
     }
 
@@ -362,14 +413,22 @@ impl MtprotoWorker {
                 let kek = Arc::clone(&self.kek);
                 let worker_id = self.worker_id.clone();
                 let config = self.config;
+                let media_store = self.media_store.clone();
                 let shutdown = shutdown.clone();
                 running.insert(
                     identity,
                     tokio::spawn(async move {
                         let target = MtprotoTarget { tenant, identity, api_id };
-                        let result =
-                            run_identity(&pool, kek.as_ref(), target, &worker_id, config, shutdown)
-                                .await;
+                        let result = run_identity(
+                            &pool,
+                            kek.as_ref(),
+                            target,
+                            &worker_id,
+                            config,
+                            media_store.as_ref(),
+                            shutdown,
+                        )
+                        .await;
                         match result {
                             Ok(exit) => tracing::info!(identity_id = identity.get(), exit = ?exit, "mtproto 身份循环结束"),
                             Err(error) => tracing::warn!(identity_id = identity.get(), error = %error, "mtproto 身份循环异常退出"),

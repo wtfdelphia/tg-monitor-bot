@@ -45,6 +45,7 @@ getrandom = { version = "0.4", features = ["std", "sys_rng"] }
 sha2 = "0.11"
 aws-config = { version = "=1.12.0", default-features = false, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio"] }
 aws-sdk-kms = { version = "=1.123.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "=1.152.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-runtime = "=1.10.0"
 aws-smithy-runtime-api = "=1.19.0"
 aws-smithy-types = "=1.8.1"
