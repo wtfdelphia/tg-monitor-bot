@@ -16,6 +16,7 @@
 | WP-5-delivery-media 片 2（PR #25） | `crates/app/src/delivery.rs` `split_text_random_id` | 拆分第二条的派生 `random_id` 与同一 (sender, target) 下其他任务碰撞概率约 2^-63 | 出现「编辑第二条文字」的需求时，改为 `delivery_tasks` 独立列 | 未升级 |
 | WP-5-delivery-media 片 2（PR #25） | `crates/app/src/media_relay.rs` `run_relay_once` | 下载完才知道 `content_hash`，做不到 spec/02 §4.2 第 3 条「命中档案跳过下载」，只在下载后去重存储 | 中转流量成为成本瓶颈时，按 document id 预判跳过 | 未升级 |
 | WP-5-delivery-media 片 2（PR #25） | `crates/tg/src/client.rs` `send_uploaded_media` | 视频与音频不带时长、尺寸等 document attributes，可能显示为普通文件 | 出现「视频不能内联播放」时，改为在 job 里保存原 attributes | 未升级 |
+| WP-5-delivery-media 片 3 B（PR #27） | `crates/app/src/media_cleanup.rs` `run_cleanup_once` | 清理结果只进 tracing、不写 `system_logs`（spec/04 §1.1 第 2 条）：`app_user` 写不进 `tenant_id IS NULL` 的行 | 平台级日志的写入路径定下来后改为写库 | 未升级 |
 
 ## 与上游纪律的适配与分叉（只增不清）
 
