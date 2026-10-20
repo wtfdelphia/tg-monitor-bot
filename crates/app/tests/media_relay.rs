@@ -561,3 +561,36 @@ async fn relay_state_is_not_readable_across_tenants(admin: PgPool) {
         "别的租户的任务 id 不得读到中转状态"
     );
 }
+
+/// 多个进程同时首启：同时发现桶不存在、同时建桶，后到的收到 409 也必须算成功。
+/// 每轮用新桶名，保证起跑时桶确实不存在。
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_ensure_bucket_all_succeed() {
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("读取时间失败")
+        .as_nanos();
+    let store = MediaStore::new(&tgm_app::media_relay::S3Config {
+        endpoint: "http://127.0.0.1:59000".to_owned(),
+        bucket: format!("tgm-test-race-{run}"),
+        region: "us-east-1".to_owned(),
+        access_key_id: "minioadmin".to_owned(),
+        secret_access_key: tgm_core::secret::Secret::new("minioadmin".to_owned()),
+    });
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+    let tasks: Vec<_> = (0..16)
+        .map(|_| {
+            let store = store.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.ensure_bucket().await
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await
+            .expect("建桶任务异常退出")
+            .expect("并发建桶必须全部成功");
+    }
+}

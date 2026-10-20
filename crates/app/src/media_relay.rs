@@ -117,13 +117,25 @@ impl MediaStore {
         {
             return Ok(());
         }
-        self.client
+        // 多个进程（或并行测试）同时发现桶不存在会一起建，后到的收到 409 BucketAlreadyOwnedByYou：
+        // 桶已经在了，就是成功。
+        match self
+            .client
             .create_bucket()
             .bucket(&self.bucket)
             .send()
             .await
-            .map(|_| ())
-            .map_err(s3_error)
+        {
+            Ok(_) => Ok(()),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|service| service.is_bucket_already_owned_by_you()) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(s3_error(error)),
+        }
     }
 
     /// 把分片流写成一个对象，途中算 sha256。超过上限时中止 multipart、报 `TooLarge`。
