@@ -59,12 +59,31 @@ session 在 Token 登录成功时立即写回，不依赖退出路径。
 测试 306 passed / 0 failed / 5 ignored，`migrate-idempotent 通过`、`double-pass 通过`、
 `已执行的全部本地卡口通过`。
 
-## 四、未验证
+## 四、重置 Token 注销已有 auth key（V4，2026-10-20）
 
-- BotFather 重置 Token 后，已落库的 auth key 是否被 Telegram 注销（ADR-0034 代价节）。
-  若不注销，平台侧只靠 control-plane 重写 Token 时清空 session 兜底。
-  测试环境提供方已于 2026-10-20 在 BotFather 重置测试 Token，但这次没能验证：长跑跑在
-  `sqlx::test` 临时库里，测试结束库即删除，重置前的 session 没有留存。要验证，得用新 Token
-  按「登录并留存 session → 在 BotFather 重置 → 用旧 session 复用」的顺序重做。
+回答 ADR-0034 代价节的未验证项。工具 `crates/app/tests/delivery_live.rs` 的 V4a / V4b（`#[ignore]`），
+两段之间由测试环境提供方在 BotFather 重置 Token。session 文件放仓库外、权限 0600，V4b 读出即删。
+
+第一次尝试没有结论：长跑跑在 `sqlx::test` 临时库里，重置前的 session 随库删除。第二次按
+「登录并留存 session → 重置 → 用旧 session 复用」重做：
+
+```text
+[V4a] session 已存，重置前复用成功 bot_id=8869608883；现在去 BotFather 重置 Token 再跑 V4b
+        ── 测试环境提供方在 BotFather 重置 Token ──
+[V4b] 重置后旧 session 建连失败 unauthorized=true error=Telegram 调用失败: request error:
+      rpc error 401: SESSION_REVOKED caused by users.getUsers
+[V4b] 结论：重置 Token 注销了已有 auth key
+```
+
+结论：重置 Token 时，Telegram 同时注销该 Bot 已签发的 auth key。落库的 session 不会比 Token 活得更久，
+「重置 Token 即失效」对 session 同样成立。样本是一个 Bot、一次重置。
+
+运行链上的走向：`SESSION_REVOKED` 已归入 `TelegramClientError::is_unauthorized`
+（`crates/tg/src/client.rs` 的单元测试覆盖）→ `resume_from_stored` 清掉 session、退回 Token 登录 →
+旧 Token 被 `auth.importBotAuthorization` 拒绝 → 身份转 `unauthorized` 并写审计（V3 已真机验证）。
+control-plane 重写 Token 时清空 session 仍保留，作为第二道。
+
+## 五、未验证
+
 - 真实 `KmsKek` 下写回 session 的那次 unwrap（本地用 `EnvKek`）。
 - 长于 8 分钟的风暴、多个 Bot 同时重启。

@@ -53,3 +53,11 @@ ADR-0033 不落 session 的理由是「Bot 凭 Token 随时可重新登录，持
 提案 `docs/plan/proposals/WP-5-delivery-bot-session.md`；
 限流实测 `docs/plan/evidence/WP-5-delivery常驻长跑-2026-10-19.md`；
 落地在 `spec/03-数据模型.md`（`identity_secrets`）、`ops/00-部署与运行时.md`（delivery 角色）。
+
+## 落地追记（2026-10-20）
+
+代价节写的「BotFather 重置 Token 不一定注销已有 auth key，这一点没有真机验证」已经真机验证：
+重置后用旧 session 调 `users.getUsers(self)`，返回 `401 SESSION_REVOKED`。重置 Token 会注销
+该 Bot 已签发的 auth key，所以落库的 session 撑不过 Token 重置，泄露面没有超出 Token 本身。
+control-plane 重写 Token 时清空 session 仍然保留，现在是第二道防线，不再是唯一一道。
+样本只有一个 Bot、一次重置。证据 `docs/plan/evidence/WP-5-delivery-bot-session-2026-10-20.md`。
