@@ -23,6 +23,8 @@ use crate::rule::{
 pub struct FanoutWorkerConfig {
     pub poll_interval: Duration,
     pub event_batch_size: i64,
+    /// 媒体对象清理的间隔（片 3 批准记录第 6 条：跑在 fanout 里，spec/04 §一「每日」之内）。
+    pub cleanup_interval: Duration,
 }
 
 impl Default for FanoutWorkerConfig {
@@ -30,6 +32,7 @@ impl Default for FanoutWorkerConfig {
         Self {
             poll_interval: Duration::from_secs(1),
             event_batch_size: 100,
+            cleanup_interval: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -48,11 +51,22 @@ pub enum FanoutWorkerExit {
 pub struct FanoutWorker {
     pool: PgPool,
     config: FanoutWorkerConfig,
+    media_store: Option<crate::media_relay::MediaStore>,
 }
 
 impl FanoutWorker {
     pub fn new(pool: PgPool, config: FanoutWorkerConfig) -> Self {
-        Self { pool, config }
+        Self {
+            pool,
+            config,
+            media_store: None,
+        }
+    }
+
+    /// 带上对象存储：每 `cleanup_interval` 跑一轮媒体对象清理。
+    pub fn with_media_cleanup(mut self, store: crate::media_relay::MediaStore) -> Self {
+        self.media_store = Some(store);
+        self
     }
 
     pub async fn run(
@@ -60,9 +74,27 @@ impl FanoutWorker {
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<FanoutWorkerExit, AppError> {
         let mut retry_delay = self.config.poll_interval;
+        // 启动后先跑一轮：进程频繁重启时不至于一直轮不到清理。
+        let mut next_cleanup = tokio::time::Instant::now();
         loop {
             if *shutdown.borrow() {
                 return Ok(FanoutWorkerExit::Shutdown);
+            }
+            if let Some(store) = &self.media_store
+                && tokio::time::Instant::now() >= next_cleanup
+            {
+                next_cleanup = tokio::time::Instant::now() + self.config.cleanup_interval;
+                // 清理失败不影响扇出：记日志，下一个间隔再试。
+                match crate::media_cleanup::run_cleanup_once(
+                    &self.pool,
+                    store,
+                    crate::media_cleanup::default_staging_max_age(),
+                )
+                .await
+                {
+                    Ok(outcome) => tracing::info!(?outcome, "媒体对象清理完成"),
+                    Err(error) => tracing::warn!(error = %error, "媒体对象清理失败，下个间隔再试"),
+                }
             }
 
             let outcome = match run_fanout_once(&self.pool, self.config.event_batch_size).await {

@@ -13,6 +13,7 @@ pub mod console_login;
 pub mod control;
 pub mod delivery;
 pub mod delivery_runtime;
+pub mod media_cleanup;
 pub mod media_relay;
 pub mod mtproto_session;
 pub mod mtproto_worker;

@@ -14,13 +14,21 @@ use tgm_db::repo::{
 use tgm_db::tenant::tenant_tx;
 use tokio::time::{Instant, sleep};
 
+/// fanout 跑媒体对象清理，要 S3 配置（WP-5-delivery-media 片 3 批准记录第 6 条）。
+const FANOUT_S3_ENV: &[(&str, &str)] = &[
+    ("TGM_S3_ENDPOINT", "http://127.0.0.1:59000"),
+    ("TGM_S3_BUCKET", "tgm-fanout"),
+    ("TGM_S3_ACCESS_KEY_ID", "minioadmin"),
+    ("TGM_S3_SECRET_ACCESS_KEY", "minioadmin"),
+];
+
 struct WorkerProcess {
     child: Child,
 }
 
 impl WorkerProcess {
     fn start(database_url: &str) -> Result<Self> {
-        Self::start_role(database_url, "fanout")
+        Self::start_role_with_env(database_url, "fanout", FANOUT_S3_ENV)
     }
 
     fn start_role(database_url: &str, role: &str) -> Result<Self> {
@@ -576,7 +584,7 @@ async fn worker_processes_exit_cleanly_on_sigterm(admin: PgPool) -> Result<()> {
         ])
         .collect();
     let cases: [(&str, &[(&str, &str)]); 4] = [
-        ("fanout", &[]),
+        ("fanout", FANOUT_S3_ENV),
         ("rule", &[]),
         ("mtproto-worker", kek_env),
         ("delivery", &delivery_env),

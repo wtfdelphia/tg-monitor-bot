@@ -267,3 +267,186 @@ delivery
 `docs/plan/evidence/WP-5-delivery-media-relay-2026-10-20.md`。真机验收中发现用户账号用 ambient
 引用读频道会报 `CHANNEL_INVALID`，已改为优先使用 session 缓存的 `access_hash`。
 片 3（媒体组、对象清理）未开始。
+
+## 片 3 实施提案（2026-10-20）
+
+### 现状（2026-10-20 核对 `9a19e49`）
+
+- 采集侧已记 `media_group_id`：mtproto-worker 写 `grouped_id`，bot-gateway 写 Bot API 的
+  `media_group_id`。但之后整条链路都不看它：fanout 逐条扇出，rule 逐条匹配，相册里每一张
+  命中都单独投一次。spec/01 那一行写的正是要避免的情况：「不做会让 9 图相册触发 9 次」。
+- `CanonicalEventType::MediaGroupCompleted` 枚举和 CHECK 都已存在，但没有代码生成这种事件。
+- 仓库里没有 Redis 客户端依赖。`TGM_REDIS_URL` 已在配置清单里，但没有代码使用。
+- `media_archive.object_expires_at` 片 2 已经写成 3 天，但没有代码删过期对象，也没有代码删
+  180 天前的档案记录。对象存储里的文件只增不减。
+- `staging/` 前缀：片 2 下载失败或撞上已有 hash 时会删除临时对象，但删除失败只忽略
+  （`let _ = store.delete(..)`），会留下孤儿对象。
+
+### 范围
+
+本片做两件事，可以分成两个提交：
+
+**A. 媒体组聚合**（首发项，spec/03 §5.1）
+
+**B. 对象存储清理**（spec/04 §一 `media_archive` 行；只做这一行，其他表的留存期仍归 WP-8）
+
+不做：编辑与删除事件、其他表的清理任务、媒体组里单张超限的部分投递（见 A.5）。
+
+### A. 媒体组聚合
+
+**A.1 聚合放在哪一层。** 放在 fanout 之前、canonical 层，不放在 rule 层。理由：
+
+- spec/03 §5.1 写的是「生成 `MEDIA_GROUP_COMPLETED`，该事件持有组内全部 message_id，规则只跑一次」，
+  聚合事件本身就是 canonical 事件；
+- 放在 rule 层的话，每个租户都要各自聚合一遍，还要处理「同组消息分到两批」的竞态；
+- 放在 canonical 层，多个租户共用一次聚合，和片 2「一个事件一个 job」的形状一致。
+
+**A.2 窗口用 PG 判定，不依赖 Redis。** spec/02 §1.1 的纪律是「Redis 只是唤醒信号，
+每个 Worker 都必须能在 Redis 完全丢失时靠扫库恢复」。静默窗口如果只放在 Redis 里，
+Redis 一丢，组就永远聚合不了（或者重复聚合）。所以判定直接查库：
+
+```text
+fanout 扫到一条带 media_group_id 的 MESSAGE_CREATED：
+  同组（receiver_identity_id, tg_chat_id, media_group_id）最新一条的 created_at
+    距今 < 2s  → 跳过，本轮不标 fanned_out，下轮再看
+    距今 ≥ 2s  → 在一个事务里：
+                 插入一条 MEDIA_GROUP_COMPLETED（tg_message_id = 组内最小 id）
+                 组内全部 MESSAGE_CREATED 标 fanned_out（它们本身不扇出、不投递）
+                 聚合事件照常扇出
+```
+
+`spec/02` §1.1 键名清单里的 `mgroup:{identity}:{group_id}` 本片不用：仓库目前没有 Redis 客户端，
+fanout 本来就是轮询扫库，2 秒窗口靠扫库判定就够了。这是对 spec/02 键名清单的偏离，
+同步在 spec/03 §5.1 的流程图里改写，并在 spec/02 的键名清单那一行注明「首发不用」。
+这属于变更分级的 C 类（实现细节），不写 ADR。
+
+幂等：聚合事件同样受 `uq_canonical` 约束（`event_type` 不同于组内单条），两个 fanout 实例
+同时判定时只有一个能插进去，另一个 `ON CONFLICT DO NOTHING` 后重新读取已有的聚合事件。
+组内某条迟到（超过 2 秒才到）时，它会自己凑成一个新组，还是被并进已经完成的组？
+这里**按迟到消息单独成组处理**：插入时发现同组已有 `MEDIA_GROUP_COMPLETED`，就把这条迟到消息
+当作普通单条消息扇出。代价是迟到的那一张会单独投一次；好处是已投出的相册不会被改写。
+
+**A.3 数据：需要一张关联表。** 聚合事件要「持有组内全部 message_id」，现有 `canonical_events`
+是一行一条消息，放不下组内成员。新增丙类表：
+
+```sql
+CREATE TABLE IF NOT EXISTS media_group_members (
+  group_event_id     BIGINT NOT NULL REFERENCES canonical_events(id) ON DELETE CASCADE,
+  member_event_id    BIGINT NOT NULL REFERENCES canonical_events(id) ON DELETE CASCADE,
+  position           INTEGER NOT NULL,          -- 按 tg_message_id 升序，决定相册顺序
+  PRIMARY KEY (group_event_id, member_event_id),
+  UNIQUE (member_event_id)                      -- 一条消息只属于一个组
+);
+```
+
+丙类表，形状和 `media_relay_jobs` 一样：显式 NO FORCE + DISABLE RLS，只 GRANT S/I 给 app_user，
+随 `canonical_events` 级联删除。表数从 28 增加到 29，需要同步 spec/03、spec/04 和各处计数，
+审计断言 C7 的丙类表清单也要加上它。
+
+另一种做法是在 `canonical_events` 上加一列 `group_event_id`。这样不用新表，但要改一张已有的大表，
+而且组内成员和聚合事件之间是一对多关系，用关联表表达更直接。**推荐新表**。
+
+**A.4 规则怎么跑。** 聚合事件的 `text` / `caption` 取组内第一条非空的 caption
+（Telegram 相册通常只有一张带说明），`media_type` 记 `MEDIA_GROUP`？不行：`rules.media_type`
+的 CHECK 里没有这个值，加值就要改表。所以**聚合事件的 `media_type` 取组内成员的类型**
+（全是 PHOTO 就是 PHOTO，混合就是 DOCUMENT 以外的第一种，混合规则见下面的批准项 3）。
+关键词只对聚合后的说明匹配一次，命中就投整组，不命中整组都不投。
+
+**A.5 投递。**
+
+- **FORWARD**：一次 `messages.forwardMessages`，`id` 和 `random_id` 都传组内全部成员。
+  `random_id` 从任务的 `telegram_random_id` 按位置派生（和片 2 的 `split_text_random_id` 同一个思路）。
+- **COPY / RESEND（pro 档中转）**：每个成员一个 `media_relay_jobs`（主键仍然是成员的
+  `canonical_event_id`，片 2 的表不改）。delivery 等组内全部 job 就绪后，调用一次
+  `messages.sendMultiMedia`：先逐个 `messages.uploadMedia` 拿到 `InputMedia`，再一起发出。
+  说明挂在第一个成员上，超过 1024 时沿用片 2 的拆分规则（相册后面再发一条全文）。
+- **free 档**：只发文字（片 1 批准口径），正文是聚合后的说明，没有说明时用占位
+  「[媒体组：N 项] 链接」。
+- 组内任何一个成员永久失败（源消息被删、超过 50 MB）时，**整组判死**，不部分投递。
+  部分投递会让目标频道出现残缺的相册，而且重试时很难保证不重复。
+
+**A.6 测试。**
+
+- L1：聚合事件的 `media_type` 合并规则；位置派生 `random_id` 恒为正且两两不同；
+  占位文案。
+- L2：
+  - 3 条同组消息在窗口内只生成 1 个聚合事件，且只投递 1 次；
+  - 窗口未到时不扇出；
+  - 两个 fanout 并发判定，只生成一个聚合事件；
+  - 迟到消息单独扇出，不改已有的组；
+  - 组内一个 job 判死，整组任务判死；
+  - pro 档整组就绪后，transport 收到的载荷带全部成员且顺序正确。
+- 真机：用户账号作为采集身份，在测试频道里由 Bot 1 发一个 3 张图的相册（`sendMultiMedia`），
+  验证整组中转后以相册形式发出，并且同一组 `random_id` 重发时返回原消息。
+  需要用户账号重新扫码登录，片 2 用的 session 已经删除。
+
+### B. 对象存储清理
+
+**B.1 做法：定时任务，不用 S3 生命周期规则。** 生命周期规则只能按对象创建时间删除，
+但片 2 的去重会**复用**还没过期的对象（同 hash 第二次下载时保留旧对象），所以对象的实际
+有效期由 `media_archive.object_expires_at` 决定，而不是由创建时间决定。按创建时间删除，
+可能删掉一个刚被复用、delivery 正要读取的对象。另外，MinIO 和各家 S3 兼容存储对生命周期规则的
+支持程度也不一样。
+
+**B.2 任务内容**（spec/04 §1.1 的清理纪律：分批、每批不超过 5000 行、批间 200 ms、写 `system_logs`）：
+
+```text
+1. object_expires_at < now() 的档案：先删对象，再把 object_key / object_expires_at 置空。
+   顺序不能反：先置空再删对象，删除失败就留下孤儿对象，而且再也查不到。
+   删对象返回 404 当作成功（幂等）。
+2. first_seen_at < now() - 180 天的档案行：物理删除。
+   前提是没有 media_relay_jobs 引用它；有引用就跳过，等 job 随 canonical_events 级联删除后再清。
+3. staging/ 前缀下超过 1 天的对象：列出后删除（清理片 2 删除失败留下的孤儿）。
+```
+
+**B.3 跑在哪个角色里。** 放在 mtproto-worker 里需要租约，放在 delivery 里会有多个实例。
+推荐**放在 fanout 角色里**，每小时跑一次：fanout 本来就不持有 Telegram 身份，部署上通常只跑一个
+实例；即便跑多个，B.2 的三步也都是幂等的。fanout 现在没有 S3 配置，需要在 eng/01 §二 把
+`TGM_S3_*` 的适用角色加上 fanout。
+
+**B.4 测试。**
+
+- L2（MinIO）：过期对象被删且档案的 key 被置空；未过期的不动；先删对象再置空（破坏顺序后测试变红）；
+  180 天前、仍被 job 引用的档案不删；`staging/` 孤儿对象被清理；`system_logs` 写入 `cleanup.done`。
+- 不需要真机。
+
+### 依赖与配置
+
+- 不新增依赖：`aws-sdk-s3` 已有 `list_objects_v2`；grammers 0.10.0 已有
+  `messages.uploadMedia` 与 `messages.sendMultiMedia` 的原始 TL。
+- 新迁移 0023 `media_group_members`。
+- eng/01 §二：`TGM_S3_*` 的适用角色加上 fanout。
+
+### 片 3 需要批准
+
+1. 媒体组聚合放在 canonical 层，2 秒静默窗口用扫库判定、首发不用 Redis
+   （spec/02 键名清单里 `mgroup:` 那一行注明首发不用；按 C 类处理，不写 ADR）。
+2. 新表 `media_group_members`（丙类，表数增加到 29），还是改为在 `canonical_events` 上加
+   `group_event_id` 列。
+3. 混合类型相册（例如图片加视频）的 `media_type`：取第一个成员的类型（推荐，简单、可预期），
+   还是规则 `media_type` 只要匹配组内任一成员就算命中。
+4. 组内任一成员永久失败时整组判死，不部分投递。
+5. 迟到消息（窗口结束后才到）单独成组投递，不并入已经完成的组。
+6. 对象清理用定时任务（不用 S3 生命周期规则），跑在 fanout 角色里，fanout 增加 `TGM_S3_*` 配置。
+7. 本片按 A、B 两个提交、一个 PR 提交；还是 B 先单独开 PR（B 不依赖真机，可以先合）。
+8. 真机：A 需要用户账号重新扫码登录作为采集身份。
+
+### 片 3 批准记录（2026-10-20）
+
+用户批准「片 3 需要批准」全部 8 条。有备选的几条按提案推荐执行：
+
+1. 媒体组聚合放在 canonical 层，2 秒静默窗口靠扫库判定，首发不用 Redis；按 C 类处理，不写 ADR。
+2. 新表 `media_group_members`（丙类，表数增加到 29）。
+3. 混合类型相册的 `media_type` 取第一个成员的类型。
+4. 组内任一成员永久失败时整组判死，不部分投递。
+5. 迟到消息单独成组投递，不并入已完成的组。
+6. 对象清理用定时任务，跑在 fanout 角色里，fanout 增加 `TGM_S3_*` 配置。
+7. B（对象清理）不依赖真机，先单独开 PR；A（媒体组聚合）随后另开 PR。
+8. A 的真机验收需要用户账号重新扫码登录，作为采集身份。
+
+### 片 3 B 落地状态（2026-10-20）
+
+B（对象清理）已实现，按批准记录第 7 条单独开 PR。证据：
+`docs/plan/evidence/WP-5-delivery-media-cleanup-2026-10-20.md`。与 B.4 的差异：
+`system_logs` 没有写入，清理结果只进 tracing（`app_user` 写不进 `tenant_id IS NULL` 的行），
+在 spec/04 §1.1 注明了缺口。A（媒体组聚合）未动。

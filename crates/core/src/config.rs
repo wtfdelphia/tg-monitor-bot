@@ -164,9 +164,17 @@ fn extra_required(role: Role) -> &'static [&'static str] {
             "TGM_PLATFORM_API_ID",
             "TGM_PLATFORM_API_HASH",
         ],
-        // fanout 与 rule 只要 COMMON。它们不碰凭据也不碰对象存储 ——
+        // fanout 跑媒体对象清理（WP-5-delivery-media 片 3 批准记录第 6 条），要桶的读删权限；
+        // 不碰凭据，所以没有 KEK。
+        Role::Fanout => &[
+            "TGM_S3_ENDPOINT",
+            "TGM_S3_BUCKET",
+            "TGM_S3_ACCESS_KEY_ID",
+            "TGM_S3_SECRET_ACCESS_KEY",
+        ],
+        // rule 只要 COMMON：不碰凭据也不碰对象存储 ——
         // 这正是 §二 那句「某个角色不需要的项，就不该配给它」想达到的形状
-        Role::Fanout | Role::Rule => &[],
+        Role::Rule => &[],
     }
 }
 
@@ -191,7 +199,8 @@ fn allowed(role: Role) -> Vec<&'static str> {
         Role::MtprotoWorker | Role::Delivery => {
             v.extend_from_slice(&["TGM_KMS_KEY_ARN", "TGM_LOCAL_KEK", "TGM_S3_REGION"]);
         }
-        Role::Fanout | Role::Rule => {}
+        Role::Fanout => v.push("TGM_S3_REGION"),
+        Role::Rule => {}
     }
     if role.uses_kek() {
         v.extend_from_slice(&[
@@ -581,11 +590,11 @@ mod tests {
         );
     }
 
-    /// 片 2：S3 静态凭据只给媒体两端，fanout / rule / control-plane 出现即多配；
-    /// TGM_S3_REGION 是可选项，媒体两端不配也不报缺。
+    /// 片 2：S3 静态凭据只给媒体两端；片 3 起 fanout 跑对象清理也要。rule / control-plane
+    /// 出现即多配；TGM_S3_REGION 是可选项，不配也不报缺。
     #[test]
     fn s3_credentials_are_media_roles_only() {
-        for role in [Role::MtprotoWorker, Role::Delivery] {
+        for role in [Role::MtprotoWorker, Role::Delivery, Role::Fanout] {
             let mut env = minimal(role);
             assert!(env.contains(&"TGM_S3_SECRET_ACCESS_KEY"));
             env.push("TGM_S3_REGION");
@@ -596,7 +605,7 @@ mod tests {
                 vec![ConfigProblem::Missing("TGM_S3_ACCESS_KEY_ID")]
             );
         }
-        for role in [Role::Fanout, Role::Rule, Role::ControlPlane] {
+        for role in [Role::Rule, Role::ControlPlane] {
             let mut env = minimal(role);
             env.extend_from_slice(&[
                 "TGM_S3_ACCESS_KEY_ID",

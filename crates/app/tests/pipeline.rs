@@ -618,6 +618,7 @@ async fn fanout_worker_marks_events_and_stops_cleanly(admin: PgPool) {
         FanoutWorkerConfig {
             poll_interval: Duration::from_secs(30),
             event_batch_size: 10,
+            ..FanoutWorkerConfig::default()
         },
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
