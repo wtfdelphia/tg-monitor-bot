@@ -609,7 +609,8 @@ SELECT q::text FROM (
               ELSE 'RLS 被 FORCE'
          END AS why
   FROM (VALUES ('tenants'), ('canonical_events'), ('media_archive'), ('identity_secrets'),
-               ('account_leases'), ('console_login_challenges'), ('media_relay_jobs')) w(tbl)
+               ('account_leases'), ('console_login_challenges'), ('media_relay_jobs'),
+               ('media_group_members')) w(tbl)
   LEFT JOIN pg_class c ON c.relname = w.tbl AND c.relkind IN ('r','p')
                       AND c.relnamespace = 'public'::regnamespace
   WHERE c.oid IS NULL OR c.relrowsecurity OR c.relforcerowsecurity

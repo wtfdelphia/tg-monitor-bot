@@ -14,6 +14,7 @@
 //! TGM_LIVE_TARGET_USERNAME                      测试频道用户名（生成来源链接用）
 //! TGM_LIVE_USER_SESSION_FILE                    用户账号 session（先跑 qr_login 的
 //!                                               live_user_session_resume 缓存频道 access_hash）
+//! TGM_LIVE_ALBUM_PHOTO_FILE                     相册验收用的本地 JPEG（非空且不超过 1 MiB）
 //! ```
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -219,6 +220,235 @@ async fn resend(setup: &Setup, transport: &TelegramDeliveryTransport, task: i64)
         file_name: relay.file_name,
     });
     transport.deliver(payload).await.expect("重发失败")
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+#[ignore = "真机：需要测试 Bot、重新扫码的用户 session、测试频道与本地 JPEG 文件"]
+async fn live_media_group_relay_end_to_end(admin: PgPool) {
+    let api_id = required("TGM_PLATFORM_API_ID")
+        .parse()
+        .expect("api_id 必须是整数");
+    let config = TelegramClientConfig::new(api_id).expect("api_id 无效");
+    let hash = Secret::new(required("TGM_PLATFORM_API_HASH"));
+    let token = Secret::new(required("TGM_LIVE_BOT_TOKEN"));
+    let chat: i64 = required("TGM_LIVE_TARGET_CHAT")
+        .parse()
+        .expect("频道 id 无效");
+    let (bot, _) = TelegramClient::connect_bot_sender(config.clone(), &hash, &token)
+        .await
+        .expect("Bot 登录失败");
+    drop(token);
+    let bot = Arc::new(bot);
+    let bytes = std::fs::read(required("TGM_LIVE_USER_SESSION_FILE")).expect("读 session 失败");
+    let user = TelegramClient::connect_with_session(
+        config.without_catch_up(),
+        StoredSession::restore(&bytes).expect("session 无效"),
+    )
+    .await
+    .expect("用户账号建连失败");
+    drop(bytes);
+    let reader = user.media_reader();
+    let photo = std::fs::read(required("TGM_LIVE_ALBUM_PHOTO_FILE")).expect("读测试 JPEG 失败");
+    assert!(
+        !photo.is_empty() && photo.len() <= 1024 * 1024,
+        "测试 JPEG 须为 1 MiB 以内的非空图片"
+    );
+    let caption = format!("tgm-relay album {}", fresh_random_id() % 1_000_000);
+    let mut source_media = Vec::new();
+    for _ in 0..3 {
+        source_media.push(
+            bot.prepare_album_media(
+                chat,
+                &mut std::io::Cursor::new(&photo),
+                photo.len(),
+                &UploadMedia {
+                    media_type: "PHOTO".to_owned(),
+                    mime_type: Some("image/jpeg".to_owned()),
+                    file_name: Some("tgm-album.jpg".to_owned()),
+                },
+            )
+            .await
+            .expect("上传源相册失败"),
+        );
+    }
+    let base = fresh_random_id();
+    let source_random_ids: Vec<_> = (0..3)
+        .map(|position| tgm_app::delivery::media_group_random_id(base, position))
+        .collect();
+    let source_ids = bot
+        .send_media_group(chat, &source_random_ids, source_media, &caption)
+        .await
+        .expect("发送源相册失败");
+    assert_eq!(source_ids.len(), 3);
+    let incoming = reader
+        .read_messages(chat, &source_ids)
+        .await
+        .expect("用户读取源相册失败");
+    let group_id = incoming[0].grouped_id.expect("源消息未组成相册");
+    assert!(
+        incoming
+            .iter()
+            .all(|message| message.grouped_id == Some(group_id))
+    );
+    let username = required("TGM_LIVE_TARGET_USERNAME");
+    let setup = setup(admin, chat, username.trim_start_matches('@')).await;
+    let role: String = sqlx::query_scalar("SELECT current_user")
+        .fetch_one(&setup.app)
+        .await
+        .expect("读角色失败");
+    assert_eq!(role, "app_user");
+    for message in &incoming {
+        let event = tgm_app::mtproto_worker::canonical_event(setup.receiver, message, 0)
+            .expect("规范化成员失败");
+        insert_canonical_event(&setup.app, &event)
+            .await
+            .expect("写源相册失败");
+    }
+    tgm_app::pipeline::run_fanout_once(&setup.app, 100)
+        .await
+        .expect("窗口内扇出失败");
+    let projections: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM tenant_events WHERE tenant_id = $1")
+            .bind(setup.tenant)
+            .fetch_one(setup.admin.raw())
+            .await
+            .expect("读投影失败");
+    assert_eq!(projections, 0, "窗口未结束不得扇出");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    tgm_app::pipeline::run_fanout_once(&setup.app, 100)
+        .await
+        .expect("聚合扇出失败");
+    tgm_app::pipeline::run_rule_once(&setup.app, 100)
+        .await
+        .expect("规则处理失败");
+    let tasks: Vec<i64> = sqlx::query_scalar("SELECT id FROM delivery_tasks WHERE tenant_id = $1")
+        .bind(setup.tenant)
+        .fetch_all(setup.admin.raw())
+        .await
+        .expect("读任务失败");
+    assert_eq!(tasks.len(), 1);
+    let task = tasks[0];
+    let store = support::media_store("tgm-live-album").await;
+    let transport = TelegramDeliveryTransport::new(Arc::clone(&bot), store.clone());
+    assert_eq!(
+        run_delivery_once(&setup.app, setup.tenant, setup.sender, &transport)
+            .await
+            .expect("等待中转失败"),
+        DeliveryRunOutcome::Deferred { task_id: task }
+    );
+    let guard = LeaseGuard {
+        identity_id: setup.receiver,
+        worker_id: "album-live".to_owned(),
+        fencing_token: acquire_lease(&setup.app, setup.receiver, "album-live")
+            .await
+            .expect("抢租约失败")
+            .expect("租约不可用"),
+    };
+    for _ in 0..3 {
+        assert!(
+            tgm_db::repo::renew_lease(
+                &setup.app,
+                setup.receiver,
+                &guard.worker_id,
+                guard.fencing_token
+            )
+            .await
+            .expect("续租失败")
+        );
+        assert!(matches!(
+            run_relay_once(&setup.app, &guard, &reader, &store)
+                .await
+                .expect("成员中转失败"),
+            RelayOutcome::Ready { .. }
+        ));
+    }
+    sqlx::query("UPDATE delivery_tasks SET next_retry_at = NULL WHERE id = $1")
+        .bind(task)
+        .execute(setup.admin.raw())
+        .await
+        .expect("清退避失败");
+    let outcome = run_delivery_once(&setup.app, setup.tenant, setup.sender, &transport)
+        .await
+        .expect("整组投递失败");
+    let DeliveryRunOutcome::Done {
+        telegram_message_id,
+        ..
+    } = outcome
+    else {
+        let errors = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT error_code, error_msg FROM delivery_logs WHERE task_id = $1 ORDER BY attempt",
+        )
+        .bind(task)
+        .fetch_all(setup.admin.raw())
+        .await
+        .expect("读取投递失败原因失败");
+        panic!("整组未完成：{outcome:?} errors={errors:?}")
+    };
+    let record = load_delivery_task_payload(&setup.app, setup.tenant, task)
+        .await
+        .expect("读快照失败")
+        .expect("快照不存在");
+    let mut payload = build_delivery_payload(&record).expect("载荷无效");
+    for state in tgm_db::repo::load_media_group_relay_for_task(&setup.app, setup.tenant, task)
+        .await
+        .expect("读整组中转失败")
+    {
+        payload.media_group.push(DeliveryMedia {
+            object_key: state.object_key.expect("对象未就绪"),
+            media_type: state.media_type.expect("类型不存在"),
+            mime_type: state.mime_type,
+            file_name: state.file_name,
+        });
+    }
+    let repeated = transport
+        .deliver(payload.clone())
+        .await
+        .expect("相册重发失败");
+    assert_eq!(
+        repeated, telegram_message_id,
+        "相同 random_id 重发必须返回原消息"
+    );
+    let output = reader
+        .read_media_group(chat, telegram_message_id)
+        .await
+        .expect("读目标相册失败");
+    let target_group_id = output[0].grouped_id.expect("目标消息没有相册 id");
+    assert_eq!(output.len(), 3, "目标相册必须包含全部成员");
+    assert_eq!(output[0].text.as_deref(), Some(caption.as_str()));
+    assert_ne!(target_group_id, group_id);
+    let forward_base = fresh_random_id();
+    let forward_ids: Vec<_> = (0..3)
+        .map(|position| tgm_app::delivery::media_group_random_id(forward_base, position))
+        .collect();
+    let forwarded = bot
+        .forward_media_group(chat, &source_ids, chat, &forward_ids)
+        .await
+        .expect("整组转发失败");
+    let forwarded_again = bot
+        .forward_media_group(chat, &source_ids, chat, &forward_ids)
+        .await
+        .expect("转发重试失败");
+    assert_eq!(forwarded, forwarded_again);
+    let forwarded_messages = reader
+        .read_messages(chat, &forwarded)
+        .await
+        .expect("读取转发相册失败");
+    assert!(forwarded_messages[0].grouped_id.is_some());
+    assert!(
+        forwarded_messages
+            .iter()
+            .all(|message| message.grouped_id == forwarded_messages[0].grouped_id)
+    );
+    println!(
+        "[G] source_ids={source_ids:?} source_group={group_id} tasks=1 members={} first_target={telegram_message_id} target_group={target_group_id} same_random_id={repeated} forwarded={forwarded:?}",
+        payload.media_group.len()
+    );
+    drop(transport);
+    user.shutdown().await.expect("用户客户端关闭失败");
+    match Arc::try_unwrap(bot) {
+        Ok(bot) => bot.shutdown().await.expect("Bot 客户端关闭失败"),
+        Err(_) => panic!("Bot 客户端仍被引用"),
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]

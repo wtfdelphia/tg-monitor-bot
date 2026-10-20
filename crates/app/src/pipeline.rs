@@ -6,9 +6,10 @@ use tgm_core::error::AppError;
 use tgm_core::ids::TenantId;
 use tgm_db::repo::{
     DeliveryTaskInput, DeliveryTaskWrite, RuleConditionRecord, RuleRecord, TenantEventRecord,
-    enqueue_delivery_tasks, fanout_canonical_event, list_all_active_tenants,
-    list_unfanned_canonical_event_ids, list_unprocessed_tenant_event_ids, load_enabled_rules,
-    load_rule_version, load_tenant_event, load_tenant_plan, mark_canonical_event_fanned_out,
+    aggregate_ready_media_groups, enqueue_delivery_tasks, fanout_canonical_event,
+    list_all_active_tenants, list_unfanned_canonical_event_ids, list_unprocessed_tenant_event_ids,
+    load_enabled_rules, load_media_group_members, load_rule_version, load_tenant_event,
+    load_tenant_plan, mark_canonical_event_fanned_out,
 };
 use tokio::sync::watch;
 
@@ -142,6 +143,7 @@ pub async fn run_fanout_once(
         ));
     }
 
+    aggregate_ready_media_groups(pool, event_batch_size).await?;
     let event_ids = list_unfanned_canonical_event_ids(pool, event_batch_size).await?;
     let mut tenant_count = 0;
     for event_id in &event_ids {
@@ -321,7 +323,11 @@ pub async fn process_tenant_event(
         rules.push(rule);
     }
 
-    let matches = if event_record.event_type == "MESSAGE_CREATED" {
+    let members = load_media_group_members(pool, tenant, tenant_event_id).await?;
+    let matches = if matches!(
+        event_record.event_type.as_str(),
+        "MESSAGE_CREATED" | "MEDIA_GROUP_COMPLETED"
+    ) {
         evaluate_rules(&event, &rules)?
     } else {
         Vec::new()
@@ -354,6 +360,7 @@ pub async fn process_tenant_event(
                 &version.snapshot,
                 &matched_keywords,
                 media == MediaRoute::TextOnly,
+                &members,
             )?,
             media_relay: media == MediaRoute::Relay,
             dead_error_code: (media == MediaRoute::TooLarge).then(|| "MEDIA_TOO_LARGE".to_owned()),

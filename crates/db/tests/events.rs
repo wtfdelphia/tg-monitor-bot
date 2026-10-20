@@ -72,6 +72,179 @@ fn bot_event(identity_id: IdentityId, message_id: i64, update_id: i64) -> Canoni
     }
 }
 
+async fn group_member(app: &PgPool, identity: IdentityId, message_id: i64, caption: &str) -> i64 {
+    let mut input = event(identity);
+    input.tg_message_id = message_id;
+    input.media_group_id = Some("album-1".to_owned());
+    input.text = None;
+    input.caption = Some(caption.to_owned());
+    input.media_type = Some(if message_id == 10 { "PHOTO" } else { "VIDEO" }.to_owned());
+    insert_canonical_event(app, &input)
+        .await
+        .expect("写组成员失败")
+        .id
+}
+
+async fn expire_group_window(app: &PgPool) {
+    sqlx::query(
+        "UPDATE canonical_events SET created_at = clock_timestamp() - interval '3 seconds'",
+    )
+    .execute(app)
+    .await
+    .expect("推进聚合窗口失败");
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn media_group_window_order_idempotency_and_late_arrival(admin: PgPool) {
+    use tgm_db::repo::{aggregate_ready_media_groups, list_unfanned_canonical_event_ids};
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let identity = seed_identity(&admin).await;
+    let last = group_member(&app, identity, 30, "urgent album").await;
+    let first = group_member(&app, identity, 10, "").await;
+    let middle = group_member(&app, identity, 20, "").await;
+    aggregate_ready_media_groups(&app, 100)
+        .await
+        .expect("聚合失败");
+    assert!(
+        list_unfanned_canonical_event_ids(&app, 100)
+            .await
+            .expect("待扇出查询失败")
+            .is_empty()
+    );
+    expire_group_window(&app).await;
+    let (left, right) = tokio::join!(
+        aggregate_ready_media_groups(&app, 100),
+        aggregate_ready_media_groups(&app, 100)
+    );
+    left.expect("并发聚合一失败");
+    right.expect("并发聚合二失败");
+    let groups: Vec<(i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, tg_message_id, caption, media_type FROM canonical_events WHERE event_type = 'MEDIA_GROUP_COMPLETED'",
+    ).fetch_all(&app).await.expect("读聚合事件失败");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].1, 10);
+    assert_eq!(groups[0].2.as_deref(), Some("urgent album"));
+    assert_eq!(groups[0].3.as_deref(), Some("PHOTO"));
+    let members: Vec<(i64, i32)> = sqlx::query_as(
+        "SELECT member_event_id, position FROM media_group_members WHERE group_event_id = $1 ORDER BY position",
+    ).bind(groups[0].0).fetch_all(&app).await.expect("读成员失败");
+    assert_eq!(members, vec![(first, 0), (middle, 1), (last, 2)]);
+    assert_eq!(
+        list_unfanned_canonical_event_ids(&app, 100)
+            .await
+            .expect("查询失败"),
+        vec![groups[0].0]
+    );
+    let late = group_member(&app, identity, 40, "late").await;
+    aggregate_ready_media_groups(&app, 100)
+        .await
+        .expect("重扫失败");
+    let ready = list_unfanned_canonical_event_ids(&app, 100)
+        .await
+        .expect("查询失败");
+    assert_eq!(ready, vec![groups[0].0, late]);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM media_group_members")
+        .fetch_one(&app)
+        .await
+        .expect("数成员失败");
+    assert_eq!(count, 3);
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn media_group_members_privileges_and_cascade(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let identity = seed_identity(&admin).await;
+    group_member(&app, identity, 10, "caption").await;
+    expire_group_window(&app).await;
+    tgm_db::repo::aggregate_ready_media_groups(&app, 10)
+        .await
+        .expect("聚合失败");
+    let flags: (bool, bool) = sqlx::query_as("SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = 'media_group_members'::regclass")
+        .fetch_one(&app).await.expect("读 RLS 标志失败");
+    assert_eq!(flags, (false, false));
+    let grants: (bool, bool, bool, bool) = sqlx::query_as("SELECT has_table_privilege(current_user, 'media_group_members', 'SELECT'), has_table_privilege(current_user, 'media_group_members', 'INSERT'), has_table_privilege(current_user, 'media_group_members', 'UPDATE'), has_table_privilege(current_user, 'media_group_members', 'DELETE')")
+        .fetch_one(&app).await.expect("读权限失败");
+    assert_eq!(grants, (true, true, false, false));
+    assert!(
+        sqlx::query("UPDATE media_group_members SET position = 9")
+            .execute(&app)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("DELETE FROM media_group_members")
+            .execute(&app)
+            .await
+            .is_err()
+    );
+    sqlx::query("DELETE FROM canonical_events WHERE event_type = 'MEDIA_GROUP_COMPLETED'")
+        .execute(admin.raw())
+        .await
+        .expect("删除组事件失败");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM media_group_members")
+        .fetch_one(&app)
+        .await
+        .expect("数成员失败");
+    assert_eq!(count, 0);
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn media_group_writes_wait_for_aggregation_lock(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let identity = seed_identity(&admin).await;
+    let mut guard = app.begin().await.expect("开始聚合事务失败");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("media-group:{}:-1001:album-1", identity.get()))
+        .execute(&mut *guard)
+        .await
+        .expect("锁定组失败");
+    let writer_pool = app.clone();
+    let writer =
+        tokio::spawn(async move { group_member(&writer_pool, identity, 10, "caption").await });
+    let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND database = (SELECT oid FROM pg_database WHERE datname = current_database()))")
+                .fetch_one(admin.raw()).await.expect("探测锁等待失败");
+            if blocked { break; }
+            assert!(!writer.is_finished(), "写入未等待聚合锁");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await;
+    guard.commit().await.expect("提交聚合事务失败");
+    writer.await.expect("写入任务退出");
+    waiting.expect("没有观测到 advisory 锁等待");
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn media_group_keys_include_identity_and_chat(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let first = seed_identity(&admin).await;
+    let second = seed_identity(&admin).await;
+    group_member(&app, first, 10, "first").await;
+    group_member(&app, second, 10, "second").await;
+    let mut other_chat = event(first);
+    other_chat.media_group_id = Some("album-1".to_owned());
+    other_chat.tg_chat_id = -1002;
+    other_chat.media_type = Some("PHOTO".to_owned());
+    insert_canonical_event(&app, &other_chat)
+        .await
+        .expect("写另一频道失败");
+    expire_group_window(&app).await;
+    tgm_db::repo::aggregate_ready_media_groups(&app, 100)
+        .await
+        .expect("聚合失败");
+    let sizes: Vec<i64> =
+        sqlx::query_scalar("SELECT count(*) FROM media_group_members GROUP BY group_event_id")
+            .fetch_all(&app)
+            .await
+            .expect("读组大小失败");
+    assert_eq!(sizes, vec![1, 1, 1], "不同身份或频道不得被同 group id 混组");
+}
+
 #[sqlx::test(migrations = "../../migrations-test")]
 async fn canonical_event_insert_is_idempotent_and_edit_versions_are_distinct(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
