@@ -44,3 +44,14 @@ ADR-0033 定案时的依据是「连续 5 次登录未触发限流」，样本�
 
 - 是否接受 A 作为首发形态。ADR-0033 已定案、正文不改；若要把限流实测写进决策记录，需要一份新 ADR。
 - 是否立项 B（新增列/表 + 新 ADR）。
+
+## 批准记录（2026-10-20）
+
+测试环境提供方批准方案 B（加密落库）。落地：迁移 `migrations/0021_identity_secret_bot_session.sql`、
+`docs/design/decisions/ADR-0034-投递Bot的session加密落库.md`。三个待解问题的处理：
+
+- 写入时机：Token 登录成功后立即写回，不等退出（SIGKILL 不经过退出路径）。
+- Token 轮换：control-plane 覆盖凭据的同一条 UPSERT 清空 session；delivery 写回时校验 DEK 密文
+  仍是读出时那一份，Token 在登录期间被换掉就丢弃。
+- 与 `mark_bot_sender_unauthorized` 的关系：复用 session 时 auth key 被拒只清 session、退回 Token 登录，
+  不标 `unauthorized`；Token 本身被拒才标。

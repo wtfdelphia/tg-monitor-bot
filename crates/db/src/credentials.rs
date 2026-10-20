@@ -17,7 +17,10 @@
 //! 不缓存解开的 DEK（eng/01 §三 末段）：每次读取各自 unwrap，用完随 `Secret` 的 `Drop` 清零。
 
 use sqlx::PgPool;
-use tgm_core::credential::{Sealed, generate_dek, open_identity_secret, seal_identity_secret};
+use tgm_core::credential::{
+    Sealed, generate_dek, open_bot_session, open_identity_secret, seal_bot_session,
+    seal_identity_secret,
+};
 use tgm_core::ids::{IdentityId, TenantId};
 use tgm_core::kek::{Kek, KekContext, KekError};
 use tgm_core::secret::Secret;
@@ -80,10 +83,15 @@ const UPSERT_SECRET: &str = "INSERT INTO identity_secrets
             nonce = EXCLUDED.nonce,
             dek_ciphertext = EXCLUDED.dek_ciphertext,
             kek_id = EXCLUDED.kek_id,
+            bot_session_ciphertext = NULL,
+            bot_session_nonce = NULL,
             updated_at = now()
      RETURNING identity_id";
 
 /// 写入（或覆盖）一个已有身份的凭据密文。Bot 存 token，MTProto 存 session。
+///
+/// 覆盖时一并清空 Bot session（ADR-0034）：新凭据换了 DEK，旧 session 既解不开、
+/// 也不该在 Token 轮换后继续代表这个 Bot 登录。
 pub async fn store_identity_secret(
     pool: &PgPool,
     kek: &dyn Kek,
@@ -318,4 +326,147 @@ pub async fn load_identity_secret(
         &nonce,
         &ciphertext,
     )?))
+}
+
+/// 读出该身份的凭据与 Bot session（ADR-0034）。一次 unwrap 解两份密文：
+/// 两者同一个 DEK，分开读会多一次 KMS 往返。身份没有存过凭据时返回 `None`。
+pub async fn load_bot_credentials(
+    pool: &PgPool,
+    kek: &dyn Kek,
+    tenant: TenantId,
+    identity: IdentityId,
+) -> Result<Option<BotCredentials>, CredentialError> {
+    type Row = (
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    );
+    let row = tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query_as::<_, Row>(
+                "SELECT s.secret_ciphertext, s.nonce, s.dek_ciphertext, s.kek_id,
+                        s.bot_session_ciphertext, s.bot_session_nonce
+                   FROM identity_secrets s
+                   JOIN identities i ON i.id = s.identity_id
+                  WHERE i.tenant_id = $1 AND s.identity_id = $2 AND i.kind = 'bot'",
+            )
+            .bind(tenant.get())
+            .bind(identity.get())
+            .fetch_optional(conn)
+            .await
+        })
+    })
+    .await?;
+    let Some((ciphertext, nonce, dek_ciphertext, kek_id, session_ciphertext, session_nonce)) = row
+    else {
+        return Ok(None);
+    };
+    if kek_id != kek.kek_id() {
+        return Err(CredentialError::KekMismatch);
+    }
+    let dek = kek
+        .unwrap(
+            &dek_ciphertext,
+            &KekContext::new(tenant.get(), identity.get()),
+        )
+        .await?;
+    let token = open_identity_secret(&dek, identity.get(), &nonce, &ciphertext)?;
+    // session 解不开（被篡改、被抄自别的身份）不是致命错误：退回 Token 重新登录即可。
+    let session = match (session_ciphertext, session_nonce) {
+        (Some(ciphertext), Some(nonce)) => {
+            open_bot_session(&dek, identity.get(), &nonce, &ciphertext).ok()
+        }
+        _ => None,
+    };
+    Ok(Some(BotCredentials {
+        token,
+        session,
+        dek_ciphertext,
+    }))
+}
+
+/// [`load_bot_credentials`] 的结果。`dek_ciphertext` 是读出时的 DEK 密文，
+/// 写回 session 时用它确认这期间 Token 没被换掉。
+pub struct BotCredentials {
+    pub token: Secret<Vec<u8>>,
+    pub session: Option<Secret<Vec<u8>>>,
+    dek_ciphertext: Vec<u8>,
+}
+
+impl std::fmt::Debug for BotCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BotCredentials([REDACTED])")
+    }
+}
+
+/// 把 Bot session 加密写回（ADR-0034）。需要 KEK 的 unwrap：session 必须用 Token 那份 DEK
+/// 加密，否则两份密文的 DEK 各在一处、对不上。调用方是 delivery，它本来就持有 Decrypt。
+///
+/// 只在 DEK 未变时写入：读出之后 Token 被 control-plane 覆盖过，这份 session 属于旧 Token，
+/// 丢弃。返回是否写入。
+pub async fn store_bot_session(
+    pool: &PgPool,
+    kek: &dyn Kek,
+    tenant: TenantId,
+    identity: IdentityId,
+    credentials: &BotCredentials,
+    session: &Secret<Vec<u8>>,
+) -> Result<bool, CredentialError> {
+    let dek = kek
+        .unwrap(
+            &credentials.dek_ciphertext,
+            &KekContext::new(tenant.get(), identity.get()),
+        )
+        .await?;
+    let sealed = seal_bot_session(&dek, identity.get(), session.expose())?;
+    drop(dek);
+    let dek_ciphertext = credentials.dek_ciphertext.clone();
+    let written = tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query_scalar::<_, i64>(
+                "UPDATE identity_secrets AS s
+                    SET bot_session_ciphertext = $3, bot_session_nonce = $4
+                   FROM identities i
+                  WHERE i.id = s.identity_id AND i.tenant_id = $1 AND s.identity_id = $2
+                    AND i.kind = 'bot' AND s.dek_ciphertext = $5
+                 RETURNING s.identity_id",
+            )
+            .bind(tenant.get())
+            .bind(identity.get())
+            .bind(sealed.ciphertext)
+            .bind(sealed.nonce)
+            .bind(dek_ciphertext)
+            .fetch_optional(conn)
+            .await
+        })
+    })
+    .await?;
+    Ok(written.is_some())
+}
+
+/// 丢弃 Bot session（auth key 被 Telegram 判失效时）。下次启动改用 Token 登录。
+pub async fn clear_bot_session(
+    pool: &PgPool,
+    tenant: TenantId,
+    identity: IdentityId,
+) -> Result<(), CredentialError> {
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query(
+                "UPDATE identity_secrets AS s
+                    SET bot_session_ciphertext = NULL, bot_session_nonce = NULL
+                   FROM identities i
+                  WHERE i.id = s.identity_id AND i.tenant_id = $1 AND s.identity_id = $2",
+            )
+            .bind(tenant.get())
+            .bind(identity.get())
+            .execute(conn)
+            .await
+        })
+    })
+    .await?;
+    Ok(())
 }

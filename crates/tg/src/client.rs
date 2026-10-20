@@ -39,6 +39,8 @@ pub enum TelegramClientError {
     MediaResendUnavailable,
     #[error("仅发送客户端不接收更新")]
     SendOnly,
+    #[error("落库的 session 登录的不是 Bot")]
+    NotBot,
     #[error("session 快照失败: {0}")]
     Snapshot(#[source] StoredSessionError),
     #[error("Telegram runner 关闭失败: {0}")]
@@ -128,14 +130,58 @@ impl TelegramClient {
 
     /// 以 Bot Token 经 MTProto 登录的仅发送客户端（ADR-0033）。
     ///
-    /// session 只在内存里，不落库：Bot 凭 Token 随时可重新登录，持久化它换不来恢复能力。
+    /// 从空 session 登录。登录成功后用 [`TelegramClient::bot_session_snapshot`] 取 session
+    /// 交给凭据层加密落库，下次用 [`TelegramClient::resume_bot_sender`] 复用（ADR-0034）。
     /// `api_id` / `api_hash` 是平台自己的；返回 Bot 的 user id。
     pub async fn connect_bot_sender(
         config: TelegramClientConfig,
         api_hash: &Secret<String>,
         bot_token: &Secret<String>,
     ) -> Result<(Self, i64), TelegramClientError> {
-        let session = Arc::new(StoredSession::default());
+        let client = Self::send_only(config, StoredSession::default());
+        match client
+            .client
+            .bot_sign_in(bot_token.expose(), api_hash.expose())
+            .await
+        {
+            Ok(me) => {
+                let bot_id = me.id().bare_id().unwrap_or_default();
+                Ok((client, bot_id))
+            }
+            Err(error) => {
+                let _ = client.shutdown().await;
+                Err(TelegramClientError::Invocation(error))
+            }
+        }
+    }
+
+    /// 用落库的 Bot session 建仅发送客户端，不调 `auth.importBotAuthorization`（ADR-0034）。
+    ///
+    /// 以一次 `users.getUsers(self)` 确认 auth key 仍有效并取回 Bot id。session 失效时
+    /// 返回的错误 [`TelegramClientError::is_unauthorized`] 为真，调用方应改用 Token 重新登录。
+    pub async fn resume_bot_sender(
+        config: TelegramClientConfig,
+        session: StoredSession,
+    ) -> Result<(Self, i64), TelegramClientError> {
+        let client = Self::send_only(config, session);
+        match client.client.get_me().await {
+            Ok(me) if me.is_bot() => {
+                let bot_id = me.id().bare_id().unwrap_or_default();
+                Ok((client, bot_id))
+            }
+            Ok(_) => {
+                let _ = client.shutdown().await;
+                Err(TelegramClientError::NotBot)
+            }
+            Err(error) => {
+                let _ = client.shutdown().await;
+                Err(TelegramClientError::Invocation(error))
+            }
+        }
+    }
+
+    fn send_only(config: TelegramClientConfig, session: StoredSession) -> Self {
+        let session = Arc::new(session);
         let SenderPool {
             runner,
             updates,
@@ -146,27 +192,13 @@ impl TelegramClient {
         let runner_task = tokio::spawn(async move {
             runner.run().await;
         });
-        let me = match client
-            .bot_sign_in(bot_token.expose(), api_hash.expose())
-            .await
-        {
-            Ok(me) => me,
-            Err(error) => {
-                handle.quit();
-                let _ = runner_task.await;
-                return Err(TelegramClientError::Invocation(error));
-            }
-        };
-        Ok((
-            Self {
-                client,
-                session,
-                handle: handle.thin,
-                updates: None,
-                runner_task,
-            },
-            me.id().bare_id().unwrap_or_default(),
-        ))
+        Self {
+            client,
+            session,
+            handle: handle.thin,
+            updates: None,
+            runner_task,
+        }
     }
 
     pub async fn next_update(&mut self) -> Result<Update, TelegramClientError> {
@@ -321,6 +353,13 @@ impl TelegramClient {
             .sync_update_state()
             .await
             .map_err(TelegramClientError::SessionSync)?;
+        self.session
+            .snapshot()
+            .map_err(TelegramClientError::Snapshot)
+    }
+
+    /// 仅发送客户端的 session 快照（没有更新流可同步）。输出含 auth key，只能交给信封加密落库。
+    pub fn bot_session_snapshot(&self) -> Result<Secret<Vec<u8>>, TelegramClientError> {
         self.session
             .snapshot()
             .map_err(TelegramClientError::Snapshot)

@@ -55,3 +55,5 @@
 真机验收 `docs/plan/evidence/WP-5-delivery真机验收-2026-10-19.md`；
 落地在 `spec/02-总体架构.md`（投递角色）、`spec/06-合规与凭据责任.md`（`api_id` 归属）、
 `spec/08-账号接入.md`（只读纪律）。
+
+决定节最后一条（session 不落库）已被 [[ADR-0034]] 取代。

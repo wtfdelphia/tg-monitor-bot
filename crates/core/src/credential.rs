@@ -19,6 +19,9 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 pub const NONCE_LEN: usize = 12;
 
 const SECRET_AAD_PREFIX: &[u8] = b"tgm:identity_secrets:secret:v1:";
+/// Bot 的 MTProto session 与 Token 共用一个 DEK（ADR-0034），AAD 前缀不同：
+/// 把 Token 密文抄进 session 列（或反过来）在解密时失败。
+const BOT_SESSION_AAD_PREFIX: &[u8] = b"tgm:identity_secrets:bot_session:v1:";
 
 /// 一次加密的产物，两个字段分别落 `secret_ciphertext` 与 `nonce`。
 #[derive(Debug)]
@@ -36,8 +39,8 @@ pub fn generate_dek() -> Result<Secret<[u8; DEK_LEN]>, KekError> {
     Ok(dek)
 }
 
-fn secret_aad(identity_id: i64) -> Vec<u8> {
-    let mut aad = SECRET_AAD_PREFIX.to_vec();
+fn aad(prefix: &[u8], identity_id: i64) -> Vec<u8> {
+    let mut aad = prefix.to_vec();
     aad.extend_from_slice(&identity_id.to_be_bytes());
     aad
 }
@@ -49,14 +52,26 @@ pub fn seal_identity_secret(
     identity_id: i64,
     plaintext: &[u8],
 ) -> Result<Sealed, KekError> {
+    seal(dek, &aad(SECRET_AAD_PREFIX, identity_id), plaintext)
+}
+
+/// 加密一个 Bot 身份的 MTProto session（ADR-0034）。
+pub fn seal_bot_session(
+    dek: &Secret<[u8; DEK_LEN]>,
+    identity_id: i64,
+    plaintext: &[u8],
+) -> Result<Sealed, KekError> {
+    seal(dek, &aad(BOT_SESSION_AAD_PREFIX, identity_id), plaintext)
+}
+
+fn seal(dek: &Secret<[u8; DEK_LEN]>, aad: &[u8], plaintext: &[u8]) -> Result<Sealed, KekError> {
     let nonce: Nonce<_> = Nonce::try_generate().map_err(|_| KekError::Rng)?;
-    let aad = secret_aad(identity_id);
     let ciphertext = Aes256Gcm::new(dek.expose().into())
         .encrypt(
             &nonce,
             Payload {
                 msg: plaintext,
-                aad: &aad,
+                aad,
             },
         )
         .map_err(|_| KekError::Crypto)?;
@@ -74,14 +89,37 @@ pub fn open_identity_secret(
     nonce: &[u8],
     ciphertext: &[u8],
 ) -> Result<Secret<Vec<u8>>, KekError> {
+    open(dek, &aad(SECRET_AAD_PREFIX, identity_id), nonce, ciphertext)
+}
+
+/// 解密 [`seal_bot_session`] 的产物。失败口径同 [`open_identity_secret`]。
+pub fn open_bot_session(
+    dek: &Secret<[u8; DEK_LEN]>,
+    identity_id: i64,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<Secret<Vec<u8>>, KekError> {
+    open(
+        dek,
+        &aad(BOT_SESSION_AAD_PREFIX, identity_id),
+        nonce,
+        ciphertext,
+    )
+}
+
+fn open(
+    dek: &Secret<[u8; DEK_LEN]>,
+    aad: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<Secret<Vec<u8>>, KekError> {
     let nonce: &Nonce<_> = nonce.try_into().map_err(|_| KekError::Crypto)?;
-    let aad = secret_aad(identity_id);
     let plain = Aes256Gcm::new(dek.expose().into())
         .decrypt(
             nonce,
             Payload {
                 msg: ciphertext,
-                aad: &aad,
+                aad,
             },
         )
         .map_err(|_| KekError::Crypto)?;
@@ -91,7 +129,10 @@ pub fn open_identity_secret(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{NONCE_LEN, generate_dek, open_identity_secret, seal_identity_secret};
+    use super::{
+        NONCE_LEN, generate_dek, open_bot_session, open_identity_secret, seal_bot_session,
+        seal_identity_secret,
+    };
 
     #[test]
     fn roundtrip_and_fresh_nonce() {
@@ -113,6 +154,25 @@ mod tests {
             open_identity_secret(&dek, 8, &sealed.nonce, &sealed.ciphertext).is_err(),
             "密文搬到别的身份上竟然解开了"
         );
+    }
+
+    #[test]
+    fn token_and_bot_session_ciphertexts_are_not_interchangeable() {
+        let dek = generate_dek().expect("生成 DEK 失败");
+        let token = seal_identity_secret(&dek, 7, b"bot-token").expect("加密失败");
+        let session = seal_bot_session(&dek, 7, b"session").expect("加密失败");
+        assert!(
+            open_bot_session(&dek, 7, &token.nonce, &token.ciphertext).is_err(),
+            "Token 密文被当成 session 解开了"
+        );
+        assert!(
+            open_identity_secret(&dek, 7, &session.nonce, &session.ciphertext).is_err(),
+            "session 密文被当成 Token 解开了"
+        );
+        assert!(open_bot_session(&dek, 8, &session.nonce, &session.ciphertext).is_err());
+        let back =
+            open_bot_session(&dek, 7, &session.nonce, &session.ciphertext).expect("解密失败");
+        assert_eq!(back.expose().as_slice(), b"session");
     }
 
     #[test]

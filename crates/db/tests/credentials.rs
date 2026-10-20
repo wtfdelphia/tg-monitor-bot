@@ -11,8 +11,8 @@ use tgm_core::kek::{DEK_LEN, EnvKek, Kek, KekContext, KekError};
 use tgm_core::profile::Profile;
 use tgm_core::secret::Secret;
 use tgm_db::credentials::{
-    CredentialError, NewBotIdentity, create_bot_identity, load_identity_secret,
-    store_identity_secret,
+    CredentialError, NewBotIdentity, clear_bot_session, create_bot_identity, load_bot_credentials,
+    load_identity_secret, store_bot_session, store_identity_secret,
 };
 
 const LOCAL_KEK: &str = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=";
@@ -427,4 +427,170 @@ async fn concurrent_create_of_same_bot_yields_one_identity(admin: PgPool) {
     .await
     .expect("计数失败");
     assert_eq!(rows, 1);
+}
+
+async fn session_columns(
+    admin: &support::AdminOnlyPool,
+    identity: IdentityId,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    sqlx::query_as(
+        "SELECT bot_session_ciphertext, bot_session_nonce FROM identity_secrets WHERE identity_id = $1",
+    )
+    .bind(identity)
+    .fetch_one(admin.raw())
+    .await
+    .expect("读 session 列失败")
+}
+
+/// ADR-0034：Bot session 与 Token 同 DEK、同行加密落库；Token 覆盖时 session 一并清空。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn bot_session_roundtrips_and_is_cleared_when_token_is_replaced(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let tenant = seed_tenant(&admin, "cred-bot-session", 6701).await;
+    let identity = seed_identity(&admin, tenant).await;
+    let kek = kek();
+    store_identity_secret(&app, &kek, tenant, identity, &secret(b"123456:token-a"))
+        .await
+        .expect("写 Token 失败");
+
+    let first = load_bot_credentials(&app, &kek, tenant, identity)
+        .await
+        .expect("读取失败")
+        .expect("应当读到凭据");
+    assert!(first.session.is_none());
+    assert!(
+        store_bot_session(
+            &app,
+            &kek,
+            tenant,
+            identity,
+            &first,
+            &secret(b"TGMS-session")
+        )
+        .await
+        .expect("写 session 失败")
+    );
+    let (ciphertext, nonce) = session_columns(&admin, identity).await;
+    let ciphertext = ciphertext.expect("session 密文为空");
+    assert!(nonce.is_some());
+    assert!(
+        !ciphertext.windows(4).any(|window| window == b"TGMS"),
+        "session 以明文落库"
+    );
+
+    let second = load_bot_credentials(&app, &kek, tenant, identity)
+        .await
+        .expect("读取失败")
+        .expect("应当读到凭据");
+    assert_eq!(second.token.expose().as_slice(), b"123456:token-a");
+    assert_eq!(
+        second
+            .session
+            .as_ref()
+            .map(|session| session.expose().clone()),
+        Some(b"TGMS-session".to_vec())
+    );
+
+    store_identity_secret(&app, &kek, tenant, identity, &secret(b"123456:token-b"))
+        .await
+        .expect("覆盖 Token 失败");
+    assert_eq!(session_columns(&admin, identity).await, (None, None));
+
+    // 读出之后 Token 被换掉：拿旧读数写回的 session 必须被拒，不能搭上新 Token 那一行。
+    assert!(
+        !store_bot_session(&app, &kek, tenant, identity, &second, &secret(b"stale"))
+            .await
+            .expect("写 session 失败")
+    );
+    assert_eq!(session_columns(&admin, identity).await, (None, None));
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn tampered_bot_session_falls_back_and_can_be_cleared(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let tenant = seed_tenant(&admin, "cred-bot-session-tamper", 6702).await;
+    let identity = seed_identity(&admin, tenant).await;
+    let kek = kek();
+    store_identity_secret(&app, &kek, tenant, identity, &secret(b"123456:token"))
+        .await
+        .expect("写 Token 失败");
+    let read = load_bot_credentials(&app, &kek, tenant, identity)
+        .await
+        .expect("读取失败")
+        .expect("应当读到凭据");
+    store_bot_session(&app, &kek, tenant, identity, &read, &secret(b"session"))
+        .await
+        .expect("写 session 失败");
+
+    // 把 Token 密文与 nonce 抄进 session 列：同 DEK、AAD 不同，必须解不开。
+    sqlx::query(
+        "UPDATE identity_secrets
+            SET bot_session_ciphertext = secret_ciphertext, bot_session_nonce = nonce
+          WHERE identity_id = $1",
+    )
+    .bind(identity)
+    .execute(admin.raw())
+    .await
+    .expect("篡改失败");
+    let back = load_bot_credentials(&app, &kek, tenant, identity)
+        .await
+        .expect("session 坏了不该让 Token 读不出来")
+        .expect("应当读到凭据");
+    assert_eq!(back.token.expose().as_slice(), b"123456:token");
+    assert!(back.session.is_none(), "Token 密文被当成 session 解开了");
+
+    clear_bot_session(&app, tenant, identity)
+        .await
+        .expect("清 session 失败");
+    assert_eq!(session_columns(&admin, identity).await, (None, None));
+
+    let half = sqlx::query(
+        "UPDATE identity_secrets SET bot_session_ciphertext = '\\x00' WHERE identity_id = $1",
+    )
+    .bind(identity)
+    .execute(admin.raw())
+    .await;
+    assert!(half.is_err(), "session 密文与 nonce 只有一半也能写进去");
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn bot_session_is_tenant_scoped(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let tenant_a = seed_tenant(&admin, "cred-bot-session-a", 6703).await;
+    let tenant_b = seed_tenant(&admin, "cred-bot-session-b", 6704).await;
+    let identity = seed_identity(&admin, tenant_a).await;
+    let kek = kek();
+    store_identity_secret(&app, &kek, tenant_a, identity, &secret(b"123456:token"))
+        .await
+        .expect("写 Token 失败");
+    assert!(
+        load_bot_credentials(&app, &kek, tenant_b, identity)
+            .await
+            .expect("读取失败")
+            .is_none(),
+        "别的租户读到了凭据"
+    );
+    let read = load_bot_credentials(&app, &kek, tenant_a, identity)
+        .await
+        .expect("读取失败")
+        .expect("应当读到凭据");
+    store_bot_session(&app, &kek, tenant_a, identity, &read, &secret(b"session"))
+        .await
+        .expect("写 session 失败");
+    let before = session_columns(&admin, identity).await;
+    // 用 A 的读数、以 B 的租户上下文写：KEK 上下文对不上，unwrap 就失败。
+    assert!(
+        store_bot_session(&app, &kek, tenant_b, identity, &read, &secret(b"hijack"))
+            .await
+            .is_err()
+    );
+    clear_bot_session(&app, tenant_b, identity)
+        .await
+        .expect("清 session 失败");
+    assert_eq!(
+        session_columns(&admin, identity).await,
+        before,
+        "别的租户改动了 session"
+    );
 }
