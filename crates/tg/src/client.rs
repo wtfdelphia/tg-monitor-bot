@@ -507,6 +507,20 @@ impl TelegramClientError {
         )
     }
 
+    /// 服务器要求的 `FLOOD_WAIT` 秒数；不是限流错误时返回 `None`。
+    pub fn flood_wait(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Invocation(grammers_client::InvocationError::Rpc(error))
+                if error.name == "FLOOD_WAIT" =>
+            {
+                error
+                    .value
+                    .map(|seconds| std::time::Duration::from_secs(u64::from(seconds)))
+            }
+            _ => None,
+        }
+    }
+
     pub fn delivery_error(&self) -> TelegramDeliveryError {
         match self {
             Self::Invocation(grammers_client::InvocationError::Rpc(error)) => {
@@ -813,6 +827,20 @@ mod tests {
         assert!(!rpc(420, "FLOOD_WAIT").is_unauthorized());
         assert!(rpc(400, "ACCESS_TOKEN_INVALID").is_bot_token_rejected());
         assert!(!rpc(420, "FLOOD_WAIT").is_bot_token_rejected());
+        assert_eq!(rpc(420, "FLOOD_WAIT").flood_wait(), None);
+        let flood = TelegramClientError::Invocation(grammers_client::InvocationError::Rpc(
+            grammers_client::sender::RpcError {
+                code: 420,
+                name: "FLOOD_WAIT".to_owned(),
+                value: Some(254),
+                caused_by: None,
+            },
+        ));
+        assert_eq!(
+            flood.flood_wait(),
+            Some(std::time::Duration::from_secs(254))
+        );
+        assert_eq!(rpc(400, "ACCESS_TOKEN_INVALID").flood_wait(), None);
     }
 
     #[test]

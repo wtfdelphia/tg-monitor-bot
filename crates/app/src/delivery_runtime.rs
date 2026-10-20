@@ -8,7 +8,11 @@
 //! - 只接 `kind = 'bot'` 的发送身份（spec/08 §1.4）。候选查询已过滤，这里登录前再核一次
 //!   Token 里的 Bot id 与登录返回的 id 一致，防止存错的 Token 以别的 Bot 发消息。
 //! - Telegram 拒绝 Token 时身份转 `unauthorized` 并写审计，不再重试登录；
-//!   其余登录失败按 `restart_delay` 冷却后重试。
+//!   其余登录失败按 `restart_delay` 冷却后重试，`FLOOD_WAIT` 时等满服务器给的秒数再重试。
+//!
+//! 退出（ops/00 §六）：登录与限流等待都响应退出信号；收到信号后最多等
+//! [`SHUTDOWN_GRACE`] 让在途投递收尾，超时直接退出 —— 正确性靠 `random_id` 与
+//! 卡住 `SENDING` 的回收，不靠优雅退出。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,6 +32,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::delivery::{DeliveryWorker, DeliveryWorkerConfig, TelegramDeliveryTransport};
+
+/// 收到退出信号后等在途发送身份收尾的上限（ops/00 §六）。
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 /// 平台自己的 MTProto 应用凭据（ADR-0033），只用于驱动租户的 Bot。
 #[derive(Clone)]
@@ -123,15 +130,32 @@ pub async fn run_sender(
     };
     let expected_bot_id = bot_id_from_token(token.expose()).unwrap_or_default();
     let client_config = TelegramClientConfig::new(app.api_id)?;
-    let (client, bot_id) =
-        match TelegramClient::connect_bot_sender(client_config, &app.api_hash, &token).await {
-            Ok(connected) => connected,
-            Err(error) if error.is_unauthorized() || error.is_bot_token_rejected() => {
-                mark_bot_sender_unauthorized(pool, tenant, identity).await?;
-                return Ok(SenderExit::Unauthorized);
+    let mut login_shutdown = shutdown.clone();
+    let connected = tokio::select! {
+        connected = TelegramClient::connect_bot_sender(client_config, &app.api_hash, &token) => connected,
+        _ = wait_for_shutdown(&mut login_shutdown) => return Ok(SenderExit::Shutdown),
+    };
+    let (client, bot_id) = match connected {
+        Ok(connected) => connected,
+        Err(error) if error.is_unauthorized() || error.is_bot_token_rejected() => {
+            mark_bot_sender_unauthorized(pool, tenant, identity).await?;
+            return Ok(SenderExit::Unauthorized);
+        }
+        Err(error) => {
+            if let Some(wait) = error.flood_wait() {
+                tracing::warn!(
+                    sender_identity_id = identity.get(),
+                    flood_wait_seconds = wait.as_secs(),
+                    "bot_sign_in 被限流，等满服务器给的时间再重试"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = wait_for_shutdown(&mut login_shutdown) => return Ok(SenderExit::Shutdown),
+                }
             }
-            Err(error) => return Err(error.into()),
-        };
+            return Err(error.into());
+        }
+    };
     drop(token);
     if bot_id != expected_bot_id {
         let _ = client.shutdown().await;
@@ -157,6 +181,31 @@ pub async fn run_sender(
     }
     result?;
     Ok(SenderExit::Shutdown)
+}
+
+/// 信号已发出或发送端已关闭时返回。
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// 等全部发送身份收尾，最多 `grace`。返回超时后仍未结束、被放弃的数量。
+pub async fn join_within(handles: Vec<JoinHandle<()>>, grace: Duration) -> usize {
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut abandoned = 0;
+    for mut handle in handles {
+        if tokio::time::timeout_at(deadline, &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            abandoned += 1;
+        }
+    }
+    abandoned
 }
 
 pub struct DeliveryRuntime {
@@ -202,8 +251,9 @@ impl DeliveryRuntime {
                 }
             }
         }
-        for (_, handle) in running {
-            let _ = handle.await;
+        let abandoned = join_within(running.into_values().collect(), SHUTDOWN_GRACE).await;
+        if abandoned > 0 {
+            tracing::warn!(abandoned, "退出等待超过上限，放弃仍在途的发送身份");
         }
         Ok(())
     }
@@ -254,8 +304,22 @@ impl DeliveryRuntime {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
-    use super::bot_id_from_token;
+    use super::{bot_id_from_token, join_within};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn shutdown_join_gives_up_after_grace() {
+        let stuck = tokio::spawn(std::future::pending::<()>());
+        let quick = tokio::spawn(async {});
+        let started = tokio::time::Instant::now();
+        let abandoned = join_within(vec![quick, stuck], Duration::from_millis(200)).await;
+        assert_eq!(abandoned, 1);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
 
     #[test]
     fn bot_id_comes_from_token_prefix() {

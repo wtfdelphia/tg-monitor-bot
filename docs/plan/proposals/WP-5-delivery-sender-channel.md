@@ -163,3 +163,27 @@ V1 / V2 / V3 全部通过，证据 `docs/plan/evidence/WP-5-delivery真机验收
 条款逐字核对完成，证据 `docs/plan/evidence/ADR-0033-条款逐字核对-2026-10-19.md`。人工批准定案，
 ADR-0033 状态改为已定案。核对新增一条硬约束（Bot 开发者条款 §5.2(f)：被封 Bot 的任务不换号重发），
 由 L2 `delivery_tasks_are_not_claimed_by_another_bot_of_same_tenant` 守住。
+
+## 常驻长跑步骤（工具：`bins/tgm/tests/delivery_soak.rs`）
+
+起真实的 `tgm serve --role delivery` 子进程，按 `TGM_SOAK_TASK_SECS` 持续放投递任务，每隔
+`TGM_SOAK_RESTART_SECS` 交替用 SIGTERM 与 SIGKILL 重启一次。判据 S1–S4 写在工具文件头：
+不丢不重、无死信、SIGTERM 30s 内以 0 退出、每次启动都能 `bot_sign_in`（ADR-0033 代价节
+「重启风暴下的限流没有测过」）。
+
+```bash
+set -a; . ~/.config/tgm-live.env; set +a      # TGM_PLATFORM_API_ID/HASH、TGM_LIVE_BOT_TOKEN、TGM_LIVE_TARGET_CHAT
+DATABASE_URL=postgres://tgm_test:tpw@127.0.0.1:55432/tgm_test_control SQLX_OFFLINE=true \
+TGM_SOAK_MINUTES=30 \
+  cargo test -p tgm --test delivery_soak -- --ignored --nocapture
+```
+
+缺任一凭据变量直接失败。输出只含计数、错误码与耗时；跑完人工核对频道里 `tgm-soak #1..#N`
+每条只出现一次，然后在 BotFather 作废测试 Token。
+
+## 常驻长跑结果（2026-10-19）
+
+30 分钟、90 条任务、3 次启动（SIGTERM 2 次、SIGKILL 1 次）全部通过 S1–S4，证据
+`docs/plan/evidence/WP-5-delivery常驻长跑-2026-10-19.md`。重启频繁时 `bot_sign_in` 会被限流
+66–305 秒，Bot session 是否落库另起提案 `docs/plan/proposals/WP-5-delivery-bot-session.md`。
+长跑中修复：登录与限流等待响应退出信号，退出等待上限 30 秒。
