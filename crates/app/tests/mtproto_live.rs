@@ -254,3 +254,392 @@ async fn live_t6_revoked_session_marks_identity_unauthorized(admin: PgPool) {
         "[T6] exit={exit:?} detected_after={took:?} status=unauthorized audits={audits} lease_takeover=ok in_candidates=false"
     );
 }
+
+// ───────────── WP-2-live-updates：U1–U3（docs/plan/proposals/WP-2-live-updates.md） ─────────────
+
+/// 测试 Bot 经 Bot API 往测试频道发消息。只用于造真机输入；采集身份本身不发送（spec/08 §1.4）。
+struct ChannelBot {
+    http: reqwest::Client,
+    base: String,
+    chat: i64,
+    sent: Vec<i64>,
+}
+
+impl ChannelBot {
+    fn new() -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base: format!(
+                "https://api.telegram.org/bot{}",
+                required("TGM_LIVE_BOT_TOKEN")
+            ),
+            chat: required("TGM_LIVE_TARGET_CHAT")
+                .parse()
+                .expect("频道 id 无效"),
+            sent: Vec::new(),
+        }
+    }
+
+    async fn call(&self, method: &str, body: serde_json::Value) -> serde_json::Value {
+        let response: serde_json::Value = self
+            .http
+            .post(format!("{}/{method}", self.base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|_| panic!("Bot API {method} 请求失败"))
+            .json()
+            .await
+            .unwrap_or_else(|_| panic!("Bot API {method} 响应无效"));
+        assert_eq!(
+            response["ok"],
+            serde_json::Value::Bool(true),
+            "Bot API {method} 失败：{}",
+            response["description"]
+        );
+        response["result"].clone()
+    }
+
+    async fn send(&mut self, text: &str) -> i64 {
+        let result = self
+            .call(
+                "sendMessage",
+                serde_json::json!({ "chat_id": self.chat, "text": text }),
+            )
+            .await;
+        let id = result["message_id"].as_i64().expect("缺 message_id");
+        self.sent.push(id);
+        id
+    }
+
+    /// 返回 Telegram 给的 `edit_date`。
+    async fn edit(&self, message_id: i64, text: &str) -> i64 {
+        let result = self
+            .call(
+                "editMessageText",
+                serde_json::json!({ "chat_id": self.chat, "message_id": message_id, "text": text }),
+            )
+            .await;
+        result["edit_date"].as_i64().expect("缺 edit_date")
+    }
+
+    async fn cleanup(&self) -> usize {
+        let mut deleted = 0;
+        for id in &self.sent {
+            let ok = self
+                .http
+                .post(format!("{}/deleteMessage", self.base))
+                .json(&serde_json::json!({ "chat_id": self.chat, "message_id": id }))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success());
+            deleted += usize::from(ok);
+        }
+        deleted
+    }
+}
+
+/// `(event_type, edit_version) -> 行数`，按 `uq_canonical` 的列统计。
+async fn event_rows(seeded: &Seeded, chat: i64, message_id: i64) -> Vec<(String, i32, i64)> {
+    sqlx::query_as(
+        "SELECT event_type, edit_version, count(*) FROM canonical_events
+          WHERE receiver_identity_id = $1 AND tg_chat_id = $2 AND tg_message_id = $3
+          GROUP BY event_type, edit_version ORDER BY event_type, edit_version",
+    )
+    .bind(seeded.identity)
+    .bind(chat)
+    .bind(message_id)
+    .fetch_all(seeded.admin.raw())
+    .await
+    .expect("读事件失败")
+}
+
+async fn text_of(seeded: &Seeded, chat: i64, message_id: i64, edit_version: i32) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT text FROM canonical_events
+          WHERE receiver_identity_id = $1 AND tg_chat_id = $2 AND tg_message_id = $3 AND edit_version = $4",
+    )
+    .bind(seeded.identity)
+    .bind(chat)
+    .bind(message_id)
+    .bind(edit_version)
+    .fetch_optional(seeded.admin.raw())
+    .await
+    .expect("读事件正文失败")
+    .flatten()
+}
+
+/// 只数测试频道：测试账号在别的对话里收到的消息同样落库，不能混进判据。
+async fn total_rows(seeded: &Seeded, chat: i64) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM canonical_events WHERE receiver_identity_id = $1 AND tg_chat_id = $2",
+    )
+    .bind(seeded.identity)
+    .bind(chat)
+    .fetch_one(seeded.admin.raw())
+    .await
+    .expect("读事件总数失败")
+}
+
+/// `updated_at` 的微秒时间戳；只做先后比较，不引 chrono。
+async fn secret_updated_at(seeded: &Seeded) -> i64 {
+    sqlx::query_scalar(
+        "SELECT (extract(epoch FROM updated_at) * 1000000)::bigint FROM identity_secrets WHERE identity_id = $1",
+    )
+        .bind(seeded.identity)
+        .fetch_one(seeded.admin.raw())
+        .await
+        .expect("读凭据行失败")
+}
+
+/// 等到 `expected` 中每个 `(message_id, event_type, edit_version)` 都恰好一行。
+async fn wait_events(
+    seeded: &Seeded,
+    chat: i64,
+    expected: &[(i64, &str, i32)],
+    label: &str,
+    seconds: u64,
+) -> Duration {
+    let started = Instant::now();
+    loop {
+        let mut all = true;
+        for (message_id, kind, version) in expected {
+            let rows = event_rows(seeded, chat, *message_id).await;
+            let count = rows
+                .iter()
+                .find(|(event, edit, _)| event == kind && edit == version)
+                .map_or(0, |row| row.2);
+            assert!(
+                count <= 1,
+                "[{label}] message {message_id} {kind}/{version} 重复 {count} 行"
+            );
+            all &= count == 1;
+        }
+        if all {
+            return started.elapsed();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(seconds),
+            "[{label}] {seconds}s 内未落齐：{expected:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn spawn_worker(
+    seeded: &Seeded,
+    worker_id: &'static str,
+) -> (
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<Result<IdentityExit, tgm_app::mtproto_worker::MtprotoWorkerError>>,
+) {
+    let (stop, shutdown) = watch::channel(false);
+    let pool = seeded.app.clone();
+    let target = MtprotoTarget {
+        tenant: seeded.tenant,
+        identity: seeded.identity,
+        api_id: api_id(),
+    };
+    let task = tokio::spawn(async move {
+        run_identity(
+            &pool,
+            &kek(),
+            target,
+            worker_id,
+            MtprotoWorkerConfig::default(),
+            None,
+            shutdown,
+        )
+        .await
+    });
+    (stop, task)
+}
+
+async fn wait_online(seeded: &Seeded, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while status_of(seeded).await != "online" {
+        assert!(Instant::now() < deadline, "[{label}] worker 未上线");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// U1 实时收消息与编辑；U2 正常退出后 `catch_up` 补齐；U3 硬停后从定时落库续上。
+#[sqlx::test(migrations = "../../migrations-test")]
+#[ignore = "真机：需要扫码登录的测试用户 session 与测试 Bot"]
+async fn live_updates_realtime_catch_up_and_hard_stop(admin: PgPool) {
+    let seeded = std::sync::Arc::new(seed_with_session(admin, "live-updates", 9303).await);
+    let bot = std::sync::Arc::new(tokio::sync::Mutex::new(ChannelBot::new()));
+    let nonce = format!("{:x}", now_nanos_u64());
+    // 主体放进独立任务：断言失败时任务 panic 变成 JoinError，频道消息仍能清理。
+    let body = tokio::spawn({
+        let seeded = std::sync::Arc::clone(&seeded);
+        let bot = std::sync::Arc::clone(&bot);
+        async move { updates_body(&seeded, &bot, &nonce).await }
+    })
+    .await;
+    let bot = bot.lock().await;
+    let deleted = bot.cleanup().await;
+    println!("[U] cleanup sent={} deleted={deleted}", bot.sent.len());
+    if let Err(error) = body {
+        std::panic::resume_unwind(error.into_panic());
+    }
+}
+
+fn now_nanos_u64() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("时钟早于 1970")
+            .as_nanos()
+            % u128::from(u64::MAX),
+    )
+    .expect("取模后放得下")
+}
+
+async fn updates_body(seeded: &Seeded, bot: &tokio::sync::Mutex<ChannelBot>, nonce: &str) {
+    let chat = bot.lock().await.chat;
+    // U1：在线时实时收新消息与编辑。
+    let (stop, worker) = spawn_worker(seeded, "live-updates-1");
+    wait_online(seeded, "U1").await;
+    let u1_text = format!("tgm-live-updates {nonce} U1");
+    let u1 = bot.lock().await.send(&u1_text).await;
+    let took_new = wait_events(seeded, chat, &[(u1, "MESSAGE_CREATED", 0)], "U1", 30).await;
+    assert_eq!(
+        text_of(seeded, chat, u1, 0).await.as_deref(),
+        Some(u1_text.as_str())
+    );
+    let u1_edited = format!("{u1_text} edited");
+    let u1_edit =
+        i32::try_from(bot.lock().await.edit(u1, &u1_edited).await).expect("edit_date 越界");
+    let took_edit = wait_events(seeded, chat, &[(u1, "MESSAGE_EDITED", u1_edit)], "U1", 30).await;
+    assert_eq!(
+        text_of(seeded, chat, u1, u1_edit).await.as_deref(),
+        Some(u1_edited.as_str())
+    );
+    println!("[U1] new_after={took_new:?} edit_after={took_edit:?} edit_version=edit_date");
+
+    // U2：正常退出（退出前落库），离线期间发 2 条、编辑 1 条，重启后补齐。
+    stop.send(true).expect("发停止信号失败");
+    let exit = worker.await.expect("worker 任务失败").expect("worker 出错");
+    assert_eq!(exit, IdentityExit::Shutdown);
+    let before_u2 = total_rows(seeded, chat).await;
+    let u2a_edited = format!("tgm-live-updates {nonce} U2a edited");
+    let u2a = bot
+        .lock()
+        .await
+        .send(&format!("tgm-live-updates {nonce} U2a"))
+        .await;
+    let u2b = bot
+        .lock()
+        .await
+        .send(&format!("tgm-live-updates {nonce} U2b"))
+        .await;
+    let u2_edit =
+        i32::try_from(bot.lock().await.edit(u2a, &u2a_edited).await).expect("edit_date 越界");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (stop, worker) = spawn_worker(seeded, "live-updates-2");
+    wait_online(seeded, "U2").await;
+    let took_u2 = wait_events(
+        seeded,
+        chat,
+        &[(u2a, "MESSAGE_CREATED", 0), (u2b, "MESSAGE_CREATED", 0)],
+        "U2",
+        60,
+    )
+    .await;
+    // 离线期间的编辑有两种合法落法：单独一条 MESSAGE_EDITED，或服务端补齐时直接给出编辑后的正文。
+    // 两种都不丢内容；如实记录是哪一种，不预设。
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let u2a_rows = event_rows(seeded, chat, u2a).await;
+    assert!(
+        u2a_rows.iter().all(|row| row.2 == 1),
+        "[U2] U2a 有重复行：{u2a_rows:?}"
+    );
+    let edit_row = u2a_rows
+        .iter()
+        .any(|(kind, version, _)| kind == "MESSAGE_EDITED" && *version == u2_edit);
+    let created_text = text_of(seeded, chat, u2a, 0).await;
+    let edit_text = text_of(seeded, chat, u2a, u2_edit).await;
+    let edit_captured = edit_text.as_deref() == Some(u2a_edited.as_str())
+        || created_text.as_deref() == Some(u2a_edited.as_str());
+    assert!(
+        edit_captured,
+        "[U2] 离线期间的编辑内容没有落库：edit_row={edit_row}"
+    );
+    let after_u2 = total_rows(seeded, chat).await;
+    assert_eq!(
+        event_rows(seeded, chat, u1).await.len(),
+        2,
+        "[U2] U1 消息不得新增行"
+    );
+    println!(
+        "[U2] exit_before=Shutdown caught_up_after={took_u2:?} chat_rows_added={} edit_as_separate_row={edit_row} created_has_edited_text={}",
+        after_u2 - before_u2,
+        created_text.as_deref() == Some(u2a_edited.as_str())
+    );
+
+    // U3：在线超过一个落库周期后硬停（不做退出前落库），租约过期后重启。
+    let saved_before = secret_updated_at(seeded).await;
+    tokio::time::sleep(Duration::from_secs(75)).await;
+    let saved_periodic = secret_updated_at(seeded).await;
+    worker.abort();
+    let _ = worker.await;
+    drop(stop);
+    sqlx::query(
+        "UPDATE account_leases SET expires_at = clock_timestamp() - interval '1 second'
+          WHERE identity_id = $1",
+    )
+    .bind(seeded.identity)
+    .execute(seeded.admin.raw())
+    .await
+    .expect("让租约过期失败");
+    let saved_after_abort = secret_updated_at(seeded).await;
+    let before_u3 = total_rows(seeded, chat).await;
+    let u3a = bot
+        .lock()
+        .await
+        .send(&format!("tgm-live-updates {nonce} U3a"))
+        .await;
+    let u3b = bot
+        .lock()
+        .await
+        .send(&format!("tgm-live-updates {nonce} U3b"))
+        .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (stop, worker) = spawn_worker(seeded, "live-updates-3");
+    wait_online(seeded, "U3").await;
+    let took_u3 = wait_events(
+        seeded,
+        chat,
+        &[(u3a, "MESSAGE_CREATED", 0), (u3b, "MESSAGE_CREATED", 0)],
+        "U3",
+        60,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let after_u3 = total_rows(seeded, chat).await;
+    assert_eq!(
+        event_rows(seeded, chat, u1).await.len(),
+        2,
+        "[U3] U1 消息不得新增行"
+    );
+    assert_eq!(
+        event_rows(seeded, chat, u2a).await,
+        u2a_rows,
+        "[U3] U2a 不得新增行"
+    );
+    assert_eq!(
+        event_rows(seeded, chat, u2b).await.len(),
+        1,
+        "[U3] U2b 不得新增行"
+    );
+    stop.send(true).expect("发停止信号失败");
+    let exit = worker.await.expect("worker 任务失败").expect("worker 出错");
+    assert_eq!(exit, IdentityExit::Shutdown);
+    println!(
+        "[U3] periodic_save={} unchanged_by_abort={} caught_up_after={took_u3:?} chat_rows_added={} expected_added=2 exit={exit:?}",
+        saved_periodic > saved_before,
+        saved_after_abort == saved_periodic,
+        after_u3 - before_u3
+    );
+}
