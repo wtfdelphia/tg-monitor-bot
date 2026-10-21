@@ -593,6 +593,19 @@ impl TelegramClient {
             .collect()
     }
 
+    /// 以一次 `users.getUsers(self)` 确认授权仍有效（只读调用，不发消息）。
+    ///
+    /// 手机端撤销会话后服务端不再推更新，更新流只是静默、不报错，单靠
+    /// [`TelegramClient::next_incoming`] 识别不到；失效时返回的错误
+    /// [`TelegramClientError::is_unauthorized`] 为真。
+    pub async fn check_authorized(&self) -> Result<(), TelegramClientError> {
+        self.client
+            .get_me()
+            .await
+            .map(|_| ())
+            .map_err(TelegramClientError::Invocation)
+    }
+
     /// 把更新流状态同步进 session 后取快照。输出含 auth key，只能交给信封加密落库。
     pub async fn snapshot(&self) -> Result<Secret<Vec<u8>>, TelegramClientError> {
         self.updates

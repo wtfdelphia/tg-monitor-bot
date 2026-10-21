@@ -1,13 +1,13 @@
 //! mtproto-worker 运行链（spec/08 §1.3、§1.4、§四、§五）。
 //!
 //! 一个身份一个任务：领租约 → 解密恢复 session → 建连 → 收消息落 `canonical_events`。
-//! 运行中每 10s 续租，每 60s 落一次 session 快照，退出前再落一次。
+//! 运行中每 10s 续租，每 60s 落一次 session 快照并校验一次授权，退出前再落一次。
 //!
 //! 三条不得放宽的纪律：
 //!
 //! - 续租失败是「立刻自杀」不是重试（spec/08 §4.3）：断开、退出该身份，不重连。
 //! - 事件与 session 落库都在事务里校验租约，僵尸 worker 写不进去。
-//! - 采集身份只读：这里只调 `next_incoming` 与快照，不调任何发送方法（spec/08 §1.4）。
+//! - 采集身份只读：这里只调 `next_incoming`、快照与 `getMe` 授权校验，不调任何发送方法（spec/08 §1.4）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,6 +39,8 @@ pub struct MtprotoWorkerConfig {
     pub save_interval: Duration,
     /// 扫描可接管身份的周期。
     pub discover_interval: Duration,
+    /// 授权校验周期。会话被撤销时更新流只是静默，要靠主动 `getMe` 发现（spec/08 §五）。
+    pub auth_check_interval: Duration,
     /// 单个身份异常退出后，下次再尝试接管前的等待。
     pub restart_delay: Duration,
 }
@@ -49,6 +51,7 @@ impl Default for MtprotoWorkerConfig {
             renew_interval: Duration::from_secs(10),
             save_interval: Duration::from_secs(60),
             discover_interval: Duration::from_secs(15),
+            auth_check_interval: Duration::from_secs(60),
             restart_delay: Duration::from_secs(30),
         }
     }
@@ -198,6 +201,19 @@ async fn run_leased(
     };
     let mut client =
         TelegramClient::connect_with_session(TelegramClientConfig::new(api_id)?, session).await?;
+    // 上线前先确认授权：失效的 auth key 也能建连，不校验就会把它置成 online。
+    match client.check_authorized().await {
+        Ok(()) => {}
+        Err(error) if error.is_unauthorized() => {
+            let exit = mark_unauthorized(pool, tenant, lease).await;
+            let _ = client.shutdown().await;
+            return exit;
+        }
+        Err(error) => {
+            let _ = client.shutdown().await;
+            return Err(error.into());
+        }
+    }
     if !set_leased_identity_status(pool, tenant, lease, "online").await? {
         let _ = client.shutdown().await;
         return Ok(IdentityExit::LeaseLost);
@@ -206,8 +222,10 @@ async fn run_leased(
 
     let mut renew = tokio::time::interval(config.renew_interval);
     let mut save = tokio::time::interval(config.save_interval);
+    let mut auth_check = tokio::time::interval(config.auth_check_interval);
     renew.tick().await;
     save.tick().await;
+    auth_check.tick().await;
     // 媒体中转下载在独立任务里跑：下载 50 MB 约 1 分钟，不能挡住收消息与续租。
     // 任务持同一租约；租约丢失时它的每次写入都会被拒，外层退出时一并 abort。
     let relay_task = media_store.map(|store| {
@@ -246,6 +264,18 @@ async fn run_leased(
                     }
                 }
             }
+            _ = auth_check.tick() => {
+                match client.check_authorized().await {
+                    Ok(()) => {}
+                    Err(error) if error.is_unauthorized() => {
+                        break mark_unauthorized(pool, tenant, lease).await;
+                    }
+                    // 网络抖动不等于授权失效：只记日志，下个周期再查。
+                    Err(error) => {
+                        tracing::warn!(error = %error, identity_id = lease.identity_id.get(), "授权校验失败");
+                    }
+                }
+            }
             incoming = client.next_incoming() => {
                 match incoming {
                     Ok(incoming) => {
@@ -260,11 +290,7 @@ async fn run_leased(
                         }
                     }
                     Err(error) if error.is_unauthorized() => {
-                        tracing::warn!(identity_id = lease.identity_id.get(), "Telegram 判定授权失效");
-                        if mark_leased_identity_unauthorized(pool, tenant, lease).await? {
-                            break Ok(IdentityExit::Unauthorized);
-                        }
-                        break Ok(IdentityExit::LeaseLost);
+                        break mark_unauthorized(pool, tenant, lease).await;
                     }
                     Err(error) => break Err(error.into()),
                 }
@@ -293,6 +319,23 @@ async fn run_leased(
     }
     let _ = client.shutdown().await;
     exit
+}
+
+/// Telegram 判定授权失效：转 `unauthorized`、写审计、释放租约，在一个持租约事务里完成。
+async fn mark_unauthorized(
+    pool: &PgPool,
+    tenant: TenantId,
+    lease: &LeaseGuard,
+) -> Result<IdentityExit, MtprotoWorkerError> {
+    tracing::warn!(
+        identity_id = lease.identity_id.get(),
+        "Telegram 判定授权失效"
+    );
+    if mark_leased_identity_unauthorized(pool, tenant, lease).await? {
+        Ok(IdentityExit::Unauthorized)
+    } else {
+        Ok(IdentityExit::LeaseLost)
+    }
 }
 
 /// 本身份的中转下载循环：有到期 job 就连续处理，空闲时按续租周期再扫。
