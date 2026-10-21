@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/core", "crates/db", "crates/tg", "crates/app", "bins/tgm"]
+# vendor/ 下是打了本地补丁的上游 crate，经 [patch.crates-io] 接入，不是本仓成员（vendor/README.md）。
+exclude = ["vendor"]
 
 # 五个 crate 共享的元数据。license 必须写：不写则 cargo deny check licenses 报
 # 五条 error[unlicensed]（实测）—— 它对本仓自己的 crate 与第三方一视同仁。
@@ -89,3 +91,8 @@ expect_used = "warn"            # 启动期配置校验里 expect 是合理的�
 panic = "warn"
 todo = "deny"                   # 骨架阶段容易留下，而它会在运行时炸
 dbg_macro = "deny"              # dbg! 走 Debug，绕过 Secret<T> 之外的脱敏约定
+
+# grammers-session 0.10.0 本地补丁：updateChannelTooLong 不再覆盖已知频道 pts（vendor/README.md）。
+# 上游修复发布后删掉这一节与 vendor/grammers-session，回到 crates.io。
+[patch.crates-io]
+grammers-session = { path = "vendor/grammers-session" }
