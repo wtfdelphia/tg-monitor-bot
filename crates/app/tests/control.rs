@@ -5557,3 +5557,203 @@ async fn bot_identity_intake_fails_closed_without_kek(admin: PgPool) {
             .expect("计数失败");
     assert_eq!(identities, 0);
 }
+
+const QR_API_HASH: &str = "0123456789abcdef0123456789abcdef";
+
+fn qr_start_request(body: Value) -> Request<Body> {
+    request(
+        "POST",
+        "/api/v1/identities/login/qr",
+        Body::from(body.to_string()),
+    )
+}
+
+fn qr_start_body() -> Value {
+    json!({
+        "api_id": 31001,
+        "api_hash": QR_API_HASH,
+        "consent_text_version": tgm_app::control::CUSTODY_CONSENT_TEXT_VERSION,
+    })
+}
+
+async fn custody_consents(admin: &support::AdminOnlyPool, tenant: tgm_core::ids::TenantId) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM tenant_consents
+          WHERE tenant_id = $1 AND consent_type = 'credential_custody'",
+    )
+    .bind(tenant)
+    .fetch_one(admin.raw())
+    .await
+    .expect("计数失败")
+}
+
+/// QR 登录的门槛全部拒在连 Telegram 之前（spec/02 §6.3、spec/01 §六、spec/06 §2.2）：
+/// Bot 入口、角色不足、free 档、未带当前版本同意、api_id/api_hash 格式错、
+/// 重新授权指向别的租户或 Bot 身份。被拒的请求不留同意记录，响应不回显 api_hash。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn qr_login_start_rejects_before_any_telegram_call(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let tenant = support::seed_tenant(&admin, "qr-deny", 5401).await;
+    let other = support::seed_tenant(&admin, "qr-deny-other", 5402).await;
+    let foreign_identity: i64 = sqlx::query_scalar(
+        "INSERT INTO identities (kind, tenant_id, tg_user_id, status)
+         VALUES ('mtproto', $1, 42, 'offline') RETURNING id",
+    )
+    .bind(other)
+    .fetch_one(admin.raw())
+    .await
+    .expect("建别的租户的 MTProto 身份失败");
+    let bot_identity = support::seed_identity(&admin, tenant).await;
+    let state = || bot_intake_state(app.clone(), "http://127.0.0.1:9".to_owned());
+    let owner = AuthContext::new(tenant, 5401, TenantRole::Owner, AuthSource::Web);
+
+    let free = router(state())
+        .oneshot(with_auth(qr_start_request(qr_start_body()), owner))
+        .await
+        .expect("执行请求失败");
+    assert_eq!(free.status(), StatusCode::FORBIDDEN, "free 档不碰 MTProto");
+
+    sqlx::query("UPDATE tenants SET plan = 'pro' WHERE id = $1")
+        .bind(tenant)
+        .execute(admin.raw())
+        .await
+        .expect("升 pro 失败");
+    let with = |patch: Value| {
+        let mut body = qr_start_body();
+        for (key, value) in patch.as_object().expect("patch 是对象") {
+            body[key] = value.clone();
+        }
+        body
+    };
+    let cases = [
+        (
+            AuthContext::new(tenant, 5401, TenantRole::Owner, AuthSource::Bot),
+            qr_start_body(),
+            StatusCode::FORBIDDEN,
+            "CREDENTIAL_VIA_WEB_ONLY",
+        ),
+        (
+            AuthContext::new(tenant, 5403, TenantRole::Member, AuthSource::Web),
+            qr_start_body(),
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+        ),
+        (
+            owner,
+            with(json!({ "consent_text_version": "custody-old" })),
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+        ),
+        (
+            owner,
+            with(json!({ "api_id": 0 })),
+            StatusCode::BAD_REQUEST,
+            "CONDITION_INVALID",
+        ),
+        (
+            owner,
+            with(json!({ "api_hash": "not-a-hash" })),
+            StatusCode::BAD_REQUEST,
+            "CONDITION_INVALID",
+        ),
+        (
+            owner,
+            with(json!({ "identity_id": foreign_identity })),
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+        ),
+        (
+            owner,
+            with(json!({ "identity_id": bot_identity.get() })),
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+        ),
+    ];
+    for (auth, body, status, code) in cases {
+        let response = router(state())
+            .oneshot(with_auth(qr_start_request(body.clone()), auth))
+            .await
+            .expect("执行请求失败");
+        assert_eq!(response.status(), status, "{body}");
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .map(|v| v.as_bytes()),
+            Some(&b"no-store"[..])
+        );
+        let bytes = to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("读取响应失败");
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(QR_API_HASH),
+            "响应回显了 api_hash"
+        );
+        let value: Value = serde_json::from_slice(&bytes).expect("解析响应失败");
+        assert_eq!(value["error"]["code"], code, "{body}");
+    }
+    assert_eq!(
+        custody_consents(&admin, tenant).await,
+        0,
+        "被拒的请求不该记同意"
+    );
+
+    let no_kek = router(ControlPlaneState::new(app.clone()))
+        .oneshot(with_auth(qr_start_request(qr_start_body()), owner))
+        .await
+        .expect("执行请求失败");
+    assert_eq!(no_kek.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(custody_consents(&admin, tenant).await, 0);
+}
+
+/// 轮询与提交密码：Bot 入口 403，未知的 login_id 一律 404（不区分不存在与不属于本人）。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn qr_login_poll_and_password_reject_bot_source_and_unknown_login(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let tenant = support::seed_tenant(&admin, "qr-poll", 5411).await;
+    let owner = AuthContext::new(tenant, 5411, TenantRole::Owner, AuthSource::Web);
+    let via_bot = AuthContext::new(tenant, 5411, TenantRole::Owner, AuthSource::Bot);
+    let unknown = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+    let poll = || {
+        request(
+            "GET",
+            &format!("/api/v1/identities/login/qr/{unknown}"),
+            Body::empty(),
+        )
+    };
+    let password = || {
+        request(
+            "POST",
+            "/api/v1/identities/login/password",
+            Body::from(json!({ "login_id": unknown, "password": "secret-pass" }).to_string()),
+        )
+    };
+    let state = bot_intake_state(app, "http://127.0.0.1:9".to_owned());
+    for (build, auth, status) in [
+        (
+            &poll as &dyn Fn() -> Request<Body>,
+            via_bot,
+            StatusCode::FORBIDDEN,
+        ),
+        (&poll, owner, StatusCode::NOT_FOUND),
+        (&password, via_bot, StatusCode::FORBIDDEN),
+        (&password, owner, StatusCode::NOT_FOUND),
+    ] {
+        let response = router(state.clone())
+            .oneshot(with_auth(build(), auth))
+            .await
+            .expect("执行请求失败");
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .map(|v| v.as_bytes()),
+            Some(&b"no-store"[..])
+        );
+        let bytes = to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("读取响应失败");
+        assert!(!String::from_utf8_lossy(&bytes).contains("secret-pass"));
+    }
+}

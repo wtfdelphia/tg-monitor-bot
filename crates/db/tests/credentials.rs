@@ -11,8 +11,10 @@ use tgm_core::kek::{DEK_LEN, EnvKek, Kek, KekContext, KekError};
 use tgm_core::profile::Profile;
 use tgm_core::secret::Secret;
 use tgm_db::credentials::{
-    CredentialError, NewBotIdentity, clear_bot_session, create_bot_identity, load_bot_credentials,
-    load_identity_secret, store_bot_session, store_identity_secret,
+    CredentialError, CustodyConsent, NewBotIdentity, NewMtprotoIdentity, clear_bot_session,
+    create_bot_identity, create_mtproto_identity, insert_custody_consent, latest_custody_consent,
+    load_bot_credentials, load_identity_secret, load_mtproto_identity,
+    reauthorize_mtproto_identity, store_bot_session, store_identity_secret,
 };
 
 const LOCAL_KEK: &str = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=";
@@ -593,4 +595,255 @@ async fn bot_session_is_tenant_scoped(admin: PgPool) {
         before,
         "别的租户改动了 session"
     );
+}
+
+fn new_user(tg_user_id: i64, api_id: i32) -> NewMtprotoIdentity {
+    NewMtprotoIdentity {
+        tg_user_id,
+        display_name: Some("Alice".to_owned()),
+        api_id,
+        actor_user_id: 7001,
+        source: "web".to_owned(),
+    }
+}
+
+/// QR 登录落库（spec/08 §1.3）：control-plane 只有 wrap 也能建身份；
+/// `api_id` 落库、`api_hash` 不落库；session 能被 worker 侧的 KEK 解开；同租户同账号去重。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn create_mtproto_identity_is_encrypt_only_audited_and_deduplicated(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let tenant = seed_tenant(&admin, "mtproto-create", 6801).await;
+    let writer = EncryptOnlyKek::new();
+    let session = secret(b"grammers-session-snapshot");
+
+    let identity = create_mtproto_identity(&app, &writer, tenant, new_user(42, 31001), &session)
+        .await
+        .expect("建 MTProto 身份失败");
+    assert_eq!(
+        *writer.wrapped.lock().expect("读取上下文失败"),
+        vec![KekContext::new(tenant.get(), identity.get())]
+    );
+    let row: (String, Option<i64>, String, Option<i32>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT i.kind, i.tg_user_id, i.status, s.api_id, s.api_hash_ciphertext
+           FROM identities i JOIN identity_secrets s ON s.identity_id = i.id
+          WHERE i.tenant_id = $1 AND i.id = $2",
+    )
+    .bind(tenant)
+    .bind(identity)
+    .fetch_one(admin.raw())
+    .await
+    .expect("读身份失败");
+    assert_eq!(
+        (row.0.as_str(), row.1, row.2.as_str(), row.3, row.4),
+        ("mtproto", Some(42), "offline", Some(31001), None)
+    );
+    let back = load_identity_secret(&app, &kek(), tenant, identity)
+        .await
+        .expect("读取失败")
+        .expect("应当读到 session");
+    assert_eq!(back.expose(), session.expose());
+    let after: serde_json::Value = sqlx::query_scalar(
+        "SELECT after FROM audit_logs
+          WHERE tenant_id = $1 AND action = 'identity.create' AND resource_id = $2",
+    )
+    .bind(tenant)
+    .bind(identity.get())
+    .fetch_one(admin.raw())
+    .await
+    .expect("应当有一条 identity.create 审计");
+    assert_eq!(after["kind"], "mtproto");
+    assert!(!after.to_string().contains("grammers-session"), "{after}");
+
+    let err = create_mtproto_identity(&app, &writer, tenant, new_user(42, 31001), &session)
+        .await
+        .expect_err("同租户重复接入同一账号应当拒绝");
+    assert!(
+        matches!(err, CredentialError::AccountAlreadyRegistered),
+        "{err:?}"
+    );
+    let other = seed_tenant(&admin, "mtproto-create-b", 6802).await;
+    create_mtproto_identity(&app, &writer, other, new_user(42, 31001), &session)
+        .await
+        .expect("另一个租户接入同一账号不受影响");
+    assert!(
+        load_mtproto_identity(&app, other, identity.get())
+            .await
+            .expect("查询失败")
+            .is_none(),
+        "别的租户按 id 查不到本租户的身份"
+    );
+}
+
+/// 重新授权（spec/08 §五）：覆盖 session 与 api_id、unauthorized 回到 offline、
+/// 在册租约立即过期但 fencing token 不动；账号不一致拒绝且不改任何东西。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn reauthorize_mtproto_identity_requires_same_account_and_expires_lease(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let tenant = seed_tenant(&admin, "mtproto-reauth", 6811).await;
+    let writer = EncryptOnlyKek::new();
+    let identity = create_mtproto_identity(
+        &app,
+        &writer,
+        tenant,
+        new_user(42, 31001),
+        &secret(b"old-session"),
+    )
+    .await
+    .expect("建身份失败");
+    sqlx::query("UPDATE identities SET status = 'unauthorized' WHERE id = $1")
+        .bind(identity)
+        .execute(admin.raw())
+        .await
+        .expect("置 unauthorized 失败");
+    sqlx::query(
+        "INSERT INTO account_leases (identity_id, worker_id, fencing_token, heartbeat_at, expires_at)
+         VALUES ($1, 'w1', 7, now(), now() + interval '1 hour')",
+    )
+    .bind(identity)
+    .execute(admin.raw())
+    .await
+    .expect("造租约失败");
+
+    let err = reauthorize_mtproto_identity(
+        &app,
+        &writer,
+        tenant,
+        identity,
+        new_user(43, 31002),
+        &secret(b"intruder-session"),
+    )
+    .await
+    .expect_err("换了账号应当拒绝");
+    assert!(matches!(err, CredentialError::AccountMismatch), "{err:?}");
+    let back = load_identity_secret(&app, &kek(), tenant, identity)
+        .await
+        .expect("读取失败")
+        .expect("应当读到 session");
+    assert_eq!(
+        back.expose().as_slice(),
+        b"old-session",
+        "被拒的重新授权不得覆盖 session"
+    );
+
+    let status = reauthorize_mtproto_identity(
+        &app,
+        &writer,
+        tenant,
+        identity,
+        new_user(42, 31002),
+        &secret(b"new-session"),
+    )
+    .await
+    .expect("同账号重新授权失败");
+    assert_eq!(status, "offline");
+    let back = load_identity_secret(&app, &kek(), tenant, identity)
+        .await
+        .expect("读取失败")
+        .expect("应当读到 session");
+    assert_eq!(back.expose().as_slice(), b"new-session");
+    let (api_id, lease_live, fencing): (Option<i32>, bool, i64) = sqlx::query_as(
+        "SELECT s.api_id, l.expires_at > clock_timestamp(), l.fencing_token
+           FROM identity_secrets s JOIN account_leases l USING (identity_id)
+          WHERE s.identity_id = $1",
+    )
+    .bind(identity)
+    .fetch_one(admin.raw())
+    .await
+    .expect("读状态失败");
+    assert_eq!((api_id, lease_live, fencing), (Some(31002), false, 7));
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_logs
+          WHERE tenant_id = $1 AND action = 'identity.reauthorize' AND resource_id = $2",
+    )
+    .bind(tenant)
+    .bind(identity.get())
+    .fetch_one(admin.raw())
+    .await
+    .expect("读审计失败");
+    assert_eq!(audits, 1, "被拒的那次不该留审计");
+
+    sqlx::query("UPDATE identities SET status = 'banned' WHERE id = $1")
+        .bind(identity)
+        .execute(admin.raw())
+        .await
+        .expect("置 banned 失败");
+    let status = reauthorize_mtproto_identity(
+        &app,
+        &writer,
+        tenant,
+        identity,
+        new_user(42, 31002),
+        &secret(b"newer-session"),
+    )
+    .await
+    .expect("重新授权失败");
+    assert_eq!(status, "banned", "封禁不因重新扫码解除");
+
+    let other = seed_tenant(&admin, "mtproto-reauth-b", 6812).await;
+    let err = reauthorize_mtproto_identity(
+        &app,
+        &writer,
+        other,
+        identity,
+        new_user(42, 31002),
+        &secret(b"cross-tenant"),
+    )
+    .await
+    .expect_err("跨租户重新授权应当拒绝");
+    assert!(matches!(err, CredentialError::IdentityNotFound), "{err:?}");
+}
+
+/// 代持授权按租户隔离，取最近一条。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn custody_consent_latest_version_is_tenant_scoped(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let tenant = seed_tenant(&admin, "consent-a", 6821).await;
+    let other = seed_tenant(&admin, "consent-b", 6822).await;
+    sqlx::query("INSERT INTO tenant_members (tenant_id, user_id) VALUES ($1, 6821)")
+        .bind(tenant)
+        .execute(admin.raw())
+        .await
+        .expect("加成员失败");
+    assert_eq!(
+        latest_custody_consent(&app, tenant)
+            .await
+            .expect("查询失败"),
+        None
+    );
+    for version in ["custody-old", "custody-v0"] {
+        insert_custody_consent(
+            &app,
+            tenant,
+            CustodyConsent {
+                text_version: version.to_owned(),
+                user_id: 6821,
+                ip: "203.0.113.7".to_owned(),
+                user_agent: Some("test".to_owned()),
+            },
+        )
+        .await
+        .expect("写同意失败");
+    }
+    assert_eq!(
+        latest_custody_consent(&app, tenant)
+            .await
+            .expect("查询失败")
+            .as_deref(),
+        Some("custody-v0")
+    );
+    assert_eq!(
+        latest_custody_consent(&app, other).await.expect("查询失败"),
+        None
+    );
+    let ip: String = sqlx::query_scalar(
+        "SELECT host(ip) FROM tenant_consents WHERE tenant_id = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(tenant)
+    .fetch_one(admin.raw())
+    .await
+    .expect("读同意失败");
+    assert_eq!(ip, "203.0.113.7");
 }

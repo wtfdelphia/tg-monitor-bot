@@ -248,6 +248,231 @@
         }
       }
     },
+    "/api/v1/identities/login/password": {
+      "post": {
+        "tags": [],
+        "operationId": "submit_qr_login_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QrLoginPasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Password checked; wrong password stays in awaiting_password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QrLoginStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Login is not waiting for a password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Owner or admin required, or submitted via Bot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown, finished, or someone else's login",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Submitted faster than every 2 seconds",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/identities/login/qr": {
+      "post": {
+        "tags": [],
+        "operationId": "start_qr_login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QrLoginStartRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "QR login started; api_hash is never echoed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QrLoginStartResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid api_id/api_hash, or rejected by Telegram",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Owner or admin on pro plan required, consent missing, or submitted via Bot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Identity to reauthorize not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many QR logins for this tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/identities/login/qr/{login_id}": {
+      "get": {
+        "tags": [],
+        "operationId": "poll_qr_login",
+        "parameters": [
+          {
+            "name": "login_id",
+            "in": "path",
+            "description": "login_id returned by POST /api/v1/identities/login/qr",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "QR login status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QrLoginStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Owner or admin required, or requested via Bot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown, finished, or someone else's login",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Polled faster than every 2 seconds",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/identities/{id}": {
       "delete": {
         "tags": [],
@@ -3870,6 +4095,128 @@
           },
           "state": {
             "type": "string"
+          }
+        }
+      },
+      "QrLoginPasswordRequest": {
+        "type": "object",
+        "description": "提交 2FA 密码。刻意不派生 `Debug`。",
+        "required": [
+          "login_id",
+          "password"
+        ],
+        "properties": {
+          "login_id": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "QrLoginStartRequest": {
+        "type": "object",
+        "description": "发起 MTProto 用户账号 QR 登录。刻意不派生 `Debug`：`api_hash` 是租户凭据。",
+        "required": [
+          "api_id",
+          "api_hash",
+          "consent_text_version"
+        ],
+        "properties": {
+          "api_hash": {
+            "type": "string",
+            "description": "与 `api_id` 配对的 `api_hash`。只在本次登录的内存里使用，不落库、不回显。"
+          },
+          "api_id": {
+            "type": "integer",
+            "format": "int32",
+            "description": "租户在 my.telegram.org 申请的 `api_id`（ADR-0013）。落库，worker 握手要用。"
+          },
+          "consent_text_version": {
+            "type": "string",
+            "description": "租户同意的凭据代持授权文本版本，必须等于当前版本。"
+          },
+          "identity_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "带上时是对该 MTProto 身份重新授权；登录到的账号必须与它原来的账号一致。"
+          }
+        },
+        "additionalProperties": false
+      },
+      "QrLoginStartResponse": {
+        "type": "object",
+        "required": [
+          "login_id",
+          "qr_svg",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "string"
+          },
+          "login_id": {
+            "type": "string",
+            "description": "32 字节随机数（base64url）。只对发起者本人有效。"
+          },
+          "qr_svg": {
+            "type": "string",
+            "description": "当前一代二维码（SVG）。内含 bearer 凭据，响应带 `Cache-Control: no-store`。"
+          }
+        }
+      },
+      "QrLoginStatusResponse": {
+        "type": "object",
+        "description": "QR 登录轮询或提交密码后的状态。",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "identity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/IdentityResponse",
+                "description": "`confirmed` 时是落库后的身份。"
+              }
+            ]
+          },
+          "password_rejected": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`awaiting_password` 时，上一次提交的密码是否被拒。"
+          },
+          "qr_svg": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`pending` 时是当前一代二维码；token 轮换后内容会变。"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`failed` 时的原因：`api_credential_rejected` | `account_already_registered` |\n`account_mismatch` | `telegram_error`。"
+          },
+          "status": {
+            "type": "string",
+            "description": "`pending` | `awaiting_password` | `confirmed` | `expired` | `failed`"
           }
         }
       },

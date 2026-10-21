@@ -3,7 +3,8 @@
 //!
 //! `#[ignore]`：需要人用 Telegram 手机端扫码，CI 与默认测试都不跑。不进生产代码。
 //! WP-2 QR 全分支实测（`docs/plan/proposals/WP-2-qr-login-live.md` 片 1）复用本工具，
-//! 按 T1–T4 打印可判定的行，真机事件序列同时喂给 `tgm_tg::qr` 的纯状态机。
+//! 按 T1–T4 打印可判定的行。登录走生产驱动 `tgm_tg::qr_login::QrLoginDriver`
+//! （控制面端点同一实现），真机事件序列同时喂给 `tgm_tg::qr` 的纯状态机。
 //! 走 `auth.exportLoginToken` → 轮询 → `auth.importLoginToken`（DC 迁移）→ 可选 2FA，
 //! 把登录后的 session 快照写到仓库外的文件（0600）。session 含 auth key，等同登录凭据：
 //! 本工具只打印 `tg://login?token=...` 链接与登录结果，不打印 session、`api_hash`、密码。
@@ -26,11 +27,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use grammers_client::{Client, InvocationError, SenderPool, tl};
 use grammers_session::Session;
+use tgm_core::secret::Secret;
 use tgm_tg::StoredSession;
-use tgm_tg::qr::{QrLoginEvent, QrLoginState, QrToken};
+use tgm_tg::qr::QrLoginState;
+use tgm_tg::qr_login::{QrLoginDriver, QrPassword, QrPoll};
 
 fn required(name: &str) -> String {
     std::env::var(name)
@@ -55,7 +57,7 @@ fn write_private(path: &PathBuf, bytes: &[u8], overwrite: bool) {
 
 enum Step {
     Pending { token: Vec<u8>, expires: i64 },
-    Migrate { dc_id: i32, token: Vec<u8> },
+    Migrate,
     Success,
     PasswordNeeded,
 }
@@ -66,10 +68,7 @@ fn classify(result: Result<tl::enums::auth::LoginToken, InvocationError>) -> Ste
             token: token.token,
             expires: i64::from(token.expires),
         },
-        Ok(tl::enums::auth::LoginToken::MigrateTo(migrate)) => Step::Migrate {
-            dc_id: migrate.dc_id,
-            token: migrate.token,
-        },
+        Ok(tl::enums::auth::LoginToken::MigrateTo(_)) => Step::Migrate,
         Ok(tl::enums::auth::LoginToken::Success(_)) => Step::Success,
         Err(InvocationError::Rpc(error)) if error.is("SESSION_PASSWORD_NEEDED") => {
             Step::PasswordNeeded
@@ -86,33 +85,6 @@ fn now_unix() -> i64 {
             .as_secs(),
     )
     .expect("时间溢出")
-}
-
-/// 真机事件序列同时喂给纯状态机（spec/08 §3.4），序列不合法即失败。
-struct Machine {
-    state: QrLoginState,
-    generation: u64,
-}
-
-impl Machine {
-    fn apply(&mut self, event: QrLoginEvent) {
-        self.state = self.state.transition(event).unwrap_or_else(|error| {
-            panic!("状态机拒绝 {event:?}（当前 {:?}）: {error}", self.state)
-        });
-    }
-
-    fn token(&mut self, expires: i64) {
-        if let QrLoginState::AwaitingScan { token } = self.state
-            && now_unix() >= token.expires_at_unix()
-        {
-            self.apply(QrLoginEvent::TokenExpired {
-                now_unix: now_unix(),
-            });
-        }
-        self.generation += 1;
-        let token = QrToken::new(self.generation, expires).expect("token 句柄无效");
-        self.apply(QrLoginEvent::TokenExported { token });
-    }
 }
 
 /// T4：导出第一代 token 后不展示、等它过期，再用它 `importLoginToken`，必须不授权。
@@ -174,101 +146,56 @@ async fn live_user_qr_login() {
         .unwrap_or(10);
     let deadline = Instant::now() + Duration::from_secs(minutes * 60);
 
-    let session = Arc::new(StoredSession::default());
-    let SenderPool {
-        runner,
-        updates,
-        handle,
-    } = SenderPool::new(Arc::clone(&session), api_id);
-    drop(updates);
-    let client = Client::new(handle.clone());
-    let runner = tokio::spawn(async move { runner.run().await });
-
-    let export = tl::functions::auth::ExportLoginToken {
-        api_id,
-        api_hash: api_hash.clone(),
-        except_ids: Vec::new(),
-    };
-    let start_dc = session.home_dc_id().expect("读 home dc 失败");
-    println!("[QR] start_dc={start_dc}");
     if std::env::var("TGM_LIVE_QR_EXPIRY_PROBE").as_deref() == Ok("1") {
+        let session = Arc::new(StoredSession::default());
+        let SenderPool {
+            runner,
+            updates,
+            handle,
+        } = SenderPool::new(Arc::clone(&session), api_id);
+        drop(updates);
+        let client = Client::new(handle.clone());
+        let runner = tokio::spawn(async move { runner.run().await });
+        let export = tl::functions::auth::ExportLoginToken {
+            api_id,
+            api_hash: api_hash.clone(),
+            except_ids: Vec::new(),
+        };
         expired_token_probe(&client, &export).await;
+        handle.quit();
+        let _ = runner.await;
     }
 
-    let mut machine = Machine {
-        state: QrLoginState::initial(),
-        generation: 0,
-    };
-    let mut current: Option<Vec<u8>> = None;
-    let mut migrations = Vec::new();
+    // 生产驱动（tgm_tg::qr_login）：控制面端点与本工具走同一条真机路径。
+    let mut driver = QrLoginDriver::start(api_id, &Secret::new(api_hash)).expect("建连失败");
+    let start_dc = driver.home_dc_id().expect("读 home dc 失败");
+    println!("[QR] start_dc={start_dc}");
+    let mut shown = 0;
     let password_needed = loop {
         assert!(Instant::now() < deadline, "等待扫码超时");
-        match classify(client.invoke(&export).await) {
-            Step::Pending { token, expires } => {
-                if current.as_ref() != Some(&token) {
-                    machine.token(expires);
-                    let link = format!(
-                        "tg://login?token={}",
-                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&token)
-                    );
-                    write_private(&link_path, link.as_bytes(), true);
+        match driver.poll(now_unix()).await.expect("QR 登录推进失败") {
+            QrPoll::Pending {
+                link,
+                generation,
+                expires_at_unix,
+            } => {
+                if generation != shown {
+                    write_private(&link_path, link.expose().as_bytes(), true);
                     println!(
-                        "[QR] generation={} ttl_secs={} 链接已写入 TGM_LIVE_QR_LINK_FILE",
-                        machine.generation,
-                        expires - now_unix()
+                        "[QR] generation={generation} ttl_secs={} 链接已写入 TGM_LIVE_QR_LINK_FILE",
+                        expires_at_unix - now_unix()
                     );
-                    current = Some(token);
-                } else if now_unix() < expires {
-                    machine.apply(QrLoginEvent::TokenStillPending {
-                        generation: machine.generation,
-                        now_unix: now_unix(),
-                    });
+                    shown = generation;
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            Step::Migrate { dc_id, token } => {
-                let old_dc = session.home_dc_id().expect("读 home dc 失败");
-                println!("[QR] LoginTokenMigrateTo dc {old_dc} -> {dc_id}");
-                machine.apply(QrLoginEvent::TokenMigrateTo {
-                    generation: machine.generation,
-                    dc_id,
-                    now_unix: now_unix(),
-                });
-                migrations.push((old_dc, dc_id));
-                handle.disconnect_from_dc(old_dc);
-                session
-                    .set_home_dc_id(dc_id)
-                    .await
-                    .expect("设置 home dc 失败");
-                let password_needed = match classify(
-                    client
-                        .invoke(&tl::functions::auth::ImportLoginToken { token })
-                        .await,
-                ) {
-                    Step::Success => false,
-                    Step::PasswordNeeded => true,
-                    Step::Pending { .. } | Step::Migrate { .. } => {
-                        panic!("importLoginToken 之后仍未授权")
-                    }
-                };
-                machine.apply(QrLoginEvent::ImportSucceeded {
-                    generation: machine.generation,
-                    password_required: password_needed,
-                    now_unix: now_unix(),
-                });
-                break password_needed;
-            }
-            step @ (Step::Success | Step::PasswordNeeded) => {
-                let password_needed = matches!(step, Step::PasswordNeeded);
-                machine.apply(QrLoginEvent::TokenSuccess {
-                    generation: machine.generation,
-                    password_required: password_needed,
-                    now_unix: now_unix(),
-                });
-                break password_needed;
-            }
+            QrPoll::PasswordNeeded => break true,
+            QrPoll::Authorized => break false,
         }
     };
+    for (from, to) in driver.migrations() {
+        println!("[QR] LoginTokenMigrateTo dc {from} -> {to}");
+    }
 
     let mut rejected = 0;
     if password_needed {
@@ -287,78 +214,46 @@ async fn live_user_qr_login() {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             };
             let password = String::from_utf8(password).expect("密码不是 UTF-8");
-            // srp_id 一次性：每次尝试都重新取密码参数。
-            let token = match client
-                .invoke(&tl::functions::account::GetPassword {})
+            let password = Secret::new(password.trim_end_matches(['\r', '\n']).to_owned());
+            match driver
+                .submit_password(&password)
                 .await
-                .expect("account.getPassword 失败")
+                .expect("2FA 校验失败")
             {
-                tl::enums::account::Password::Password(password) => {
-                    grammers_client::client::PasswordToken::new(password)
-                }
-            };
-            match client
-                .check_password(token, password.trim_end_matches(['\r', '\n']))
-                .await
-            {
-                Ok(_) => {
-                    machine.apply(QrLoginEvent::PasswordAccepted);
+                QrPassword::Accepted => {
                     println!("[T3] password=accepted rejected_before={rejected}");
                     break;
                 }
-                Err(grammers_client::SignInError::InvalidPassword(_)) => {
-                    machine.apply(QrLoginEvent::PasswordRejected);
+                QrPassword::Rejected => {
                     rejected += 1;
                     assert!(
-                        !client.is_authorized().await.expect("is_authorized 失败"),
-                        "错误密码后不得已授权"
+                        matches!(driver.state(), QrLoginState::AwaitingPassword { .. }),
+                        "错误密码后状态必须停在等密码"
                     );
                     println!(
                         "[T3] password=rejected count={rejected} state=AwaitingPassword，等待下一个密码文件"
                     );
                 }
-                Err(error) => panic!("2FA 校验失败: {error}"),
             }
         }
     }
     assert_eq!(
-        machine.state,
+        driver.state(),
         QrLoginState::Authorized,
         "状态机未到 Authorized"
     );
-
-    let me = client.get_me().await.expect("登录后 getMe 失败");
-    assert!(!me.is_bot(), "登录的是 Bot，不是用户账号");
-    assert!(client.is_authorized().await.expect("is_authorized 失败"));
-    // getMe 只回 User；grammers 靠缓存里 is_self 的 User 判断「已登录」，importLoginToken
-    // 路径不像 sign_in 那样替我们写入，这里补上，让 worker 恢复 session 时走已登录分支。
-    let tl::enums::User::User(raw) = &me.raw else {
-        panic!("getMe 返回空用户")
-    };
-    session
-        .cache_peer(&grammers_session::types::PeerInfo::User {
-            id: raw.id,
-            auth: raw
-                .access_hash
-                .map(grammers_session::types::PeerAuth::from_hash),
-            bot: Some(false),
-            is_self: Some(true),
-        })
-        .await
-        .expect("缓存 self 失败");
-    assert!(session.is_signed_in().expect("读 session 失败"));
-    let snapshot = session.snapshot().expect("取 session 失败");
-    write_private(&session_path, snapshot.expose(), false);
+    let migrations = driver.migrations().to_vec();
+    let generations = shown;
+    let home_dc = driver.home_dc_id().expect("读 home dc 失败");
+    let authorized = driver.finish().await.expect("取 session 失败");
+    driver.close().await;
+    write_private(&session_path, authorized.session.expose(), false);
     let _ = std::fs::remove_file(&link_path);
     println!(
-        "[QR] authorized generations={} migrations={migrations:?} 2fa={password_needed} \
-         password_rejected={rejected} start_dc={start_dc} home_dc={} session_bytes={}",
-        machine.generation,
-        session.home_dc_id().expect("读 home dc 失败"),
-        snapshot.expose().len()
+        "[QR] authorized generations={generations} migrations={migrations:?} 2fa={password_needed} \
+         password_rejected={rejected} start_dc={start_dc} home_dc={home_dc} session_bytes={}",
+        authorized.session.expose().len()
     );
-    handle.quit();
-    let _ = runner.await;
 }
 
 /// 用 `live_user_qr_login` 写出的 session 恢复，确认是已登录的用户账号，
