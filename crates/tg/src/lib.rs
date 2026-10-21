@@ -17,3 +17,6 @@ pub use session::{StoredSession, StoredSessionError};
 
 /// QR 登录状态机。这里只处理纯状态迁移，不接触网络、凭据或数据库。
 pub mod qr;
+
+/// QR 登录驱动：持有一条 grammers 连接，按状态机推进真机登录。
+pub mod qr_login;

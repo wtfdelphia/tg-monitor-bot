@@ -47,6 +47,12 @@ pub enum CredentialError {
     /// 持租约写入时发现租约已被接管或过期（spec/08 §4.3）。
     #[error("身份租约已丢失")]
     LeaseLost,
+    /// 同一租户已接入同一个 Telegram 用户账号。
+    #[error("该账号已接入")]
+    AccountAlreadyRegistered,
+    /// 重新授权登录到的账号与身份原账号不一致。
+    #[error("登录的账号与该身份不一致")]
+    AccountMismatch,
 }
 
 /// 一份待落库的凭据：凭据密文 + 被 KEK 包裹的 DEK。明文 DEK 在返回前已清零。
@@ -469,4 +475,311 @@ pub async fn clear_bot_session(
     })
     .await?;
     Ok(())
+}
+
+/// QR 登录完成后新建 MTProto 身份的公开字段（来自 getMe，不含 session）。
+#[derive(Debug, Clone)]
+pub struct NewMtprotoIdentity {
+    pub tg_user_id: i64,
+    pub display_name: Option<String>,
+    /// 租户自带（ADR-0013）。`api_hash` 不落库：control-plane 解不开密文，worker 不需要它。
+    pub api_id: i32,
+    pub actor_user_id: i64,
+    pub source: String,
+}
+
+fn mtproto_lock_key(tenant: TenantId, tg_user_id: i64) -> String {
+    format!("tgm:identity.mtproto:{}:{tg_user_id}", tenant.get())
+}
+
+/// 新建 MTProto 身份并写入 session 密文与 `api_id`，同一事务内记 `identity.create` 审计。
+///
+/// 去重形状照 [`create_bot_identity`]：事务外查重省一次 KMS 调用，事务内 advisory lock 再查一次。
+pub async fn create_mtproto_identity(
+    pool: &PgPool,
+    kek: &dyn Kek,
+    tenant: TenantId,
+    input: NewMtprotoIdentity,
+    session: &Secret<Vec<u8>>,
+) -> Result<IdentityId, CredentialError> {
+    let tg_user_id = input.tg_user_id;
+    let (identity_id, exists) = tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            let exists = mtproto_account_exists(&mut *conn, tenant, tg_user_id).await?;
+            let id = sqlx::query_scalar::<_, i64>(
+                "SELECT nextval(pg_get_serial_sequence('identities', 'id'))",
+            )
+            .fetch_one(&mut *conn)
+            .await?;
+            Ok((id, exists))
+        })
+    })
+    .await?;
+    if exists {
+        return Err(CredentialError::AccountAlreadyRegistered);
+    }
+
+    let credential = seal_with_fresh_dek(kek, tenant, identity_id, session.expose()).await?;
+    let created = tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(mtproto_lock_key(tenant, input.tg_user_id))
+                .execute(&mut *conn)
+                .await?;
+            if mtproto_account_exists(&mut *conn, tenant, input.tg_user_id).await? {
+                return Ok(None);
+            }
+            let id = sqlx::query_scalar::<_, IdentityId>(
+                "INSERT INTO identities (id, kind, tenant_id, tg_user_id, display_name, status)
+                 OVERRIDING SYSTEM VALUE
+                 VALUES ($2, 'mtproto', $1, $3, $4, 'offline')
+                 RETURNING id",
+            )
+            .bind(tenant.get())
+            .bind(identity_id)
+            .bind(input.tg_user_id)
+            .bind(input.display_name.as_deref())
+            .fetch_one(&mut *conn)
+            .await?;
+            write_mtproto_secret(&mut *conn, tenant, identity_id, credential, input.api_id).await?;
+            sqlx::query(
+                "INSERT INTO audit_logs
+                     (tenant_id, actor_user_id, action, resource, resource_id, after, source)
+                 VALUES ($1, $2, 'identity.create', 'identity', $3, $4, $5)",
+            )
+            .bind(tenant.get())
+            .bind(input.actor_user_id)
+            .bind(identity_id)
+            .bind(serde_json::json!({
+                "kind": "mtproto",
+                "tg_user_id": input.tg_user_id,
+                "display_name": input.display_name,
+                "api_id_set": true,
+                "credential_set": true,
+            }))
+            .bind(input.source)
+            .execute(&mut *conn)
+            .await?;
+            Ok(Some(id))
+        })
+    })
+    .await?;
+    created.ok_or(CredentialError::AccountAlreadyRegistered)
+}
+
+/// 对已有 MTProto 身份重新授权：覆盖 session 与 `api_id`，`unauthorized` / `offline` 转 `offline`，
+/// 让在册租约立即过期，记 `identity.reauthorize` 审计（spec/08 §五「用户重新扫码 → 回到 offline」）。
+/// 返回落库后的状态（`banned` 保持不变）。
+///
+/// 登录到的账号必须与身份原账号一致，否则拒绝 —— 不让别的账号顶替老身份上已有的订阅。
+/// 租约置过期而不删：fencing token 保持单调，仍持旧 token 的 worker 写不进新 session（spec/08 §4.3）。
+pub async fn reauthorize_mtproto_identity(
+    pool: &PgPool,
+    kek: &dyn Kek,
+    tenant: TenantId,
+    identity: IdentityId,
+    input: NewMtprotoIdentity,
+    session: &Secret<Vec<u8>>,
+) -> Result<String, CredentialError> {
+    let tg_user_id = input.tg_user_id;
+    let current = tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query_as::<_, (Option<i64>,)>(
+                "SELECT tg_user_id FROM identities
+                  WHERE tenant_id = $1 AND id = $2 AND kind = 'mtproto'",
+            )
+            .bind(tenant.get())
+            .bind(identity.get())
+            .fetch_optional(conn)
+            .await
+        })
+    })
+    .await?;
+    let Some((current,)) = current else {
+        return Err(CredentialError::IdentityNotFound);
+    };
+    if current.is_some_and(|current| current != tg_user_id) {
+        return Err(CredentialError::AccountMismatch);
+    }
+
+    let credential = seal_with_fresh_dek(kek, tenant, identity.get(), session.expose()).await?;
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            let before = sqlx::query_as::<_, (String, Option<i64>)>(
+                "SELECT status, tg_user_id FROM identities
+                  WHERE tenant_id = $1 AND id = $2 AND kind = 'mtproto'
+                  FOR UPDATE",
+            )
+            .bind(tenant.get())
+            .bind(identity.get())
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some((status, current)) = before else {
+                return Ok(Err(CredentialError::IdentityNotFound));
+            };
+            if current.is_some_and(|current| current != tg_user_id) {
+                return Ok(Err(CredentialError::AccountMismatch));
+            }
+            sqlx::query(
+                "UPDATE account_leases SET expires_at = clock_timestamp()
+                  WHERE identity_id = $1 AND expires_at > clock_timestamp()",
+            )
+            .bind(identity.get())
+            .execute(&mut *conn)
+            .await?;
+            let after = if status == "banned" { "banned" } else { "offline" };
+            sqlx::query(
+                "UPDATE identities
+                    SET tg_user_id = $3, status = $4, updated_at = clock_timestamp()
+                  WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant.get())
+            .bind(identity.get())
+            .bind(tg_user_id)
+            .bind(after)
+            .execute(&mut *conn)
+            .await?;
+            write_mtproto_secret(&mut *conn, tenant, identity.get(), credential, input.api_id)
+                .await?;
+            sqlx::query(
+                "INSERT INTO audit_logs
+                     (tenant_id, actor_user_id, action, resource, resource_id, before, after, source)
+                 VALUES ($1, $2, 'identity.reauthorize', 'identity', $3, $4, $5, $6)",
+            )
+            .bind(tenant.get())
+            .bind(input.actor_user_id)
+            .bind(identity.get())
+            .bind(serde_json::json!({ "status": status }))
+            .bind(serde_json::json!({
+                "status": after,
+                "tg_user_id": tg_user_id,
+                "api_id_set": true,
+                "credential_set": true,
+            }))
+            .bind(input.source)
+            .execute(&mut *conn)
+            .await?;
+            Ok(Ok(after.to_owned()))
+        })
+    })
+    .await?
+}
+
+/// 按 id 取该租户的 MTProto 身份。重新授权在扫码前先核一次，免得扫完码才发现 id 不对。
+pub async fn load_mtproto_identity(
+    pool: &PgPool,
+    tenant: TenantId,
+    identity: i64,
+) -> Result<Option<IdentityId>, sqlx::Error> {
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query_scalar::<_, IdentityId>(
+                "SELECT id FROM identities
+                  WHERE tenant_id = $1 AND id = $2 AND kind = 'mtproto'",
+            )
+            .bind(tenant.get())
+            .bind(identity)
+            .fetch_optional(conn)
+            .await
+        })
+    })
+    .await
+}
+
+async fn mtproto_account_exists(
+    conn: &mut sqlx::PgConnection,
+    tenant: TenantId,
+    tg_user_id: i64,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM identities
+                        WHERE tenant_id = $1 AND kind = 'mtproto' AND tg_user_id = $2)",
+    )
+    .bind(tenant.get())
+    .bind(tg_user_id)
+    .fetch_one(conn)
+    .await
+}
+
+async fn write_mtproto_secret(
+    conn: &mut sqlx::PgConnection,
+    tenant: TenantId,
+    identity_id: i64,
+    credential: SealedCredential,
+    api_id: i32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(UPSERT_SECRET)
+        .bind(tenant.get())
+        .bind(identity_id)
+        .bind(credential.sealed.ciphertext)
+        .bind(credential.sealed.nonce)
+        .bind(credential.dek_ciphertext)
+        .bind(credential.kek_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    sqlx::query(
+        "UPDATE identity_secrets SET api_id = $2, api_hash_ciphertext = NULL
+          WHERE identity_id = $1",
+    )
+    .bind(identity_id)
+    .bind(api_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// 租户凭据代持授权（spec/06 §2.2，`tenant_consents.consent_type = 'credential_custody'`）。
+#[derive(Debug, Clone)]
+pub struct CustodyConsent {
+    pub text_version: String,
+    pub user_id: i64,
+    pub ip: String,
+    pub user_agent: Option<String>,
+}
+
+/// 该租户最近一条 `credential_custody` 同意的文本版本。没有同意过时返回 `None`。
+pub async fn latest_custody_consent(
+    pool: &PgPool,
+    tenant: TenantId,
+) -> Result<Option<String>, sqlx::Error> {
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT text_version FROM tenant_consents
+                  WHERE tenant_id = $1 AND consent_type = 'credential_custody'
+                  ORDER BY agreed_at DESC, id DESC
+                  LIMIT 1",
+            )
+            .bind(tenant.get())
+            .fetch_optional(conn)
+            .await
+        })
+    })
+    .await
+}
+
+/// 记一条代持授权同意。表只给 `SELECT, INSERT`（R22），凭证不可改。
+pub async fn insert_custody_consent(
+    pool: &PgPool,
+    tenant: TenantId,
+    consent: CustodyConsent,
+) -> Result<(), sqlx::Error> {
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query(
+                "INSERT INTO tenant_consents
+                     (tenant_id, consent_type, text_version, user_id, ip, user_agent)
+                 VALUES ($1, 'credential_custody', $2, $3, $4::inet, $5)",
+            )
+            .bind(tenant.get())
+            .bind(consent.text_version)
+            .bind(consent.user_id)
+            .bind(consent.ip)
+            .bind(consent.user_agent)
+            .execute(conn)
+            .await?;
+            Ok(())
+        })
+    })
+    .await
 }

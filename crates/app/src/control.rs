@@ -36,6 +36,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use crate::bot_console::BotConsoleConfig;
 use crate::console_login::{ChallengeMaterial, decode_nonce, encode_nonce};
 use crate::pipeline::to_rule;
+use crate::qr_login_control::{Lookup, QrLoginStore, StartRejected, Touch, new_login_id};
 use crate::rule::{KeywordMatchType, RuleKeyword, keyword_matches_text};
 
 #[derive(Clone)]
@@ -46,6 +47,7 @@ pub struct ControlPlaneState {
     oidc_config: Option<OidcConfig>,
     oidc_states: Arc<OidcLoginStateStore>,
     credential_intake: Option<CredentialIntake>,
+    qr_logins: Arc<QrLoginStore<QrLoginEntry>>,
 }
 
 /// 凭据录入所需的 KEK 与 Bot API 地址（ADR-0032）。
@@ -79,6 +81,7 @@ impl ControlPlaneState {
             oidc_config: None,
             oidc_states: Arc::new(OidcLoginStateStore::default()),
             credential_intake: None,
+            qr_logins: Arc::new(QrLoginStore::default()),
         }
     }
 
@@ -90,6 +93,7 @@ impl ControlPlaneState {
             oidc_config: None,
             oidc_states: Arc::new(OidcLoginStateStore::default()),
             credential_intake: None,
+            qr_logins: Arc::new(QrLoginStore::default()),
         }
     }
 
@@ -105,6 +109,7 @@ impl ControlPlaneState {
             oidc_config: None,
             oidc_states: Arc::new(OidcLoginStateStore::default()),
             credential_intake: None,
+            qr_logins: Arc::new(QrLoginStore::default()),
         }
     }
 
@@ -121,6 +126,7 @@ impl ControlPlaneState {
             oidc_config: Some(oidc_config),
             oidc_states: Arc::new(OidcLoginStateStore::default()),
             credential_intake: None,
+            qr_logins: Arc::new(QrLoginStore::default()),
         }
     }
 
@@ -136,6 +142,7 @@ impl ControlPlaneState {
             oidc_config: Some(oidc_config),
             oidc_states: Arc::new(OidcLoginStateStore::default()),
             credential_intake: None,
+            qr_logins: Arc::new(QrLoginStore::default()),
         }
     }
 
@@ -254,6 +261,54 @@ pub struct IdentityResponse {
 pub struct BotIdentityCreateRequest {
     /// BotFather 发放的 token。只写不读：响应与审计都不回显。
     pub token: String,
+}
+
+/// 发起 MTProto 用户账号 QR 登录。刻意不派生 `Debug`：`api_hash` 是租户凭据。
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QrLoginStartRequest {
+    /// 租户在 my.telegram.org 申请的 `api_id`（ADR-0013）。落库，worker 握手要用。
+    pub api_id: i32,
+    /// 与 `api_id` 配对的 `api_hash`。只在本次登录的内存里使用，不落库、不回显。
+    pub api_hash: String,
+    /// 租户同意的凭据代持授权文本版本，必须等于当前版本。
+    pub consent_text_version: String,
+    /// 带上时是对该 MTProto 身份重新授权；登录到的账号必须与它原来的账号一致。
+    pub identity_id: Option<i64>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct QrLoginStartResponse {
+    /// 32 字节随机数（base64url）。只对发起者本人有效。
+    pub login_id: String,
+    /// 当前一代二维码（SVG）。内含 bearer 凭据，响应带 `Cache-Control: no-store`。
+    pub qr_svg: String,
+    pub expires_at: String,
+}
+
+/// QR 登录轮询或提交密码后的状态。
+#[derive(Serialize, ToSchema)]
+pub struct QrLoginStatusResponse {
+    /// `pending` | `awaiting_password` | `confirmed` | `expired` | `failed`
+    pub status: String,
+    /// `pending` 时是当前一代二维码；token 轮换后内容会变。
+    pub qr_svg: Option<String>,
+    pub expires_at: Option<String>,
+    /// `awaiting_password` 时，上一次提交的密码是否被拒。
+    pub password_rejected: Option<bool>,
+    /// `confirmed` 时是落库后的身份。
+    pub identity: Option<IdentityResponse>,
+    /// `failed` 时的原因：`api_credential_rejected` | `account_already_registered` |
+    /// `account_mismatch` | `telegram_error`。
+    pub reason: Option<String>,
+}
+
+/// 提交 2FA 密码。刻意不派生 `Debug`。
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QrLoginPasswordRequest {
+    pub login_id: String,
+    pub password: String,
 }
 
 #[derive(Debug, Clone, ToSchema)]
@@ -1946,6 +2001,457 @@ fn validate_bot_token(token: &str) -> Result<i64, ApiError> {
         .ok()
         .filter(|id| *id > 0)
         .ok_or_else(invalid)
+}
+
+/// 当前凭据代持授权文本的版本（spec/06 §2.2）。正文属于 WP-8 的法务工作，这一版是占位。
+pub const CUSTODY_CONSENT_TEXT_VERSION: &str = "custody-v0";
+
+/// 登录中的一条 MTProto 连接。进入终态时 `driver` 被取走并关闭。
+pub struct QrLoginEntry {
+    driver: Option<tgm_tg::qr_login::QrLoginDriver>,
+    api_id: i32,
+    identity_id: Option<tgm_core::ids::IdentityId>,
+}
+
+fn close_logins(entries: Vec<Arc<tokio::sync::Mutex<QrLoginEntry>>>) {
+    for entry in entries {
+        tokio::spawn(async move {
+            let driver = entry.lock().await.driver.take();
+            if let Some(driver) = driver {
+                driver.close().await;
+            }
+        });
+    }
+}
+
+/// MTProto 凭据录入的共同门槛：仅 Web、owner/admin、pro 档、已配置 KEK。
+async fn require_mtproto_intake(
+    state: &ControlPlaneState,
+    auth: AuthContext,
+) -> Result<(), ApiError> {
+    if auth.source() != AuthSource::Web {
+        return Err(AppError::CredentialViaWebOnly.into());
+    }
+    require_identity_write(auth)?;
+    let plan = tgm_db::repo::load_tenant_plan(&state.pool, auth.tenant_id())
+        .await
+        .map_err(AppError::from)?;
+    if plan != "pro" {
+        return Err(AppError::Forbidden.into());
+    }
+    if state.credential_intake.is_none() {
+        return Err(
+            AppError::internal(std::io::Error::other("control-plane 未配置凭据录入 KEK")).into(),
+        );
+    }
+    Ok(())
+}
+
+fn render_qr_svg(link: &Secret<String>) -> Result<String, ApiError> {
+    let code = qrcode::QrCode::new(link.expose().as_bytes()).map_err(AppError::internal)?;
+    Ok(code
+        .render::<qrcode::render::svg::Color<'_>>()
+        .min_dimensions(256, 256)
+        .build())
+}
+
+fn unix_to_rfc3339(unix: i64) -> String {
+    DateTime::<Utc>::from_timestamp(unix, 0)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339()
+}
+
+fn qr_status(status: &str) -> QrLoginStatusResponse {
+    QrLoginStatusResponse {
+        status: status.to_owned(),
+        qr_svg: None,
+        expires_at: None,
+        password_rejected: None,
+        identity: None,
+        reason: None,
+    }
+}
+
+fn qr_failed(reason: &str) -> QrLoginStatusResponse {
+    QrLoginStatusResponse {
+        reason: Some(reason.to_owned()),
+        ..qr_status("failed")
+    }
+}
+
+fn driver_failure_reason(error: &tgm_tg::qr_login::QrLoginDriverError) -> &'static str {
+    if error.is_api_credential_rejected() {
+        "api_credential_rejected"
+    } else {
+        "telegram_error"
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/identities/login/qr",
+    request_body = QrLoginStartRequest,
+    responses(
+        (status = 201, description = "QR login started; api_hash is never echoed", body = QrLoginStartResponse),
+        (status = 400, description = "Invalid api_id/api_hash, or rejected by Telegram", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin on pro plan required, consent missing, or submitted via Bot", body = ErrorResponse),
+        (status = 404, description = "Identity to reauthorize not found", body = ErrorResponse),
+        (status = 429, description = "Too many QR logins for this tenant", body = ErrorResponse)
+    )
+)]
+async fn start_qr_login(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    headers: HeaderMap,
+    Json(input): Json<QrLoginStartRequest>,
+) -> Result<(StatusCode, Json<QrLoginStartResponse>), ApiError> {
+    let api_hash = Secret::new(input.api_hash);
+    require_mtproto_intake(&state, auth).await?;
+    // spec/06 §2.2：代持授权先于凭据录入，而且必须是当前版本的文本。
+    if input.consent_text_version != CUSTODY_CONSENT_TEXT_VERSION {
+        return Err(AppError::Forbidden.into());
+    }
+    if input.api_id <= 0 {
+        return Err(AppError::ConditionInvalid("api_id 必须为正整数".to_owned()).into());
+    }
+    let hash = api_hash.expose();
+    if hash.len() != 32 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::ConditionInvalid("api_hash 格式无效".to_owned()).into());
+    }
+    let identity_id = match input.identity_id {
+        None => None,
+        Some(identity) => Some(
+            tgm_db::credentials::load_mtproto_identity(&state.pool, auth.tenant_id(), identity)
+                .await
+                .map_err(AppError::from)?
+                .ok_or(AppError::NotFound)?,
+        ),
+    };
+
+    let tenant = auth.tenant_id();
+    let latest = tgm_db::credentials::latest_custody_consent(&state.pool, tenant)
+        .await
+        .map_err(AppError::from)?;
+    if latest.as_deref() != Some(CUSTODY_CONSENT_TEXT_VERSION) {
+        let user_agent = headers
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        tgm_db::credentials::insert_custody_consent(
+            &state.pool,
+            tenant,
+            tgm_db::credentials::CustodyConsent {
+                text_version: CUSTODY_CONSENT_TEXT_VERSION.to_owned(),
+                user_id: auth.actor_user_id(),
+                ip: request_origin_ip(&headers),
+                user_agent,
+            },
+        )
+        .await
+        .map_err(AppError::from)?;
+    }
+    let now = std::time::Instant::now();
+    close_logins(state.qr_logins.sweep(now));
+    let login_id = new_login_id().map_err(AppError::internal)?;
+    // 先占登记簿名额再建连接：被限流拒掉的请求不该开出一条 MTProto 连接。
+    let entry = state
+        .qr_logins
+        .start(
+            login_id.clone(),
+            tenant.get(),
+            auth.actor_user_id(),
+            now,
+            QrLoginEntry {
+                driver: None,
+                api_id: input.api_id,
+                identity_id,
+            },
+        )
+        .map_err(|rejected| match rejected {
+            StartRejected::TooManyConcurrent | StartRejected::TooManyPerHour => {
+                AppError::RateLimited
+            }
+        })?;
+    match tgm_tg::qr_login::QrLoginDriver::start(input.api_id, &api_hash) {
+        Ok(driver) => entry.lock().await.driver = Some(driver),
+        Err(_) => {
+            state.qr_logins.remove(&login_id);
+            return Err(AppError::ConditionInvalid("api_id 必须为正整数".to_owned()).into());
+        }
+    }
+
+    let first = {
+        let mut guard = entry.lock().await;
+        match guard.driver.as_mut() {
+            Some(driver) => driver.poll(Utc::now().timestamp()).await,
+            None => return Err(AppError::NotFound.into()),
+        }
+    };
+    match first {
+        Ok(tgm_tg::qr_login::QrPoll::Pending {
+            link,
+            expires_at_unix,
+            ..
+        }) => Ok((
+            StatusCode::CREATED,
+            Json(QrLoginStartResponse {
+                login_id,
+                qr_svg: render_qr_svg(&link)?,
+                expires_at: unix_to_rfc3339(expires_at_unix),
+            }),
+        )),
+        Ok(other) => {
+            close_logins(state.qr_logins.remove(&login_id).into_iter().collect());
+            Err(AppError::internal(std::io::Error::other(format!(
+                "新连接的第一次 exportLoginToken 不是 Token: {other:?}"
+            )))
+            .into())
+        }
+        Err(error) => {
+            close_logins(state.qr_logins.remove(&login_id).into_iter().collect());
+            if error.is_api_credential_rejected() {
+                return Err(AppError::ConditionInvalid(
+                    "Telegram 拒绝了该 api_id/api_hash".to_owned(),
+                )
+                .into());
+            }
+            Err(AppError::internal(error).into())
+        }
+    }
+}
+
+/// 已授权：取 session 落库。落库不成就注销这次登录，不在 Telegram 侧留下悬空设备。
+async fn persist_qr_login(
+    state: &ControlPlaneState,
+    auth: AuthContext,
+    login_id: &str,
+    entry: &mut QrLoginEntry,
+) -> Result<QrLoginStatusResponse, ApiError> {
+    let Some(driver) = entry.driver.take() else {
+        return Err(AppError::NotFound.into());
+    };
+    state.qr_logins.remove(login_id);
+    let authorized = match driver.finish().await {
+        Ok(authorized) => authorized,
+        Err(error) => {
+            tracing::warn!(error = %error, "QR 登录已授权但取 session 失败");
+            let _ = driver.log_out().await;
+            return Ok(qr_failed(driver_failure_reason(&error)));
+        }
+    };
+    let Some(intake) = state.credential_intake.as_ref() else {
+        let _ = driver.log_out().await;
+        return Err(
+            AppError::internal(std::io::Error::other("control-plane 未配置凭据录入 KEK")).into(),
+        );
+    };
+    let input = tgm_db::credentials::NewMtprotoIdentity {
+        tg_user_id: authorized.tg_user_id,
+        display_name: authorized.display_name.clone(),
+        api_id: entry.api_id,
+        actor_user_id: auth.actor_user_id(),
+        source: auth.source().as_str().to_owned(),
+    };
+    let stored = match entry.identity_id {
+        Some(identity) => tgm_db::credentials::reauthorize_mtproto_identity(
+            &state.pool,
+            intake.kek.as_ref(),
+            auth.tenant_id(),
+            identity,
+            input,
+            &authorized.session,
+        )
+        .await
+        .map(|status| (identity.get(), status)),
+        None => tgm_db::credentials::create_mtproto_identity(
+            &state.pool,
+            intake.kek.as_ref(),
+            auth.tenant_id(),
+            input,
+            &authorized.session,
+        )
+        .await
+        .map(|id| (id.get(), "offline".to_owned())),
+    };
+    match stored {
+        Ok((id, status)) => {
+            driver.close().await;
+            Ok(QrLoginStatusResponse {
+                identity: Some(IdentityResponse {
+                    id,
+                    kind: "mtproto".to_owned(),
+                    tg_user_id: Some(authorized.tg_user_id),
+                    display_name: authorized.display_name,
+                    status,
+                }),
+                ..qr_status("confirmed")
+            })
+        }
+        Err(error) => {
+            if let Err(logout) = driver.log_out().await {
+                tracing::warn!(error = %logout, "QR 登录落库失败后注销也失败");
+            }
+            match error {
+                tgm_db::credentials::CredentialError::AccountAlreadyRegistered => {
+                    Ok(qr_failed("account_already_registered"))
+                }
+                tgm_db::credentials::CredentialError::AccountMismatch => {
+                    Ok(qr_failed("account_mismatch"))
+                }
+                tgm_db::credentials::CredentialError::IdentityNotFound => {
+                    Err(AppError::NotFound.into())
+                }
+                tgm_db::credentials::CredentialError::Db(error) => Err(AppError::Db(error).into()),
+                other => Err(AppError::internal(other).into()),
+            }
+        }
+    }
+}
+
+/// 取一条进行中的登录。别人的登录、不存在、已终结都是 404；超时返回 `expired` 并关闭连接。
+fn lookup_qr_login(
+    state: &ControlPlaneState,
+    auth: AuthContext,
+    login_id: &str,
+    touch: Touch,
+) -> Result<Result<Arc<tokio::sync::Mutex<QrLoginEntry>>, QrLoginStatusResponse>, ApiError> {
+    let now = std::time::Instant::now();
+    close_logins(state.qr_logins.sweep(now));
+    match state.qr_logins.touch(
+        login_id,
+        auth.tenant_id().get(),
+        auth.actor_user_id(),
+        now,
+        touch,
+    ) {
+        Lookup::Live(entry) => Ok(Ok(entry)),
+        Lookup::Expired(entry) => {
+            close_logins(vec![entry]);
+            Ok(Err(qr_status("expired")))
+        }
+        Lookup::NotFound => Err(AppError::NotFound.into()),
+        Lookup::TooFast => Err(AppError::RateLimited.into()),
+    }
+}
+
+fn require_qr_login_caller(auth: AuthContext) -> Result<(), ApiError> {
+    if auth.source() != AuthSource::Web {
+        return Err(AppError::CredentialViaWebOnly.into());
+    }
+    require_identity_write(auth)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/identities/login/qr/{login_id}",
+    params(("login_id" = String, Path, description = "login_id returned by POST /api/v1/identities/login/qr")),
+    responses(
+        (status = 200, description = "QR login status", body = QrLoginStatusResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required, or requested via Bot", body = ErrorResponse),
+        (status = 404, description = "Unknown, finished, or someone else's login", body = ErrorResponse),
+        (status = 429, description = "Polled faster than every 2 seconds", body = ErrorResponse)
+    )
+)]
+async fn poll_qr_login(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(login_id): Path<String>,
+) -> Result<Json<QrLoginStatusResponse>, ApiError> {
+    require_qr_login_caller(auth)?;
+    let entry = match lookup_qr_login(&state, auth, &login_id, Touch::Poll)? {
+        Ok(entry) => entry,
+        Err(status) => return Ok(Json(status)),
+    };
+    let mut guard = entry.lock().await;
+    let polled = match guard.driver.as_mut() {
+        Some(driver) => driver.poll(Utc::now().timestamp()).await,
+        None => return Err(AppError::NotFound.into()),
+    };
+    match polled {
+        Ok(tgm_tg::qr_login::QrPoll::Pending {
+            link,
+            expires_at_unix,
+            ..
+        }) => Ok(Json(QrLoginStatusResponse {
+            qr_svg: Some(render_qr_svg(&link)?),
+            expires_at: Some(unix_to_rfc3339(expires_at_unix)),
+            ..qr_status("pending")
+        })),
+        Ok(tgm_tg::qr_login::QrPoll::PasswordNeeded) => Ok(Json(qr_status("awaiting_password"))),
+        Ok(tgm_tg::qr_login::QrPoll::Authorized) => {
+            persist_qr_login(&state, auth, &login_id, &mut guard)
+                .await
+                .map(Json)
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "QR 登录轮询失败");
+            let reason = driver_failure_reason(&error);
+            state.qr_logins.remove(&login_id);
+            if let Some(driver) = guard.driver.take() {
+                driver.close().await;
+            }
+            Ok(Json(qr_failed(reason)))
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/identities/login/password",
+    request_body = QrLoginPasswordRequest,
+    responses(
+        (status = 200, description = "Password checked; wrong password stays in awaiting_password", body = QrLoginStatusResponse),
+        (status = 400, description = "Login is not waiting for a password", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required, or submitted via Bot", body = ErrorResponse),
+        (status = 404, description = "Unknown, finished, or someone else's login", body = ErrorResponse),
+        (status = 429, description = "Submitted faster than every 2 seconds", body = ErrorResponse)
+    )
+)]
+async fn submit_qr_login_password(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Json(input): Json<QrLoginPasswordRequest>,
+) -> Result<Json<QrLoginStatusResponse>, ApiError> {
+    let password = Secret::new(input.password);
+    require_qr_login_caller(auth)?;
+    if password.expose().is_empty() || password.expose().len() > 256 {
+        return Err(AppError::ConditionInvalid("密码长度无效".to_owned()).into());
+    }
+    let entry = match lookup_qr_login(&state, auth, &input.login_id, Touch::Password)? {
+        Ok(entry) => entry,
+        Err(status) => return Ok(Json(status)),
+    };
+    let mut guard = entry.lock().await;
+    let checked = match guard.driver.as_mut() {
+        Some(driver) => driver.submit_password(&password).await,
+        None => return Err(AppError::NotFound.into()),
+    };
+    match checked {
+        Ok(tgm_tg::qr_login::QrPassword::Accepted) => {
+            persist_qr_login(&state, auth, &input.login_id, &mut guard)
+                .await
+                .map(Json)
+        }
+        Ok(tgm_tg::qr_login::QrPassword::Rejected) => Ok(Json(QrLoginStatusResponse {
+            password_rejected: Some(true),
+            ..qr_status("awaiting_password")
+        })),
+        Err(tgm_tg::qr_login::QrLoginDriverError::WrongStep) => {
+            Err(AppError::ConditionInvalid("该登录当前不需要密码".to_owned()).into())
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "QR 登录提交密码失败");
+            let reason = driver_failure_reason(&error);
+            state.qr_logins.remove(&input.login_id);
+            if let Some(driver) = guard.driver.take() {
+                driver.close().await;
+            }
+            Ok(Json(qr_failed(reason)))
+        }
+    }
 }
 
 #[utoipa::path(
@@ -4293,6 +4799,9 @@ async fn retry_task(
         dashboard,
         list_identities,
         create_bot_identity,
+        start_qr_login,
+        poll_qr_login,
+        submit_qr_login_password,
         update_identity,
         reset_identity_status,
         delete_identity,
@@ -4347,6 +4856,10 @@ async fn retry_task(
         IdentityResponse,
         IdentityListResponse,
         BotIdentityCreateRequest,
+        QrLoginStartRequest,
+        QrLoginStartResponse,
+        QrLoginStatusResponse,
+        QrLoginPasswordRequest,
         IdentityPatchRequest,
         KeywordResponse,
         KeywordListResponse,
@@ -4471,6 +4984,19 @@ pub fn router(state: ControlPlaneState) -> Router {
         .route("/api/v1/dashboard/summary", get(dashboard))
         .route("/api/v1/identities", get(list_identities))
         .route("/api/v1/identities/bot", post(create_bot_identity))
+        .route(
+            "/api/v1/identities/login/qr",
+            post(start_qr_login).route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/api/v1/identities/login/qr/{login_id}",
+            get(poll_qr_login).route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/api/v1/identities/login/password",
+            post(submit_qr_login_password)
+                .route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
         .route(
             "/api/v1/identities/{id}",
             patch(update_identity).delete(delete_identity),

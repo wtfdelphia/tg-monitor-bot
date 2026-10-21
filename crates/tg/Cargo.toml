@@ -14,7 +14,7 @@ tokio = { workspace = true }
 grammers-client = { workspace = true }
 grammers-session = { workspace = true }
 glass_pumpkin = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
-base64 = { workspace = true }
 rstest = { workspace = true }

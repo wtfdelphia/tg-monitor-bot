@@ -43,6 +43,8 @@ async-trait = "0.1"          # eng/01 §三 的 trait 签名是 async fn
 base64 = "0.23"              # TGM_LOCAL_KEK 是 base64 的 32 字节
 getrandom = { version = "0.4", features = ["std", "sys_rng"] }
 sha2 = "0.11"
+# QR 登录二维码（WP-2-qr-login-control D3）：只开 svg，不拉 image
+qrcode = { version = "=0.14.1", default-features = false, features = ["svg"] }
 aws-config = { version = "=1.12.0", default-features = false, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio"] }
 aws-sdk-kms = { version = "=1.123.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-s3 = { version = "=1.152.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
