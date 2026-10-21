@@ -18,6 +18,7 @@
 | WP-5-delivery-media 片 2（PR #25） | `crates/tg/src/client.rs` `send_uploaded_media` | 视频与音频不带时长、尺寸等 document attributes，可能显示为普通文件 | 出现「视频不能内联播放」时，改为在 job 里保存原 attributes | 视频部分 2026-10-21 改为占位属性（PR #31，见下行），音频未升级 |
 | WP-5-delivery-media 片 3 A 变体（PR #31） | `crates/tg/src/client.rs` `UploadMedia::upload_attributes` | 视频属性的时长与宽高填 0，且一律置 `nosound_video`；有音轨视频是否被去声未验证 | 出现「视频不能内联播放」（含时长显示为 0、转发后无声）时，改为在 job 里保存原 attributes | 未升级 |
 | WP-5-delivery-media 片 3 B（PR #27） | `crates/app/src/media_cleanup.rs` `run_cleanup_once` | 清理结果只进 tracing、不写 `system_logs`（spec/04 §1.1 第 2 条）：`app_user` 写不进 `tenant_id IS NULL` 的行 | 平台级日志的写入路径定下来后改为写库 | 未升级 |
+| WP-2-qr-login-control（PR #35） | `crates/app/src/qr_login_control.rs` `QrLoginStore` | 登录中的 MTProto 连接、`login_id` 登记簿与限流计数都在进程内：只在单实例 control-plane（ADR-0025 形态 A）下成立，进程重启丢失进行中的登录 | control-plane 上多实例前，改为粘性路由或共享存储 | 未升级 |
 
 ## 与上游纪律的适配与分叉（只增不清）
 
