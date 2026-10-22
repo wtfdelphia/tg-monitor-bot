@@ -9,6 +9,7 @@
 //! TGM_LIVE_TARGET_CHAT           测试频道的 Bot API chat id（T5 读一条消息证明已授权）
 //! TGM_LIVE_PROBE_MESSAGE_ID      T5 读取的频道消息 id
 //! TGM_LIVE_T6_SECONDS            T6 等待 worker 识别失效的上限，默认 180
+//! TGM_LIVE_R1_SECONDS            R1 上线后等人撤销并识别的上限，默认 600
 //! ```
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -252,6 +253,78 @@ async fn live_t6_revoked_session_marks_identity_unauthorized(admin: PgPool) {
     );
     println!(
         "[T6] exit={exit:?} detected_after={took:?} status=unauthorized audits={audits} lease_takeover=ok in_candidates=false"
+    );
+}
+
+/// R1：在线期间被撤销（`docs/plan/proposals/WP-2-remaining.md`）。T6 是上线前那次校验识别的；
+/// 这里先上线，再由人在手机端结束会话，必须由运行中的周期校验或更新流识别出来。
+#[sqlx::test(migrations = "../../migrations-test")]
+#[ignore = "真机：需要扫码登录的测试用户 session，上线后由人在手机端撤销"]
+async fn live_r1_revoked_while_online(admin: PgPool) {
+    let seeded = seed_with_session(admin, "wp2-r1", 9303).await;
+    let seconds: u64 = std::env::var("TGM_LIVE_R1_SECONDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(600);
+    let (_stop, shutdown) = watch::channel(false);
+    let pool = seeded.app.clone();
+    let tenant = seeded.tenant;
+    let identity = seeded.identity;
+    let config = MtprotoWorkerConfig {
+        auth_check_interval: Duration::from_secs(10),
+        ..MtprotoWorkerConfig::default()
+    };
+    let worker = tokio::spawn(async move {
+        run_identity(
+            &pool,
+            &kek(),
+            MtprotoTarget {
+                tenant,
+                identity,
+                api_id: api_id(),
+            },
+            "wp2-r1",
+            config,
+            None,
+            shutdown,
+        )
+        .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while status_of(&seeded).await != "online" {
+        assert!(Instant::now() < deadline, "worker 未能上线");
+        assert!(!worker.is_finished(), "worker 在上线前就退出了");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let online_at = Instant::now();
+    println!("[R1] online, revoke now");
+    let exit = match tokio::time::timeout(Duration::from_secs(seconds), worker).await {
+        Ok(joined) => joined.expect("worker 任务失败"),
+        Err(_) => panic!("{seconds}s 内未识别在线期间的撤销"),
+    };
+    let online_for = online_at.elapsed();
+    let exit = match exit {
+        Ok(exit) => exit,
+        Err(error) => panic!("worker 以错误退出（未归入 unauthorized）：{error}"),
+    };
+    assert_eq!(exit, IdentityExit::Unauthorized);
+    assert_eq!(status_of(&seeded).await, "unauthorized");
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_logs
+          WHERE tenant_id = $1 AND action = 'identity.unauthorized' AND resource_id = $2",
+    )
+    .bind(seeded.tenant)
+    .bind(seeded.identity)
+    .fetch_one(seeded.admin.raw())
+    .await
+    .expect("读审计失败");
+    assert_eq!(audits, 1);
+    let next = acquire_lease(&seeded.app, seeded.identity, "wp2-r1-next")
+        .await
+        .expect("抢租约失败");
+    assert!(next.is_some(), "失效后租约必须立即可接管");
+    println!(
+        "[R1] exit={exit:?} online_until_detected={online_for:?} status=unauthorized audits={audits} lease_takeover=ok"
     );
 }
 
