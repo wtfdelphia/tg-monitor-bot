@@ -13,10 +13,10 @@ use josekit::jwt::{self, JwtPayload};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::types::chrono::{TimeZone, Utc};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-use tgm_app::bot_console::{BotConsoleConfig, process_console_login_action};
-use tgm_app::console_login::ConsoleLoginAction;
+use tgm_app::bot_console::{BotConsoleConfig, TelegramBotApiClient, process_console_login_action};
+use tgm_app::console_login::{ConsoleLoginAction, confirm_callback_data};
 use tgm_app::control::{ControlPlaneState, OIDC_ISSUER, OidcConfig, router};
 use tgm_core::auth::{AuthContext, AuthSource, TenantRole};
 use tgm_core::oidc::OidcSigningAlgorithm;
@@ -61,6 +61,58 @@ fn session_cookie(value: &[u8]) -> String {
 
 fn csrf_cookie(value: &[u8]) -> String {
     format!("tgm_csrf={}", URL_SAFE_NO_PAD.encode(value))
+}
+
+async fn assert_issued_session_lifecycle(
+    state: ControlPlaneState,
+    cookies: &[String],
+    expected_identity: Value,
+) {
+    let session = cookies
+        .iter()
+        .find(|cookie| cookie.starts_with("tgm_session="))
+        .and_then(|cookie| cookie.split(';').next())
+        .expect("登录响应缺少 session cookie");
+    let csrf = cookies
+        .iter()
+        .find_map(|cookie| cookie.strip_prefix("tgm_csrf="))
+        .and_then(|cookie| cookie.split(';').next())
+        .expect("登录响应缺少 CSRF cookie");
+    let app = router(state);
+    let me_request = || {
+        Request::builder()
+            .uri("/auth/me")
+            .header("cookie", session)
+            .body(Body::empty())
+            .expect("构造已签发会话鉴权请求失败")
+    };
+    let me = app
+        .clone()
+        .oneshot(me_request())
+        .await
+        .expect("已签发会话鉴权失败");
+    assert_eq!(me.status(), StatusCode::OK);
+    assert_eq!(response_json(me).await, expected_identity);
+
+    let logout = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/logout")
+                .header("cookie", format!("{session}; tgm_csrf={csrf}"))
+                .header("x-csrf-token", csrf)
+                .body(Body::empty())
+                .expect("构造已签发会话注销请求失败"),
+        )
+        .await
+        .expect("注销已签发会话失败");
+    assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+    let revoked = app
+        .oneshot(me_request())
+        .await
+        .expect("验证已签发会话注销后失效失败");
+    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
 }
 
 fn session_management_request(
@@ -1057,7 +1109,7 @@ async fn oidc_callback_issues_session_from_verified_member(admin: PgPool) {
         ))
     );
 
-    let replay = router(state)
+    let replay = router(state.clone())
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -1071,6 +1123,12 @@ async fn oidc_callback_issues_session_from_verified_member(admin: PgPool) {
         .await
         .expect("执行 OIDC 重放回调请求失败");
     assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    assert_issued_session_lifecycle(
+        state,
+        &cookies,
+        json!({"user_id": 7001, "tenant_id": tenant.get(), "role": "TENANT_OWNER"}),
+    )
+    .await;
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]
@@ -1162,7 +1220,6 @@ async fn qr_confirmed_challenge_issues_one_session_for_unique_member(admin: PgPo
     let auth_pool = support::auth_pool(&admin).await;
     let tenant = support::seed_tenant(&admin, "qr-session", 9911).await;
     const USER_ID: i64 = 9911;
-    let nonce = vec![41_u8; 32];
     sqlx::query(
         "INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, $2, 'TENANT_OWNER')",
     )
@@ -1171,35 +1228,205 @@ async fn qr_confirmed_challenge_issues_one_session_for_unique_member(admin: PgPo
     .execute(admin.raw())
     .await
     .expect("创建扫码成员失败");
-    tgm_db::repo::create_console_login_challenge(
-        &auth_pool,
-        &nonce,
-        "A7K3",
-        "203.0.113.7",
-        Some("test-browser"),
-        Utc::now() + Duration::from_secs(120),
-    )
-    .await
-    .expect("创建扫码挑战失败");
-    assert!(
-        tgm_db::repo::claim_console_login_challenge(&auth_pool, &nonce, USER_ID)
-            .await
-            .expect("扫码 claim 失败")
+    let sent = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let recorded = sent.clone();
+    let mock = axum::Router::new().route(
+        "/botlocal-test/{method}",
+        axum::routing::post(move |axum::Json(payload): axum::Json<Value>| {
+            let recorded = recorded.clone();
+            async move {
+                recorded.lock().expect("记录登录卡失败").push(payload);
+                axum::Json(json!({"ok": true, "result": {}}))
+            }
+        }),
     );
-    assert!(
-        process_console_login_action(
-            &auth_pool,
-            USER_ID,
-            ConsoleLoginAction::Confirm {
-                nonce: nonce.clone(),
-                confirm_code: "A7K3".to_owned(),
-            },
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("启动控制 Bot 本地测试服务失败");
+    let address = listener.local_addr().expect("读取 Bot 测试地址失败");
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await });
+    let state = ControlPlaneState::with_auth_pool_and_bot(
+        app,
+        auth_pool,
+        BotConsoleConfig {
+            secret_token: "control-secret".to_owned(),
+            bot_identity_id: support::seed_identity(&admin, tenant).await,
+            bot_username: "control_bot".to_owned(),
+            bot_api: Some(Arc::new(
+                TelegramBotApiClient::new(
+                    Arc::new(Secret::new("local-test".to_owned())),
+                    format!("http://{address}"),
+                )
+                .expect("创建控制 Bot 测试客户端失败"),
+            )),
+        },
+    );
+    let created = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/qr/challenge")
+                .header("x-forwarded-for", "203.0.113.7")
+                .header("user-agent", "test-browser")
+                .body(Body::empty())
+                .expect("构造端到端扫码挑战请求失败"),
         )
         .await
-        .expect("确认挑战失败")
+        .expect("创建端到端扫码挑战失败");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let challenge = response_json(created).await;
+    let encoded_nonce = challenge["nonce"].as_str().expect("扫码 nonce 缺失");
+    let nonce = URL_SAFE_NO_PAD
+        .decode(encoded_nonce)
+        .expect("扫码 nonce 非法");
+    let confirm_code = challenge["confirm_code"].as_str().expect("确认码缺失");
+    let confirm_data = confirm_callback_data(&nonce, confirm_code);
+    let start_update = |actor, chat_id, kind| {
+        json!({
+            "update_id": 101,
+            "message": {
+                "from": {"id": actor},
+                "chat": {"id": chat_id, "type": kind},
+                "text": format!("/start login_{encoded_nonce}"),
+            },
+        })
+    };
+    let confirm_update = |actor, chat_id, kind, data| {
+        json!({
+            "update_id": 102,
+            "callback_query": {
+                "id": "callback-102",
+                "from": {"id": actor},
+                "message": {"chat": {"id": chat_id, "type": kind}},
+                "data": data,
+            },
+        })
+    };
+    let webhook_request = |update: Value, secret: &str| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/bot/webhook")
+            .header("content-type", "application/json");
+        if !secret.is_empty() {
+            request = request.header("x-telegram-bot-api-secret-token", secret);
+        }
+        request
+            .body(Body::from(update.to_string()))
+            .expect("构造控制 Bot Webhook 请求失败")
+    };
+    let poll_request = || {
+        request(
+            "GET",
+            &format!("/auth/qr/challenge/{encoded_nonce}"),
+            Body::empty(),
+        )
+    };
+    for (update, secret, status, expected_state) in [
+        (
+            start_update(USER_ID, USER_ID, "private"),
+            "",
+            StatusCode::UNAUTHORIZED,
+            "pending",
+        ),
+        (
+            start_update(USER_ID, USER_ID, "private"),
+            "wrong-secret",
+            StatusCode::UNAUTHORIZED,
+            "pending",
+        ),
+        (
+            start_update(USER_ID, -1001, "group"),
+            "control-secret",
+            StatusCode::NO_CONTENT,
+            "pending",
+        ),
+        (
+            start_update(USER_ID, USER_ID + 1, "private"),
+            "control-secret",
+            StatusCode::NO_CONTENT,
+            "pending",
+        ),
+        (
+            start_update(USER_ID, USER_ID, "private"),
+            "control-secret",
+            StatusCode::NO_CONTENT,
+            "awaiting_confirm",
+        ),
+        (
+            start_update(USER_ID + 1, USER_ID + 1, "private"),
+            "control-secret",
+            StatusCode::NO_CONTENT,
+            "awaiting_confirm",
+        ),
+        (
+            confirm_update(USER_ID + 1, USER_ID + 1, "private", confirm_data.clone()),
+            "control-secret",
+            StatusCode::NO_CONTENT,
+            "awaiting_confirm",
+        ),
+        (
+            confirm_update(USER_ID, -1001, "group", confirm_data.clone()),
+            "control-secret",
+            StatusCode::NO_CONTENT,
+            "awaiting_confirm",
+        ),
+        (
+            confirm_update(USER_ID, USER_ID + 1, "private", confirm_data.clone()),
+            "control-secret",
+            StatusCode::NO_CONTENT,
+            "awaiting_confirm",
+        ),
+    ] {
+        let response = router(state.clone())
+            .oneshot(webhook_request(update, secret))
+            .await
+            .expect("执行控制 Bot 反向请求失败");
+        assert_eq!(response.status(), status);
+        let polled = router(state.clone())
+            .oneshot(poll_request())
+            .await
+            .expect("轮询未确认挑战失败");
+        assert_eq!(polled.status(), StatusCode::OK);
+        assert_eq!(polled.headers().get_all("set-cookie").iter().count(), 0);
+        assert_eq!(response_json(polled).await["state"], expected_state);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM web_sessions")
+            .fetch_one(admin.raw())
+            .await
+            .expect("核对未确认时无会话失败");
+        assert_eq!(count, 0);
+    }
+    let card = sent.lock().expect("读取登录确认卡失败")[0].clone();
+    assert_eq!(card["chat_id"], USER_ID);
+    assert!(
+        card["text"]
+            .as_str()
+            .expect("登录卡文本缺失")
+            .contains(confirm_code)
+    );
+    assert!(
+        card["text"]
+            .as_str()
+            .expect("登录卡文本缺失")
+            .contains("203.0.113.7")
+    );
+    assert!(
+        card["text"]
+            .as_str()
+            .expect("登录卡文本缺失")
+            .contains("test-browser")
+    );
+    assert_eq!(
+        card["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+        confirm_data
     );
 
-    let state = ControlPlaneState::with_auth_pool(app, auth_pool.clone());
+    let confirmed_update = confirm_update(USER_ID, USER_ID, "private", confirm_data);
+    let confirmed = router(state.clone())
+        .oneshot(webhook_request(confirmed_update.clone(), "control-secret"))
+        .await
+        .expect("执行正确的控制 Bot 确认失败");
+    assert_eq!(confirmed.status(), StatusCode::NO_CONTENT);
+
     let response = router(state.clone())
         .oneshot(
             Request::builder()
@@ -1249,7 +1476,12 @@ async fn qr_confirmed_challenge_issues_one_session_for_unique_member(admin: PgPo
             .expect("读取签发会话失败");
     assert_eq!(row, Some((tenant.get(), USER_ID, "bot_qr".to_owned())));
 
-    let second = router(state)
+    let replay = router(state.clone())
+        .oneshot(webhook_request(confirmed_update, "control-secret"))
+        .await
+        .expect("重放控制 Bot 确认失败");
+    assert_eq!(replay.status(), StatusCode::NO_CONTENT);
+    let second = router(state.clone())
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -1264,6 +1496,120 @@ async fn qr_confirmed_challenge_issues_one_session_for_unique_member(admin: PgPo
         .expect("重复轮询已确认挑战失败");
     assert_eq!(second.status(), StatusCode::NOT_FOUND);
     assert_eq!(second.headers().get_all("set-cookie").iter().count(), 0);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM web_sessions")
+        .fetch_one(admin.raw())
+        .await
+        .expect("核对重复确认未签发额外会话失败");
+    assert_eq!(count, 1);
+    assert_ne!(session_id, nonce);
+    assert_issued_session_lifecycle(
+        state,
+        &cookies,
+        json!({"user_id": USER_ID, "tenant_id": tenant.get(), "role": "TENANT_OWNER"}),
+    )
+    .await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn qr_wrong_confirmation_rejects_challenge_without_allowing_retry(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let auth_pool = support::auth_pool(&admin).await;
+    let tenant = support::seed_tenant(&admin, "qr-wrong-code", 9912).await;
+    const USER_ID: i64 = 9912;
+    sqlx::query(
+        "INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, $2, 'TENANT_OWNER')",
+    )
+    .bind(tenant)
+    .bind(USER_ID)
+    .execute(admin.raw())
+    .await
+    .expect("创建错误确认码测试成员失败");
+    let state = ControlPlaneState::with_auth_pool_and_bot(
+        app,
+        auth_pool,
+        BotConsoleConfig {
+            secret_token: "control-secret".to_owned(),
+            bot_identity_id: support::seed_identity(&admin, tenant).await,
+            bot_username: "control_bot".to_owned(),
+            bot_api: None,
+        },
+    );
+    let created = router(state.clone())
+        .oneshot(request("POST", "/auth/qr/challenge", Body::empty()))
+        .await
+        .expect("创建错误确认码挑战失败");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let challenge = response_json(created).await;
+    let nonce = challenge["nonce"].as_str().expect("扫码 nonce 缺失");
+    let confirm_code = challenge["confirm_code"].as_str().expect("确认码缺失");
+    let decoded_nonce = URL_SAFE_NO_PAD.decode(nonce).expect("扫码 nonce 非法");
+    for (update, expected_state) in [
+        (
+            json!({
+                "update_id": 201,
+                "message": {
+                    "from": {"id": USER_ID},
+                    "chat": {"id": USER_ID, "type": "private"},
+                    "text": format!("/start login_{nonce}"),
+                },
+            }),
+            "awaiting_confirm",
+        ),
+        (
+            json!({
+                "update_id": 202,
+                "callback_query": {
+                    "from": {"id": USER_ID},
+                    "message": {"chat": {"id": USER_ID, "type": "private"}},
+                    "data": confirm_callback_data(&decoded_nonce, "0000"),
+                },
+            }),
+            "rejected",
+        ),
+        (
+            json!({
+                "update_id": 203,
+                "callback_query": {
+                    "from": {"id": USER_ID},
+                    "message": {"chat": {"id": USER_ID, "type": "private"}},
+                    "data": confirm_callback_data(&decoded_nonce, confirm_code),
+                },
+            }),
+            "rejected",
+        ),
+    ] {
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/bot/webhook")
+                    .header("content-type", "application/json")
+                    .header("x-telegram-bot-api-secret-token", "control-secret")
+                    .body(Body::from(update.to_string()))
+                    .expect("构造错误确认码 Webhook 请求失败"),
+            )
+            .await
+            .expect("执行错误确认码 Webhook 请求失败");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let polled = router(state.clone())
+            .oneshot(request(
+                "GET",
+                &format!("/auth/qr/challenge/{nonce}"),
+                Body::empty(),
+            ))
+            .await
+            .expect("轮询错误确认码挑战失败");
+        assert_eq!(polled.status(), StatusCode::OK);
+        assert_eq!(polled.headers().get_all("set-cookie").iter().count(), 0);
+        assert_eq!(response_json(polled).await["state"], expected_state);
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM web_sessions")
+        .fetch_one(admin.raw())
+        .await
+        .expect("核对错误确认码未签发会话失败");
+    assert_eq!(count, 0);
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]
