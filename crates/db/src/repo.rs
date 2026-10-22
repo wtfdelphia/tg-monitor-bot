@@ -3953,7 +3953,7 @@ pub async fn list_delivery_sender_candidates(
     .await
 }
 
-/// Bot Token 被 Telegram 拒绝（吊销或重置）：同一事务内转 `unauthorized` 并写审计。
+/// Bot Token 被 Telegram 拒绝（吊销或重置）：同一事务内转 `unauthorized`、写审计、入队租户通知。
 ///
 /// 发送身份没有租约（形态 A 单实例，ADR-0025），所以不校验 fencing。
 /// 已是 `unauthorized` 时不重复写审计，返回 `false`。
@@ -3991,6 +3991,13 @@ pub async fn mark_bot_sender_unauthorized(
             .bind(json!({ "status": before }))
             .bind(json!({ "status": "unauthorized" }))
             .execute(&mut *conn)
+            .await?;
+            enqueue_tenant_notification(
+                &mut *conn,
+                tenant,
+                identity,
+                LostAuthorization::Unauthorized,
+            )
             .await?;
             Ok(true)
         })
@@ -5119,14 +5126,68 @@ pub async fn set_leased_identity_status(
     .await
 }
 
-/// Telegram 判定授权失效：同一事务内转 `unauthorized`、释放租约、写审计（spec/08 §五）。
-///
-/// 释放只把 `expires_at` 置为当前时间，保留行与 token。返回 `false` 表示租约已丢失，
-/// 状态由新持有者处理。
+/// 身份失去授权的两种终态（spec/08 §五）。两者都不自动重试；
+/// 区别只在通知文案：`unauthorized` 让用户重新扫码，`banned` 无法自助恢复。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostAuthorization {
+    Unauthorized,
+    Banned,
+}
+
+impl LostAuthorization {
+    pub fn status(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::Banned => "banned",
+        }
+    }
+
+    /// 审计 action 与 `tenant_notifications.kind` 共用同一个值。
+    pub fn action(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "identity.unauthorized",
+            Self::Banned => "identity.banned",
+        }
+    }
+}
+
+/// 入队一条租户通知（`tenant_notifications`）。只在转状态的同一事务里调用：
+/// 转状态成功而通知没入队，就是 spec/08 §五 第 2 条静默丢失。
+async fn enqueue_tenant_notification(
+    conn: &mut sqlx::PgConnection,
+    tenant: TenantId,
+    identity: IdentityId,
+    lost: LostAuthorization,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO tenant_notifications (tenant_id, kind, identity_id) VALUES ($1, $2, $3)",
+    )
+    .bind(tenant.get())
+    .bind(lost.action())
+    .bind(identity.get())
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Telegram 判定授权失效：同一事务内转 `unauthorized`、释放租约、写审计、入队通知（spec/08 §五）。
 pub async fn mark_leased_identity_unauthorized(
     pool: &PgPool,
     tenant: TenantId,
     lease: &LeaseGuard,
+) -> Result<bool, sqlx::Error> {
+    mark_leased_identity_lost(pool, tenant, lease, LostAuthorization::Unauthorized).await
+}
+
+/// 持租约把 MTProto 身份转入 `unauthorized` 或 `banned`（spec/08 §五 三件事）。
+///
+/// 一个事务完成：转状态、释放租约、写审计、入队租户通知。释放只把 `expires_at`
+/// 置为当前时间，保留行与 token。返回 `false` 表示租约已丢失，状态由新持有者处理。
+pub async fn mark_leased_identity_lost(
+    pool: &PgPool,
+    tenant: TenantId,
+    lease: &LeaseGuard,
+    lost: LostAuthorization,
 ) -> Result<bool, sqlx::Error> {
     let lease = lease.clone();
     tenant_tx(pool, tenant, |conn| {
@@ -5136,7 +5197,7 @@ pub async fn mark_leased_identity_unauthorized(
             }
             let before = sqlx::query_scalar::<_, String>(
                 "UPDATE identities AS i
-                    SET status = 'unauthorized', updated_at = clock_timestamp()
+                    SET status = $3, updated_at = clock_timestamp()
                    FROM (SELECT id, status FROM identities
                           WHERE tenant_id = $1 AND id = $2 FOR UPDATE) AS old
                   WHERE i.id = old.id
@@ -5145,6 +5206,7 @@ pub async fn mark_leased_identity_unauthorized(
             )
             .bind(tenant.get())
             .bind(lease.identity_id.get())
+            .bind(lost.status())
             .fetch_optional(&mut *conn)
             .await?;
             let Some(before) = before else {
@@ -5163,15 +5225,129 @@ pub async fn mark_leased_identity_unauthorized(
             sqlx::query(
                 "INSERT INTO audit_logs
                     (tenant_id, actor_user_id, action, resource, resource_id, before, after, source)
-                 VALUES ($1, NULL, 'identity.unauthorized', 'identity', $2, $3, $4, 'system')",
+                 VALUES ($1, NULL, $5, 'identity', $2, $3, $4, 'system')",
             )
             .bind(tenant.get())
             .bind(lease.identity_id.get())
             .bind(json!({ "status": before }))
-            .bind(json!({ "status": "unauthorized" }))
+            .bind(json!({ "status": lost.status() }))
+            .bind(lost.action())
             .execute(&mut *conn)
             .await?;
+            enqueue_tenant_notification(&mut *conn, tenant, lease.identity_id, lost).await?;
             Ok(true)
+        })
+    })
+    .await
+}
+
+/// 一条待发的租户通知，连同收件人（`tenants.owner_user_id`）。
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DueTenantNotification {
+    pub id: i64,
+    pub kind: String,
+    pub identity_id: IdentityId,
+    pub owner_user_id: i64,
+    pub attempt_count: i32,
+}
+
+/// 取本租户到期的 PENDING 通知，按入队顺序。
+pub async fn list_due_tenant_notifications(
+    pool: &PgPool,
+    tenant: TenantId,
+    limit: i64,
+) -> Result<Vec<DueTenantNotification>, sqlx::Error> {
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            sqlx::query_as::<_, DueTenantNotification>(
+                "SELECT n.id, n.kind, n.identity_id, t.owner_user_id, n.attempt_count
+                   FROM tenant_notifications n
+                   JOIN tenants t ON t.id = n.tenant_id
+                  WHERE n.tenant_id = $1
+                    AND n.status = 'PENDING'
+                    AND n.next_retry_at <= clock_timestamp()
+                  ORDER BY n.id
+                  LIMIT $2",
+            )
+            .bind(tenant.get())
+            .bind(limit)
+            .fetch_all(&mut *conn)
+            .await
+        })
+    })
+    .await
+}
+
+/// 通知一次发送尝试的结局。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TenantNotificationOutcome {
+    Sent,
+    /// 可重试：`attempt_count` 加一，`retry_after` 之后再发。
+    Retry {
+        error_code: String,
+        retry_after_seconds: i64,
+    },
+    /// 不可恢复（收件人从未私聊 Bot、已拉黑、重试用尽）：不再发送。
+    Dead {
+        error_code: String,
+    },
+}
+
+/// 记录一次发送结局。只推进仍是 PENDING 的行，返回是否推进了：
+/// 并发的两个发送循环里只有一个能把同一条通知置 SENT。
+pub async fn record_tenant_notification(
+    pool: &PgPool,
+    tenant: TenantId,
+    id: i64,
+    outcome: TenantNotificationOutcome,
+) -> Result<bool, sqlx::Error> {
+    tenant_tx(pool, tenant, |conn| {
+        Box::pin(async move {
+            let updated = match outcome {
+                TenantNotificationOutcome::Sent => {
+                    sqlx::query(
+                        "UPDATE tenant_notifications
+                            SET status = 'SENT', sent_at = clock_timestamp(),
+                                attempt_count = attempt_count + 1, last_error_code = NULL
+                          WHERE tenant_id = $1 AND id = $2 AND status = 'PENDING'",
+                    )
+                    .bind(tenant.get())
+                    .bind(id)
+                    .execute(&mut *conn)
+                    .await?
+                }
+                TenantNotificationOutcome::Retry {
+                    error_code,
+                    retry_after_seconds,
+                } => {
+                    sqlx::query(
+                        "UPDATE tenant_notifications
+                            SET attempt_count = attempt_count + 1, last_error_code = $3,
+                                next_retry_at = clock_timestamp() + make_interval(secs => $4)
+                          WHERE tenant_id = $1 AND id = $2 AND status = 'PENDING'",
+                    )
+                    .bind(tenant.get())
+                    .bind(id)
+                    .bind(error_code)
+                    .bind(retry_after_seconds as f64)
+                    .execute(&mut *conn)
+                    .await?
+                }
+                TenantNotificationOutcome::Dead { error_code } => {
+                    sqlx::query(
+                        "UPDATE tenant_notifications
+                            SET status = 'DEAD', attempt_count = attempt_count + 1,
+                                last_error_code = $3
+                          WHERE tenant_id = $1 AND id = $2 AND status = 'PENDING'",
+                    )
+                    .bind(tenant.get())
+                    .bind(id)
+                    .bind(error_code)
+                    .execute(&mut *conn)
+                    .await?
+                }
+            };
+            Ok(updated.rows_affected() == 1)
         })
     })
     .await

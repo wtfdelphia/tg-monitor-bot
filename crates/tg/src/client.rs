@@ -989,14 +989,27 @@ pub struct TelegramDeliveryError {
 
 impl TelegramClientError {
     /// Telegram 判定授权已失效（spec/08 §五 的 `unauthorized`）。这类错误不得自动重试。
+    ///
+    /// 账号被封禁（[`Self::is_banned`]）不算：两者都不重试，但用户能做的事不同 ——
+    /// 授权失效重新扫码即可，封禁扫码也恢复不了。
     pub fn is_unauthorized(&self) -> bool {
+        !self.is_banned()
+            && matches!(
+                self,
+                Self::Invocation(grammers_client::InvocationError::Rpc(error))
+                    if error.code == 401
+                        || error.is("AUTH_KEY_UNREGISTERED")
+                        || error.is("SESSION_REVOKED")
+            )
+    }
+
+    /// Telegram 判定账号已被封禁或注销（spec/08 §五 的 `banned`）：`USER_DEACTIVATED`
+    /// 与 `USER_DEACTIVATED_BAN`，Telegram 以 401 返回。不得自动重试。
+    pub fn is_banned(&self) -> bool {
         matches!(
             self,
             Self::Invocation(grammers_client::InvocationError::Rpc(error))
-                if error.code == 401
-                    || error.is("AUTH_KEY_UNREGISTERED")
-                    || error.is("SESSION_REVOKED")
-                    || error.is("USER_DEACTIVATED*")
+                if error.is("USER_DEACTIVATED*")
         )
     }
 
@@ -1414,6 +1427,10 @@ mod tests {
         };
         assert!(rpc(401, "AUTH_KEY_UNREGISTERED").is_unauthorized());
         assert!(rpc(401, "SESSION_REVOKED").is_unauthorized());
+        assert!(rpc(401, "USER_DEACTIVATED").is_banned());
+        assert!(rpc(401, "USER_DEACTIVATED_BAN").is_banned());
+        assert!(!rpc(401, "USER_DEACTIVATED_BAN").is_unauthorized());
+        assert!(!rpc(401, "AUTH_KEY_UNREGISTERED").is_banned());
         assert!(!rpc(420, "FLOOD_WAIT").is_unauthorized());
         assert!(rpc(400, "ACCESS_TOKEN_INVALID").is_bot_token_rejected());
         assert!(!rpc(420, "FLOOD_WAIT").is_bot_token_rejected());

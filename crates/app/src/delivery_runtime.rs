@@ -150,7 +150,11 @@ async fn resume_from_stored(
             clear_bot_session(pool, tenant, identity).await?;
             Ok(Resume::SignIn)
         }
-        Err(error) if error.is_unauthorized() || matches!(error, TelegramClientError::NotBot) => {
+        Err(error)
+            if error.is_unauthorized()
+                || error.is_banned()
+                || matches!(error, TelegramClientError::NotBot) =>
+        {
             tracing::info!(
                 sender_identity_id = identity.get(),
                 "落库的 Bot session 已失效，改用 Token 登录"
@@ -201,7 +205,11 @@ pub async fn run_sender(
             };
             let (client, bot_id) = match connected {
                 Ok(connected) => connected,
-                Err(error) if error.is_unauthorized() || error.is_bot_token_rejected() => {
+                Err(error)
+                    if error.is_unauthorized()
+                        || error.is_banned()
+                        || error.is_bot_token_rejected() =>
+                {
                     mark_bot_sender_unauthorized(pool, tenant, identity).await?;
                     return Ok(SenderExit::Unauthorized);
                 }
