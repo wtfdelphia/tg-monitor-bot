@@ -5,7 +5,9 @@
 
 mod support;
 
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
@@ -13,7 +15,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use sqlx::PgPool;
 use tgm_app::bot_console::TelegramBotApiClient;
-use tgm_app::tenant_notify::{MAX_ATTEMPTS, deliver_once, deliver_tenant};
+use tgm_app::tenant_notify::{MAX_ATTEMPTS, TenantNotifyConfig, deliver_once, deliver_tenant};
 use tgm_core::ids::{IdentityId, TenantId};
 use tgm_core::secret::Secret;
 use tgm_db::repo::{
@@ -99,6 +101,175 @@ async fn mock_bot_api(reply: (u16, &'static str)) -> (TelegramBotApiClient, Mock
     )
     .expect("建 Bot API client 失败");
     (client, mock)
+}
+
+struct NotificationProcess(Child);
+
+impl NotificationProcess {
+    fn start(database_url: &str, api_url: &str) -> Self {
+        Self(
+            Command::new(std::env::current_exe().expect("定位通知测试二进制失败"))
+                .args(["--exact", "notification_restart_child", "--nocapture"])
+                .env_clear()
+                .env("TGM_NOTIFY_RESTART_DATABASE_URL", database_url)
+                .env("TGM_NOTIFY_RESTART_API_URL", api_url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("启动通知子进程失败"),
+        )
+    }
+
+    fn kill(&mut self) {
+        self.0.kill().expect("强杀通知子进程失败");
+        assert!(!self.0.wait().expect("回收通知子进程失败").success());
+    }
+}
+
+impl Drop for NotificationProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn notification_restart_child() {
+    let Ok(database_url) = std::env::var("TGM_NOTIFY_RESTART_DATABASE_URL") else {
+        return;
+    };
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("连接通知测试库失败");
+    let role: (String, bool, bool) = sqlx::query_as(
+        "SELECT current_user::text, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("读取通知子进程角色失败");
+    assert_eq!(role, ("app_user".to_owned(), false, false));
+    let client = TelegramBotApiClient::new(
+        Arc::new(Secret::new("123456:test".to_owned())),
+        std::env::var("TGM_NOTIFY_RESTART_API_URL").expect("缺少 mock Bot API 地址"),
+    )
+    .expect("创建通知客户端失败");
+    let (_stop, shutdown) = tokio::sync::watch::channel(false);
+    tgm_app::tenant_notify::run(
+        pool,
+        Arc::new(client),
+        TenantNotifyConfig::default(),
+        shutdown,
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn pending_notification_survives_process_kill_before_response(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&app)
+        .await
+        .expect("读取通知测试库名失败");
+    let database_url = format!("postgres://app_user:apw@127.0.0.1:55432/{database}");
+    let tenant = support::seed_tenant(&admin, "tn-restart", 7109).await;
+    let identity = seed(&admin, tenant, "mtproto").await;
+    let holder = lease(&app, identity, "worker-restart").await;
+    assert!(
+        mark_leased_identity_unauthorized(&app, tenant, &holder)
+            .await
+            .expect("通知入队失败")
+    );
+
+    let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let response_permits = Arc::new(tokio::sync::Semaphore::new(0));
+    let router = Router::new().route(
+        "/{*path}",
+        post({
+            let response_permits = Arc::clone(&response_permits);
+            move |body: String| {
+                let requests = requests.clone();
+                let response_permits = Arc::clone(&response_permits);
+                async move {
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&body).expect("通知请求不是 JSON");
+                    requests.send(payload).expect("记录通知请求失败");
+                    response_permits.acquire().await.expect("响应闸门").forget();
+                    (StatusCode::OK, OK.1)
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定通知 mock 失败");
+    let api_url = format!("http://{}", listener.local_addr().expect("mock 地址"));
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+
+    let mut first = NotificationProcess::start(&database_url, &api_url);
+    let first_request = tokio::time::timeout(Duration::from_secs(30), received.recv())
+        .await
+        .expect("首进程没有发起通知")
+        .expect("请求通道提前关闭");
+    assert_eq!(first_request["chat_id"], 7109);
+    assert!(
+        first_request["text"]
+            .as_str()
+            .expect("通知正文")
+            .contains(&format!("#{}", identity.get()))
+    );
+    first.kill();
+
+    let state: (String, i32, bool) = tgm_db::tenant::tenant_tx(&app, tenant, |connection| {
+        Box::pin(async move {
+            sqlx::query_as(
+                "SELECT status, attempt_count, sent_at IS NOT NULL FROM tenant_notifications",
+            )
+            .fetch_one(connection)
+            .await
+        })
+    })
+    .await
+    .expect("读取强杀后的通知状态失败");
+    assert_eq!(state, ("PENDING".to_owned(), 0, false));
+
+    response_permits.add_permits(2);
+    let mut restarted = NotificationProcess::start(&database_url, &api_url);
+    let retried_request = tokio::time::timeout(Duration::from_secs(30), received.recv())
+        .await
+        .expect("新进程没有继续通知")
+        .expect("请求通道提前关闭");
+    assert_eq!(retried_request, first_request);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            restarted
+                .0
+                .try_wait()
+                .expect("检查通知子进程失败")
+                .is_none(),
+            "通知子进程提前退出"
+        );
+        let state: (String, i32, bool) = tgm_db::tenant::tenant_tx(&app, tenant, |connection| {
+            Box::pin(async move {
+                sqlx::query_as(
+                    "SELECT status, attempt_count, sent_at IS NOT NULL FROM tenant_notifications",
+                )
+                .fetch_one(connection)
+                .await
+            })
+        })
+        .await
+        .expect("读取恢复后的通知状态失败");
+        if state.0 == "SENT" {
+            assert_eq!(state, ("SENT".to_owned(), 1, true));
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "通知未置 SENT");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    restarted.kill();
+    server.abort();
 }
 
 /// 转 unauthorized 的同一事务里入队恰好一条；租约已丢失的僵尸 worker 什么都不写。
