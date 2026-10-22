@@ -188,14 +188,24 @@ async fn serve_control_plane(
         .map_err(|e| anyhow::anyhow!("TGM_LISTEN_ADDR 无效 {raw_addr:?}: {e}"))?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(listen_addr = %addr, "control-plane HTTP 服务已启动");
-    tgm_app::control::serve_with_auth_and_bot_and_oidc(
+    let bot_api = Arc::new(bot_api);
+    // spec/08 §五 第 2 条：身份失去授权时经控制 Bot 通知租户 owner。
+    // HTTP 服务优雅退出后再停它。
+    let (notify_stop, notify_shutdown) = watch::channel(false);
+    let notify_task = tokio::spawn(tgm_app::tenant_notify::run(
+        pool.clone(),
+        Arc::clone(&bot_api),
+        tgm_app::tenant_notify::TenantNotifyConfig::default(),
+        notify_shutdown,
+    ));
+    let served = tgm_app::control::serve_with_auth_and_bot_and_oidc(
         pool,
         auth_pool,
         tgm_app::bot_console::BotConsoleConfig {
             secret_token: bot_secret,
             bot_identity_id,
             bot_username,
-            bot_api: Some(Arc::new(bot_api)),
+            bot_api: Some(bot_api),
         },
         tgm_app::control::OidcConfig {
             bot_id: oidc_bot_id,
@@ -214,7 +224,10 @@ async fn serve_control_plane(
         listener,
         signal,
     )
-    .await?;
+    .await;
+    let _ = notify_stop.send(true);
+    let _ = notify_task.await;
+    served?;
     Ok(())
 }
 

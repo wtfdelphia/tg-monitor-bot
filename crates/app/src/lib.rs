@@ -20,6 +20,7 @@ pub mod mtproto_worker;
 pub mod pipeline;
 pub mod qr_login_control;
 pub mod rule;
+pub mod tenant_notify;
 
 /// 退出信号：`SIGTERM`（`docker stop` / systemd）或 Ctrl-C，先到先完成。
 /// ops/00 §六：收到后停止拉取新任务，等在途请求结束。

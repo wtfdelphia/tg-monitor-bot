@@ -19,9 +19,10 @@ use tgm_core::ids::{IdentityId, TenantId};
 use tgm_core::kek::Kek;
 use tgm_db::credentials::{CredentialError, store_identity_secret_leased};
 use tgm_db::repo::{
-    CanonicalAdapter, CanonicalEventInput, CanonicalEventType, LeaseGuard, acquire_lease,
-    insert_canonical_event_leased, list_all_active_tenants, list_mtproto_worker_candidates,
-    mark_leased_identity_unauthorized, release_lease, renew_lease, set_leased_identity_status,
+    CanonicalAdapter, CanonicalEventInput, CanonicalEventType, LeaseGuard, LostAuthorization,
+    acquire_lease, insert_canonical_event_leased, list_all_active_tenants,
+    list_mtproto_worker_candidates, mark_leased_identity_lost, release_lease, renew_lease,
+    set_leased_identity_status,
 };
 use tgm_tg::client::TelegramClientConfig;
 use tgm_tg::{IncomingMessage, TelegramClient, TelegramClientError};
@@ -82,6 +83,8 @@ pub enum IdentityExit {
     NoSession,
     /// Telegram 判定授权失效，身份已转 `unauthorized`。
     Unauthorized,
+    /// Telegram 判定账号被封禁，身份已转 `banned`。
+    Banned,
 }
 
 /// 把一条采集消息转成第一层事件。与 Bot 路径同一张表、同一组唯一键（spec/03 §5.2）。
@@ -176,7 +179,7 @@ pub async fn run_identity(
     // 释放是优化不是要求（ops/00 §六），失败只记日志。
     if !matches!(
         result,
-        Ok(IdentityExit::LeaseLost | IdentityExit::Unauthorized)
+        Ok(IdentityExit::LeaseLost | IdentityExit::Unauthorized | IdentityExit::Banned)
     ) {
         let _ = set_leased_identity_status(pool, tenant, &lease, "offline").await;
         if let Err(error) = release_lease(pool, identity, worker_id, fencing_token).await {
@@ -204,8 +207,8 @@ async fn run_leased(
     // 上线前先确认授权：失效的 auth key 也能建连，不校验就会把它置成 online。
     match client.check_authorized().await {
         Ok(()) => {}
-        Err(error) if error.is_unauthorized() => {
-            let exit = mark_unauthorized(pool, tenant, lease).await;
+        Err(error) if error.is_unauthorized() || error.is_banned() => {
+            let exit = mark_lost(pool, tenant, lease, &error).await;
             let _ = client.shutdown().await;
             return exit;
         }
@@ -267,8 +270,8 @@ async fn run_leased(
             _ = auth_check.tick() => {
                 match client.check_authorized().await {
                     Ok(()) => {}
-                    Err(error) if error.is_unauthorized() => {
-                        break mark_unauthorized(pool, tenant, lease).await;
+                    Err(error) if error.is_unauthorized() || error.is_banned() => {
+                        break mark_lost(pool, tenant, lease, &error).await;
                     }
                     // 网络抖动不等于授权失效：只记日志，下个周期再查。
                     Err(error) => {
@@ -289,8 +292,8 @@ async fn run_leased(
                             break Ok(IdentityExit::LeaseLost);
                         }
                     }
-                    Err(error) if error.is_unauthorized() => {
-                        break mark_unauthorized(pool, tenant, lease).await;
+                    Err(error) if error.is_unauthorized() || error.is_banned() => {
+                        break mark_lost(pool, tenant, lease, &error).await;
                     }
                     Err(error) => break Err(error.into()),
                 }
@@ -321,18 +324,26 @@ async fn run_leased(
     exit
 }
 
-/// Telegram 判定授权失效：转 `unauthorized`、写审计、释放租约，在一个持租约事务里完成。
-async fn mark_unauthorized(
+/// Telegram 判定授权失效或账号被封：转 `unauthorized` / `banned`、写审计、释放租约、
+/// 入队租户通知，在一个持租约事务里完成（spec/08 §五）。
+async fn mark_lost(
     pool: &PgPool,
     tenant: TenantId,
     lease: &LeaseGuard,
+    error: &TelegramClientError,
 ) -> Result<IdentityExit, MtprotoWorkerError> {
+    let (lost, exit) = if error.is_banned() {
+        (LostAuthorization::Banned, IdentityExit::Banned)
+    } else {
+        (LostAuthorization::Unauthorized, IdentityExit::Unauthorized)
+    };
     tracing::warn!(
         identity_id = lease.identity_id.get(),
-        "Telegram 判定授权失效"
+        status = lost.status(),
+        "Telegram 判定身份失去授权"
     );
-    if mark_leased_identity_unauthorized(pool, tenant, lease).await? {
-        Ok(IdentityExit::Unauthorized)
+    if mark_leased_identity_lost(pool, tenant, lease, lost).await? {
+        Ok(exit)
     } else {
         Ok(IdentityExit::LeaseLost)
     }

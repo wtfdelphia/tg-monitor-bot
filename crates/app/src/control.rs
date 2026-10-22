@@ -1937,7 +1937,8 @@ async fn create_bot_identity(
         crate::bot_console::TelegramBotApiClient::new(Arc::clone(&token), &intake.bot_api_base_url)
             .map_err(AppError::internal)?;
     let me = client.get_me().await.map_err(|error| match error {
-        crate::bot_console::TelegramBotApiError::Api(_) => {
+        crate::bot_console::TelegramBotApiError::Api(_)
+        | crate::bot_console::TelegramBotApiError::Rejected { .. } => {
             AppError::ConditionInvalid("Telegram 拒绝了该 Bot Token".to_owned())
         }
         other => AppError::internal(other),
