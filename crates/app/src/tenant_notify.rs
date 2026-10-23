@@ -179,6 +179,7 @@ mod tests {
         Err(TelegramBotApiError::Rejected {
             status,
             description: "x".to_owned(),
+            retry_after: None,
         })
     }
 

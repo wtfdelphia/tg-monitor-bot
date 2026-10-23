@@ -402,6 +402,12 @@ pub struct BotCredentials {
     dek_ciphertext: Vec<u8>,
 }
 
+impl BotCredentials {
+    pub fn version(&self) -> &[u8] {
+        &self.dek_ciphertext
+    }
+}
+
 impl std::fmt::Debug for BotCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("BotCredentials([REDACTED])")

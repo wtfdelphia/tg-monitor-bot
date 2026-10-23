@@ -167,11 +167,13 @@ let ruleListLoading=false;
 let currentRole='';
 let canWrite=false;
 let identityIntakeCleanup=()=>{};
+let targetProbeCleanup=()=>{};
+let targetPageGeneration=0;
 const escapeHtml=value=>String(value??'').replace(/[&<>'"]/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
 const getCsrf=()=>document.cookie.split(';').map(value=>value.trim()).find(value=>value.startsWith('tgm_csrf='))?.slice('tgm_csrf='.length)||'';
 function showError(error){content.insertAdjacentHTML('afterbegin','<div class="danger">'+escapeHtml(error.message||'请求失败')+'</div>')}
 async function api(url,options={}){
-  const response=await fetch(url,{credentials:'same-origin',...options});
+  const response=await fetch(url,{credentials:'same-origin',...(url.startsWith('/api/v1/targets')?{cache:'no-store'}:{}),...options});
   if(response.status===401){window.location.href='/login';throw new Error('登录已失效')}
   const body=response.headers.get('content-type')?.includes('json')?await response.json():await response.text();
   if(!response.ok)throw new Error(body?.error?.message||'请求失败');
@@ -398,8 +400,11 @@ async function keywords(){
 }
 
 async function targets(){
+  targetProbeCleanup();
+  const pageGeneration=++targetPageGeneration;
   title.textContent='目标频道';
   const [body,identitiesBody]=await Promise.all([apiAllPages('/api/v1/targets'),apiAllPages('/api/v1/identities?kind=bot')]);
+  if(pageGeneration!==targetPageGeneration)return;
   const identityOptions=identitiesBody.items.map(item=>'<option value="'+item.id+'">'+escapeHtml(item.display_name||item.tg_user_id||item.id)+' · '+escapeHtml(item.kind)+'</option>').join('');
   const rows=body.items.map(item=>'<tr><td>'+escapeHtml(item.tg_chat_id)+'</td><td>'+escapeHtml(item.title||'—')+'</td><td>'+escapeHtml(item.sender_identity_id)+'</td><td>'+targetStatus(item)+'</td><td><div class="actions"><button data-target-toggle="'+item.id+'" data-enabled="'+item.enabled+'" type="button">'+(item.enabled?'停用':'启用')+'</button><button class="danger-button" data-target-delete="'+item.id+'" type="button">删除</button></div><details><summary>编辑</summary><form class="inline-form" data-target-edit="'+item.id+'"><input name="chat" value="'+escapeHtml(item.tg_chat_id)+'" required><input name="title" placeholder="名称" value="'+escapeHtml(item.title||'')+'"><select name="sender_identity_id" required>'+identitiesBody.items.map(identity=>'<option value="'+identity.id+'" '+(String(identity.id)===String(item.sender_identity_id)?'selected':'')+'>'+escapeHtml(identity.display_name||identity.tg_user_id||identity.id)+'</option>').join('')+'</select><button type="submit">保存</button></form></details></td></tr>');
   content.innerHTML='<div class="notice">目标频道当前要求填写已解析的 Telegram chat_id，例如 -1001234567890。创建后可启停和修改发送身份。</div><form id="target-form" class="toolbar"><input name="chat" placeholder="Telegram chat_id，例如 -100..." required><input name="title" placeholder="名称"><select name="sender_identity_id" required><option value="">选择发送身份</option>'+identityOptions+'</select><button>新增目标</button></form>'+(rows.length?renderTable(['频道','名称','发送身份','状态','操作'],rows):'<div class="empty">暂无目标频道。</div>');
@@ -407,6 +412,58 @@ async function targets(){
   document.querySelectorAll('[data-target-toggle]').forEach(button=>button.addEventListener('click',()=>runWrite(button,async()=>{await writeApi('/api/v1/targets/'+button.dataset.targetToggle,'PATCH',{enabled:button.dataset.enabled!=='true'});await targets()})));
   document.querySelectorAll('[data-target-delete]').forEach(button=>button.addEventListener('click',()=>runWrite(button,async()=>{if(!window.confirm('确定停用这个目标频道吗？'))return;await writeApi('/api/v1/targets/'+button.dataset.targetDelete,'DELETE');await targets()})));
   document.querySelectorAll('[data-target-edit]').forEach(form=>form.addEventListener('submit',async event=>{event.preventDefault();const data=new FormData(form);await runWrite(form,async()=>{await writeApi('/api/v1/targets/'+form.dataset.targetEdit,'PATCH',{chat:data.get('chat'),title:data.get('title')||null,sender_identity_id:Number(data.get('sender_identity_id'))});await targets()})}));
+  bindTargetProbes(body.items,pageGeneration);
+  enforceReadOnly();
+}
+
+function probeText(probe){
+  const role=probe.bot_role?' · Bot 角色：'+probe.bot_role:'';
+  if(probe.state==='SUCCEEDED')return (probe.can_send===true?'可发送基础文字':'不可发送基础文字')+role+' · 目标内容保护：'+(probe.content_protected?'开启':'关闭')+' · '+(probe.checked_at||'');
+  if(probe.state==='FAILED')return '自检失败：'+(probe.error_code||'UNKNOWN')+'，可重新自检';
+  return (probe.state==='RUNNING'?'正在检查':'等待后台检查')+(probe.error_code==='RATE_LIMITED'?' · Telegram 限流冷却中':'');
+}
+function bindTargetProbes(items,pageGeneration){
+  let stopped=false;
+  let timer;
+  const controller=new AbortController();
+  const deadline=Date.now()+60000;
+  const pending=new Map();
+  const active=()=>!stopped&&pageGeneration===targetPageGeneration;
+  const leave=()=>{targetPageGeneration+=1;cleanup()};
+  const stop=()=>{stopped=true;clearTimeout(timer);clearTimeout(expiry);controller.abort()};
+  const cleanup=()=>{stop();window.removeEventListener('pagehide',leave)};
+  const expiry=setTimeout(()=>{if(!active())return;for(const item of pending.values()){const label=document.querySelector('#target-probe-'+item.id);if(label)label.textContent+=' · 页面等待已结束，后台继续；可刷新查看'}stop()},60000);
+  targetProbeCleanup=cleanup;
+  window.addEventListener('pagehide',leave);
+  for(const item of items){
+    const button=document.querySelector('[data-target-toggle="'+item.id+'"]');
+    const cell=button?.closest('td');
+    if(!cell)continue;
+    const probe=item.probe||{state:'PENDING',generation:0};
+    cell.insertAdjacentHTML('afterbegin','<p id="target-probe-'+item.id+'" role="status" aria-live="polite">'+escapeHtml(probeText(probe))+'</p>'+(canWrite?'<button type="button" data-target-probe="'+item.id+'">重新自检</button>':''));
+    if(probe.state==='PENDING'||probe.state==='RUNNING')pending.set(item.id,{...item,probe});
+  }
+  document.querySelectorAll('[data-target-probe]').forEach(button=>button.addEventListener('click',()=>runWrite(button,async()=>{
+    await writeApi('/api/v1/targets/'+encodeURIComponent(button.dataset.targetProbe)+'/probe','POST');
+    if(pageGeneration===targetPageGeneration)await targets();
+  })));
+  async function poll(){
+    if(!active()||Date.now()>=deadline)return;
+    for(const [id,item] of pending){
+      if(!active())return;
+      try{
+        const probe=await api('/api/v1/targets/'+encodeURIComponent(id)+'/probe',{cache:'no-store',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+        if(!active())return;
+        if(probe.generation<item.probe.generation)continue;
+        item.probe=probe;
+        const label=document.querySelector('#target-probe-'+id);
+        if(label)label.textContent=probeText(probe);
+        if(probe.state!=='PENDING'&&probe.state!=='RUNNING')pending.delete(id);
+      }catch(error){if(!active())return;const label=document.querySelector('#target-probe-'+id);if(label)label.textContent='暂时无法读取自检结果，请刷新查看';pending.delete(id)}
+    }
+    if(pending.size&&active())timer=setTimeout(poll,2000);else stop();
+  }
+  if(pending.size)timer=setTimeout(poll,2000);else stop();
 }
 
 async function rules(page=1,append=false,filters=ruleFilterState){
@@ -620,6 +677,12 @@ mod tests {
     fn identity_intake_clears_credentials_and_serializes_login_states()
     -> Result<(), Box<dyn std::error::Error>> {
         check_page_script(CONSOLE_PAGE, "console_identity_intake.js")
+    }
+
+    #[test]
+    fn target_probes_poll_serially_and_discard_stale_responses()
+    -> Result<(), Box<dyn std::error::Error>> {
+        check_page_script(CONSOLE_PAGE, "console_target_probe.js")
     }
 
     #[test]

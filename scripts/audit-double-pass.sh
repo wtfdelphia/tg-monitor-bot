@@ -106,7 +106,7 @@ declare -A UNDO=(
   [C4]="DROP MATERIALIZED VIEW probe_mv;"
   # 撤销要恢复列级形态，顺序同 migrations/0011：先收表级再逐列给。
   # 反了不报错、权限照旧 —— 这个陷阱正是 C2 存在的理由
-  [C2]="REVOKE UPDATE ON identities FROM app_user; GRANT UPDATE (kind, tg_user_id, display_name, status, proxy_url, updated_at) ON identities TO app_user;"
+  [C2]="REVOKE UPDATE ON identities FROM app_user; GRANT UPDATE (kind, tg_user_id, display_name, status, proxy_url, updated_at, target_probe_not_before) ON identities TO app_user;"
   [C6]="REVOKE UPDATE (payload_snapshot) ON delivery_tasks FROM app_user;"
   [C7]="ALTER TABLE media_group_members DISABLE ROW LEVEL SECURITY;"
   # DROP ROLE 要求该角色不再持有任何权限，所以先 REVOKE 表级授权 ——

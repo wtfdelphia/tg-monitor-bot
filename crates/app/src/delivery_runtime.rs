@@ -349,6 +349,11 @@ impl DeliveryRuntime {
     }
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<(), sqlx::Error> {
+        let probe = tokio::spawn(crate::target_probe::run(
+            self.pool.clone(),
+            self.kek.clone(),
+            shutdown.clone(),
+        ));
         let mut running: HashMap<IdentityId, JoinHandle<()>> = HashMap::new();
         let mut cooldown: HashMap<IdentityId, tokio::time::Instant> = HashMap::new();
         let mut discover = tokio::time::interval(self.config.discover_interval);
@@ -369,7 +374,9 @@ impl DeliveryRuntime {
                 }
             }
         }
-        let abandoned = join_within(running.into_values().collect(), SHUTDOWN_GRACE).await;
+        let mut handles: Vec<_> = running.into_values().collect();
+        handles.push(probe);
+        let abandoned = join_within(handles, SHUTDOWN_GRACE).await;
         if abandoned > 0 {
             tracing::warn!(abandoned, "退出等待超过上限，放弃仍在途的发送身份");
         }

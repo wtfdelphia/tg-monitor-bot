@@ -2880,8 +2880,8 @@ async fn target_router_patch_clears_title_and_preserves_omitted_values(admin: Pg
     let identity = support::seed_identity(&admin, tenant).await;
     let target_id: i64 = sqlx::query_scalar(
         "INSERT INTO target_channels
-            (tenant_id, tg_chat_id, title, sender_identity_id, can_send, checked_at, enabled)
-         VALUES ($1, -1005951, 'Target A', $2, TRUE, clock_timestamp(), TRUE) RETURNING id",
+            (tenant_id, tg_chat_id, title, sender_identity_id, can_send, checked_at, enabled, probe_state, content_protected, bot_role)
+         VALUES ($1, -1005951, 'Target A', $2, TRUE, clock_timestamp(), TRUE, 'SUCCEEDED', FALSE, 'administrator') RETURNING id",
     )
     .bind(tenant)
     .bind(identity)

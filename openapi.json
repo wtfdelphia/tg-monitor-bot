@@ -2625,6 +2625,114 @@
         }
       }
     },
+    "/api/v1/targets/{id}/probe": {
+      "get": {
+        "tags": [],
+        "operationId": "get_target_probe",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Target channel id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current target probe",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TargetProbeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Target not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "start_target_probe",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Target channel id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Probe queued or already in progress",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TargetProbeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Owner or admin required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Target not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/tasks": {
       "get": {
         "tags": [],
@@ -5149,7 +5257,8 @@
           "id",
           "tg_chat_id",
           "sender_identity_id",
-          "enabled"
+          "enabled",
+          "probe"
         ],
         "properties": {
           "can_send": {
@@ -5171,6 +5280,9 @@
             "type": "integer",
             "format": "int64"
           },
+          "probe": {
+            "$ref": "#/components/schemas/TargetProbeResponse"
+          },
           "sender_identity_id": {
             "type": "integer",
             "format": "int64"
@@ -5184,6 +5296,52 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "TargetProbeResponse": {
+        "type": "object",
+        "required": [
+          "generation",
+          "state"
+        ],
+        "properties": {
+          "bot_role": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "can_send": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "checked_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_protected": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "state": {
+            "type": "string"
           }
         }
       },
