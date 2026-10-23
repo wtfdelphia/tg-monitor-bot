@@ -2,15 +2,76 @@
 
 mod support;
 
+use axum::body::{Body, to_bytes};
+use axum::extract::Request;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::{Json, routing::post};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::json;
 use sqlx::PgPool;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use tgm_app::control::{ControlPlaneState, router};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tgm_app::control::{ControlPlaneState, CredentialIntake, router};
+use tgm_core::kek::EnvKek;
+use tgm_core::profile::Profile;
 use tgm_db::repo::{WebSessionLoginMethod, issue_web_session_for_user};
 use tokio::net::TcpListener;
+
+const TEST_BOT_TOKEN: &str = "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+async fn qr_http_stub(request: Request, next: Next, polls: &AtomicUsize) -> Response {
+    let path = request.uri().path().to_owned();
+    if !path.starts_with("/api/v1/identities/login/") {
+        return next.run(request).await;
+    }
+    let pending = || {
+        json!({
+            "status": "pending",
+            "qr_svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"256\" height=\"256\"><path d=\"M0 0h256v256H0z\"/></svg>",
+            "expires_at": (sqlx::types::chrono::Utc::now() + std::time::Duration::from_secs(30)).to_rfc3339(),
+        })
+    };
+    let body = if path.ends_with("/password") {
+        let bytes = to_bytes(request.into_body(), 4096)
+            .await
+            .expect("读取浏览器密码桩请求失败");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("解析密码桩请求失败");
+        if body["password"] == "browser-wrong-password" {
+            json!({"status":"awaiting_password","password_rejected":true})
+        } else {
+            json!({"status":"confirmed"})
+        }
+    } else if path.ends_with("/qr") {
+        let bytes = to_bytes(request.into_body(), 4096)
+            .await
+            .expect("读取浏览器 QR 桩请求失败");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("解析 QR 桩请求失败");
+        assert_eq!(body["consent_text_version"], "custody-v0");
+        assert!(body["identity_id"].as_i64().is_some());
+        polls.store(0, Ordering::SeqCst);
+        let mut response = pending();
+        response["login_id"] = json!("A".repeat(43));
+        response
+    } else if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+        let mut response = pending();
+        response["qr_svg"] = json!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"257\" height=\"257\"><path d=\"M0 0h257v257H0z\"/></svg>"
+        );
+        response
+    } else {
+        json!({"status":"awaiting_password"})
+    };
+    let mut response = Json(body).into_response();
+    response.headers_mut().insert(
+        "cache-control",
+        "no-store".parse().expect("构造测试响应头失败"),
+    );
+    response
+}
 
 #[sqlx::test(migrations = "../../migrations-test")]
 #[ignore = "需要 Node、Puppeteer 和真实 Chrome；显式运行，不以默认 CI 跳过作为通过"]
@@ -40,6 +101,11 @@ async fn console_real_browser_uses_restricted_http_and_temporary_database(admin:
             .expect("创建浏览器测试成员失败");
     }
     let identity = support::seed_identity(&admin, tenant).await;
+    sqlx::query("INSERT INTO identities (kind, tenant_id, tg_user_id, display_name, status) VALUES ('mtproto', $1, 88004, '扫码测试账号', 'unauthorized')")
+        .bind(tenant)
+        .execute(admin.raw())
+        .await
+        .expect("创建重新授权测试身份失败");
     sqlx::query("UPDATE identities SET display_name = $1 WHERE id = $2")
         .bind("浏览器测试身份-abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz")
         .bind(identity)
@@ -107,10 +173,35 @@ async fn console_real_browser_uses_restricted_http_and_temporary_database(admin:
             "csrf": URL_SAFE_NO_PAD.encode(&sessions[1].csrf_token),
         },
     });
+    let bot_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定浏览器 Bot API 桩失败");
+    let bot_address = bot_listener.local_addr().expect("读取 Bot 桩地址失败");
+    let bot_router = axum::Router::new().route(
+        &format!("/bot{TEST_BOT_TOKEN}/getMe"),
+        post(|| async { Json(json!({"ok":true,"result":{"id":123456,"is_bot":true,"first_name":"浏览器接入 Bot","username":"browser_local_bot"}})) }),
+    );
+    let bot_server = tokio::spawn(async move { axum::serve(bot_listener, bot_router).await });
+    let kek = EnvKek::new(
+        Profile::Development,
+        "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
+    )
+    .expect("构造浏览器测试 KEK 失败");
+    let state =
+        ControlPlaneState::with_auth_pool(app, auth).with_credential_intake(CredentialIntake {
+            kek: Arc::new(kek),
+            bot_api_base_url: format!("http://{bot_address}"),
+        });
+    let polls = Arc::new(AtomicUsize::new(0));
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
-            router(ControlPlaneState::with_auth_pool(app, auth)),
+            router(state).layer(middleware::from_fn(
+                move |request: Request<Body>, next: Next| {
+                    let polls = polls.clone();
+                    async move { qr_http_stub(request, next, &polls).await }
+                },
+            )),
         )
         .await
     });
@@ -150,6 +241,8 @@ async fn console_real_browser_uses_restricted_http_and_temporary_database(admin:
     .await;
     server.abort();
     let _ = server.await;
+    bot_server.abort();
+    let _ = bot_server.await;
     let output = result.expect("浏览器测试进程任务失败");
     println!("{}", String::from_utf8_lossy(&output.stdout));
     assert!(
@@ -163,4 +256,16 @@ async fn console_real_browser_uses_restricted_http_and_temporary_database(admin:
             .await
             .expect("读取会话撤销结果失败");
     assert_eq!(remaining, 0, "远程撤销和退出登录应删除管理员的测试会话");
+    let stored: (Vec<u8>, String) = sqlx::query_as("SELECT secret_ciphertext, kek_id FROM identity_secrets WHERE identity_id IN (SELECT id FROM identities WHERE tenant_id = $1 AND tg_user_id = 123456)")
+        .bind(tenant)
+        .fetch_one(admin.raw())
+        .await
+        .expect("浏览器接入 Bot 应已加密落库");
+    assert!(
+        !stored
+            .0
+            .windows(TEST_BOT_TOKEN.len())
+            .any(|window| window == TEST_BOT_TOKEN.as_bytes())
+    );
+    assert_eq!(stored.1, "local:env:v1");
 }

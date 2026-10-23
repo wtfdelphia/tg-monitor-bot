@@ -816,6 +816,15 @@ async fn console_identity_page_exposes_safe_actions_without_tenant_parameters(ad
     let html = String::from_utf8(body.to_vec()).expect("身份页响应不是 UTF-8");
     assert!(html.contains("状态复位"));
     assert!(html.contains("目标频道"));
+    assert!(html.contains("id=\"bot-intake-form\""));
+    assert!(html.contains("id=\"identity-qr-form\""));
+    assert!(html.contains("id=\"identity-password-form\""));
+    assert!(html.contains("仅 pro 档可用"));
+    assert!(html.contains("内测占位授权版本：custody-v0"));
+    assert!(html.contains("canWrite?identityIntakeMarkup(body.items):''"));
+    assert!(html.contains("item.kind==='mtproto'"));
+    assert!(html.contains("input.value='';"));
+    assert!(html.contains("cache:'no-store'"));
     assert!(!html.contains("tenant_id"));
 }
 
