@@ -622,6 +622,11 @@ pub struct TargetChannelRecord {
     pub can_send: Option<bool>,
     pub checked_at: Option<DateTime<Utc>>,
     pub enabled: bool,
+    pub probe_state: String,
+    pub probe_generation: i64,
+    pub probe_error_code: Option<String>,
+    pub content_protected: Option<bool>,
+    pub bot_role: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1721,7 +1726,8 @@ pub async fn list_target_channels(
         Box::pin(async move {
             sqlx::query_as::<_, TargetChannelRecord>(
                 r#"
-                SELECT id, tg_chat_id, title, sender_identity_id, can_send, checked_at, enabled
+                SELECT id, tg_chat_id, title, sender_identity_id, can_send, checked_at, enabled,
+                       probe_state, probe_generation, probe_error_code, content_protected, bot_role
                   FROM target_channels
                  WHERE tenant_id = $1
                  ORDER BY id
@@ -1747,7 +1753,8 @@ pub async fn load_target_channel(
         Box::pin(async move {
             sqlx::query_as::<_, TargetChannelRecord>(
                 r#"
-                SELECT id, tg_chat_id, title, sender_identity_id, can_send, checked_at, enabled
+                SELECT id, tg_chat_id, title, sender_identity_id, can_send, checked_at, enabled,
+                       probe_state, probe_generation, probe_error_code, content_protected, bot_role
                   FROM target_channels
                  WHERE tenant_id = $1 AND id = $2
                 "#,
@@ -1802,7 +1809,8 @@ pub async fn create_target_channel(
                 INSERT INTO target_channels
                     (tenant_id, tg_chat_id, title, sender_identity_id, can_send, checked_at, enabled, updated_at)
                 VALUES ($1, $2, $3, $4, NULL, NULL, TRUE, clock_timestamp())
-                RETURNING id, tg_chat_id, title, sender_identity_id, can_send, checked_at, enabled
+                RETURNING id, tg_chat_id, title, sender_identity_id, can_send, checked_at, enabled,
+                          probe_state, probe_generation, probe_error_code, content_protected, bot_role
                 "#,
             )
             .bind(tenant.get())
@@ -1860,17 +1868,10 @@ pub async fn update_target_channel(
                        title = CASE WHEN $7 THEN $4 ELSE title END,
                        sender_identity_id = COALESCE($5, sender_identity_id),
                        enabled = COALESCE($6, enabled),
-                       can_send = CASE
-                           WHEN $3 IS NOT NULL OR $5 IS NOT NULL THEN NULL
-                           ELSE can_send
-                       END,
-                       checked_at = CASE
-                           WHEN $3 IS NOT NULL OR $5 IS NOT NULL THEN NULL
-                           ELSE checked_at
-                       END,
                        updated_at = clock_timestamp()
                  WHERE tenant_id = $1 AND id = $2
-                RETURNING id, tg_chat_id, title, sender_identity_id, can_send, checked_at, enabled
+                RETURNING id, tg_chat_id, title, sender_identity_id, can_send, checked_at, enabled,
+                          probe_state, probe_generation, probe_error_code, content_protected, bot_role
                 "#,
             )
             .bind(tenant.get())

@@ -180,18 +180,65 @@ async fn console_real_browser_uses_restricted_http_and_temporary_database(admin:
     let bot_router = axum::Router::new().route(
         &format!("/bot{TEST_BOT_TOKEN}/getMe"),
         post(|| async { Json(json!({"ok":true,"result":{"id":123456,"is_bot":true,"first_name":"浏览器接入 Bot","username":"browser_local_bot"}})) }),
-    );
+    )
+    .route(&format!("/bot{TEST_BOT_TOKEN}/getChat"), post(|Json(payload): Json<serde_json::Value>| async move {
+        let id = payload["chat_id"].as_i64().expect("目标 chat id");
+        if id == -10088013 {
+            Json(json!({"ok":false,"error_code":403,"description":"browser-secret-error-sentinel"}))
+        } else {
+            Json(json!({"ok":true,"result":{"id":id,"type":"channel","has_protected_content":true}}))
+        }
+    }))
+    .route(&format!("/bot{TEST_BOT_TOKEN}/getChatMember"), post(|Json(payload): Json<serde_json::Value>| async move {
+        assert_eq!(payload["user_id"], 123456);
+        Json(json!({"ok":true,"result":{"user":{"id":123456,"is_bot":true},"status":"administrator","can_post_messages":payload["chat_id"] != -10088012}}))
+    }));
     let bot_server = tokio::spawn(async move { axum::serve(bot_listener, bot_router).await });
     let kek = EnvKek::new(
         Profile::Development,
         "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=",
     )
     .expect("构造浏览器测试 KEK 失败");
-    let state =
-        ControlPlaneState::with_auth_pool(app, auth).with_credential_intake(CredentialIntake {
-            kek: Arc::new(kek),
+    let kek = Arc::new(kek);
+    let probe_pool = app.clone();
+    let probe_kek = kek.clone();
+    let probe_url = format!("http://{bot_address}");
+    let (probe_stop, mut probe_shutdown) = tokio::sync::watch::channel(false);
+    let probe_worker = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                _ = probe_shutdown.changed() => break,
+                _ = interval.tick() => {}
+            }
+            let claim = tgm_db::target_probe::claim_probe(
+                &probe_pool,
+                tenant,
+                "browser-fixture".to_owned(),
+            )
+            .await
+            .expect("浏览器探测认领");
+            if let Some(claim) = claim {
+                let outcome = tgm_app::target_probe::execute(
+                    &probe_pool,
+                    probe_kek.as_ref(),
+                    tenant,
+                    &claim,
+                    &probe_url,
+                )
+                .await;
+                tgm_db::target_probe::finish_probe(&probe_pool, tenant, claim, outcome)
+                    .await
+                    .expect("浏览器探测回写");
+            }
+        }
+    });
+    let state = ControlPlaneState::with_auth_pool(app.clone(), auth).with_credential_intake(
+        CredentialIntake {
+            kek: kek.clone(),
             bot_api_base_url: format!("http://{bot_address}"),
-        });
+        },
+    );
     let polls = Arc::new(AtomicUsize::new(0));
     let server = tokio::spawn(async move {
         axum::serve(
@@ -240,6 +287,8 @@ async fn console_real_browser_uses_restricted_http_and_temporary_database(admin:
     })
     .await;
     server.abort();
+    let _ = probe_stop.send(true);
+    probe_worker.await.expect("结束浏览器自检 worker");
     let _ = server.await;
     bot_server.abort();
     let _ = bot_server.await;

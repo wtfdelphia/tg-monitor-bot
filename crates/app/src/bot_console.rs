@@ -61,7 +61,11 @@ pub enum TelegramBotApiError {
     /// Telegram 明确拒绝了请求（HTTP 4xx，`ok=false`）。`status` 用于区分可重试的 429
     /// 与不可恢复的 403（收件人没私聊过 Bot 或已拉黑）。
     #[error("Telegram Bot API 拒绝请求（HTTP {status}）：{description}")]
-    Rejected { status: u16, description: String },
+    Rejected {
+        status: u16,
+        description: String,
+        retry_after: Option<u32>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -184,7 +188,7 @@ impl TelegramBotApiClient {
         self.request(method, payload).await.map(|_| ())
     }
 
-    async fn request<T: Serialize>(
+    pub(crate) async fn request<T: Serialize>(
         &self,
         method: &str,
         payload: &T,
@@ -223,6 +227,13 @@ impl TelegramBotApiClient {
         }
         let envelope = match serde_json::from_slice::<BotApiResponse>(&body) {
             Ok(envelope) => envelope,
+            Err(_) if status.is_client_error() => {
+                return Err(TelegramBotApiError::Rejected {
+                    status: status.as_u16(),
+                    description: "Telegram 拒绝请求".to_owned(),
+                    retry_after: None,
+                });
+            }
             Err(_) if !status.is_success() => {
                 return Err(TelegramBotApiError::Api(format!(
                     "HTTP {}",
@@ -235,10 +246,14 @@ impl TelegramBotApiClient {
             let description = envelope
                 .description
                 .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
-            if status.is_client_error() {
+            let error_status = envelope.error_code.unwrap_or(status.as_u16());
+            if (400..500).contains(&error_status) {
                 return Err(TelegramBotApiError::Rejected {
-                    status: status.as_u16(),
+                    status: error_status,
                     description,
+                    retry_after: envelope
+                        .parameters
+                        .and_then(|parameters| parameters.retry_after),
                 });
             }
             return Err(TelegramBotApiError::Api(description));
@@ -252,6 +267,13 @@ struct BotApiResponse {
     ok: bool,
     description: Option<String>,
     result: Option<serde_json::Value>,
+    error_code: Option<u16>,
+    parameters: Option<BotApiParameters>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BotApiParameters {
+    retry_after: Option<u32>,
 }
 
 /// `getMe` 返回的 User 对象中本仓用到的字段。
@@ -849,7 +871,7 @@ mod tests {
             .expect_err("Bot API 失败响应不应被视为成功");
         assert!(matches!(
             error,
-            TelegramBotApiError::Rejected { status: 429, description } if description == "retry"
+            TelegramBotApiError::Rejected { status: 429, description, .. } if description == "retry"
         ));
         let _ = server.await.expect("等待 Bot API mock 失败");
     }

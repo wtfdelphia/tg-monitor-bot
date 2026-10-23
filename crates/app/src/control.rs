@@ -1551,6 +1551,30 @@ pub struct TargetChannelResponse {
     pub can_send: Option<bool>,
     pub checked_at: Option<String>,
     pub enabled: bool,
+    pub probe: TargetProbeResponse,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TargetProbeResponse {
+    pub generation: i64,
+    pub state: String,
+    pub can_send: Option<bool>,
+    pub content_protected: Option<bool>,
+    pub bot_role: Option<String>,
+    pub checked_at: Option<String>,
+    pub error_code: Option<String>,
+}
+
+fn probe_response(record: tgm_db::target_probe::TargetProbe) -> TargetProbeResponse {
+    TargetProbeResponse {
+        generation: record.generation,
+        state: record.state,
+        can_send: record.can_send,
+        content_protected: record.content_protected,
+        bot_role: record.bot_role,
+        checked_at: record.checked_at.map(format_timestamp),
+        error_code: record.error_code,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -3769,6 +3793,15 @@ fn target_pagination(query: &TargetChannelListQuery) -> Result<(i64, i64), ApiEr
 
 fn target_response(record: tgm_db::repo::TargetChannelRecord) -> TargetChannelResponse {
     TargetChannelResponse {
+        probe: TargetProbeResponse {
+            generation: record.probe_generation,
+            state: record.probe_state,
+            can_send: record.can_send,
+            content_protected: record.content_protected,
+            bot_role: record.bot_role,
+            checked_at: record.checked_at.map(format_timestamp),
+            error_code: record.probe_error_code,
+        },
         id: record.id,
         tg_chat_id: record.tg_chat_id,
         title: record.title,
@@ -4470,7 +4503,7 @@ async fn list_targets(
     Authenticated(auth): Authenticated,
     State(state): State<ControlPlaneState>,
     Query(query): Query<TargetChannelListQuery>,
-) -> Result<Json<TargetChannelListResponse>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     let (page, per_page) = target_pagination(&query)?;
     let mut records = tgm_db::repo::list_target_channels(
         &state.pool,
@@ -4484,12 +4517,15 @@ async fn list_targets(
     if has_more {
         records.truncate(per_page as usize);
     }
-    Ok(Json(TargetChannelListResponse {
-        items: records.into_iter().map(target_response).collect(),
-        page,
-        per_page,
-        has_more,
-    }))
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(TargetChannelListResponse {
+            items: records.into_iter().map(target_response).collect(),
+            page,
+            per_page,
+            has_more,
+        }),
+    ))
 }
 
 #[utoipa::path(
@@ -4509,7 +4545,7 @@ async fn create_target(
     Authenticated(auth): Authenticated,
     State(state): State<ControlPlaneState>,
     Json(input): Json<TargetChannelCreateRequest>,
-) -> Result<(StatusCode, Json<TargetChannelResponse>), ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     require_target_write(auth)?;
     let tg_chat_id = parse_target_chat(&input.chat)?;
     let sender_identity_id =
@@ -4528,7 +4564,62 @@ async fn create_target(
     )
     .await
     .map_err(ApiError::from)?;
-    Ok((StatusCode::CREATED, Json(target_response(record))))
+    Ok((
+        StatusCode::CREATED,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(target_response(record)),
+    ))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/targets/{id}/probe",
+    params(("id" = i64, Path, description = "Target channel id")),
+    responses(
+        (status = 200, description = "Current target probe", body = TargetProbeResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 404, description = "Target not found", body = ErrorResponse)
+    )
+)]
+async fn get_target_probe(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let probe = tgm_db::target_probe::read_probe(&state.pool, auth.tenant_id(), id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(probe_response(probe)),
+    ))
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/targets/{id}/probe",
+    params(("id" = i64, Path, description = "Target channel id")),
+    responses(
+        (status = 202, description = "Probe queued or already in progress", body = TargetProbeResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Target not found", body = ErrorResponse)
+    )
+)]
+async fn start_target_probe(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_target_write(auth)?;
+    let probe = tgm_db::target_probe::request_probe(&state.pool, auth.tenant_id(), id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(probe_response(probe)),
+    ))
 }
 
 #[utoipa::path(
@@ -4550,7 +4641,7 @@ async fn update_target(
     State(state): State<ControlPlaneState>,
     Path(id): Path<i64>,
     Json(input): Json<TargetChannelPatchRequest>,
-) -> Result<Json<TargetChannelResponse>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     require_target_write(auth)?;
     let chat = input.chat.as_deref().map(parse_target_chat).transpose()?;
     let record = tgm_db::repo::update_target_channel(
@@ -4568,7 +4659,10 @@ async fn update_target(
     )
     .await
     .map_err(ApiError::from)?;
-    Ok(Json(target_response(record)))
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(target_response(record)),
+    ))
 }
 
 #[utoipa::path(
@@ -4814,6 +4908,8 @@ async fn retry_task(
         update_keyword,
         delete_keyword,
         list_targets,
+        get_target_probe,
+        start_target_probe,
         create_target,
         update_target,
         delete_target,
@@ -4874,6 +4970,7 @@ async fn retry_task(
         KeywordImportResponse,
         KeywordExportResponse,
         TargetChannelResponse,
+        TargetProbeResponse,
         TargetChannelListResponse,
         TargetChannelCreateRequest,
         TargetChannelPatchRequest,
@@ -5014,10 +5111,23 @@ pub fn router(state: ControlPlaneState) -> Router {
             "/api/v1/keywords/{id}",
             patch(update_keyword).delete(delete_keyword),
         )
-        .route("/api/v1/targets", get(list_targets).post(create_target))
+        .route(
+            "/api/v1/targets",
+            get(list_targets)
+                .post(create_target)
+                .route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/api/v1/targets/{id}/probe",
+            get(get_target_probe)
+                .post(start_target_probe)
+                .route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
         .route(
             "/api/v1/targets/{id}",
-            patch(update_target).delete(delete_target),
+            patch(update_target)
+                .delete(delete_target)
+                .route_layer(middleware::from_fn(no_store_sensitive_auth)),
         )
         .route("/api/v1/rules", get(list_rules).post(create_rule))
         .route(

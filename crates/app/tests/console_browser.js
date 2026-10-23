@@ -236,6 +236,28 @@ async function main() {
     assert.equal(await writer.evaluate(() => Boolean(window.browserInjected)), false);
     console.log('规则：创建、批量停用、子项编辑、版本快照及转义通过');
 
+    await navigate(writer, '/console/targets', '目标频道', '#target-form');
+    const botIdentity = await writer.$eval('#target-form select', element => [...element.options].find(option => option.textContent.includes('浏览器接入 Bot'))?.value);
+    assert.ok(botIdentity);
+    for (const [chat, expected] of [['-10088011', '可发送基础文字'], ['-10088012', '不可发送基础文字'], ['-10088013', '自检失败：TELEGRAM_REJECTED']]) {
+      await fill(writer, '#target-form [name=chat]', chat);
+      await writer.select('#target-form [name=sender_identity_id]', botIdentity);
+      await Promise.all([
+        writer.waitForResponse(response => response.url().endsWith('/api/v1/targets') && response.request().method() === 'POST' && response.status() === 201),
+        writer.click('#target-form button'),
+      ]);
+      await writer.waitForFunction((chat, expected) => [...document.querySelectorAll('tbody tr')].some(row => row.cells[0].textContent === chat && row.textContent.includes(expected)), {}, chat, expected);
+    }
+    const lastProbe = await writer.$eval('tbody tr:last-child [data-target-probe]', element => element.dataset.targetProbe);
+    await writer.focus('[data-target-probe="'+lastProbe+'"]');
+    await Promise.all([
+      writer.waitForResponse(response => response.url().endsWith('/probe') && response.request().method() === 'POST' && response.status() === 202),
+      writer.keyboard.press('Enter'),
+    ]);
+    await writer.waitForFunction(() => document.body.textContent.includes('自检失败：TELEGRAM_REJECTED'));
+    assert.equal(await writer.evaluate(() => document.body.textContent.includes('browser-secret-error-sentinel')), false);
+    console.log('目标自检：创建排队、只读 Bot 桩、可发送/无发帖权/拒绝、键盘重试及错误脱敏通过');
+
     const routes = [
       ['/console/identities', '身份', '[data-identity-edit]'],
       ['/console/rules', '规则列表', '[data-rule-select]'],
@@ -274,6 +296,9 @@ async function main() {
     assert.equal(await viewer.$('[data-rule-select]'), null);
     await navigate(viewer, '/console/rules/new', '新建规则', '#content .empty');
     assert.match(await viewer.$eval('#content', element => element.textContent), /没有规则编辑权限/);
+    await navigate(viewer, '/console/targets', '目标频道', '#target-form');
+    assert.equal(await viewer.$('[data-target-probe]'), null);
+    assert.match(await viewer.$eval('#content', element => element.textContent), /不可发送基础文字/);
     console.log('只读角色：业务写入入口隐藏、规则编辑拒绝通过');
 
     await writer.setViewport({ width: 390, height: 900 });
