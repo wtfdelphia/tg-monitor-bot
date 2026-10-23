@@ -21,9 +21,9 @@ async function main() {
   let heldRequest;
   let delayKeyword = false;
   const watchdog = setTimeout(() => {
-    console.error('真实浏览器验收超过 120 秒');
+    console.error('真实浏览器验收超过 180 秒');
     process.exit(1);
-  }, 120000);
+  }, 180000);
 
   function checkParameters(value) {
     if (!value || typeof value !== 'object') return;
@@ -48,6 +48,10 @@ async function main() {
     page.on('request', request => {
       try {
         const url = new URL(request.url());
+        if (url.protocol === 'data:' && request.resourceType() === 'image' && url.href.startsWith('data:image/svg+xml;')) {
+          void request.continue();
+          return;
+        }
         assert.equal(url.origin, origin.origin, '测试不得向真实外部平台发送请求');
         assert.equal(url.searchParams.has('tenant_id'), false);
         if (request.postData()) checkParameters(JSON.parse(request.postData()));
@@ -69,7 +73,12 @@ async function main() {
   async function screenshot(page, name) {
     if (!screenshots) return;
     fs.mkdirSync(screenshots, { recursive: true });
-    await page.screenshot({ path: path.join(screenshots, `${name}.png`), fullPage: true });
+    const redaction = await page.addStyleTag({ content: '#identity-intake{visibility:hidden!important}' });
+    try {
+      await page.screenshot({ path: path.join(screenshots, `${name}.png`), fullPage: true });
+    } finally {
+      await redaction.evaluate(element => element.remove());
+    }
   }
 
   async function navigate(page, route, title, selector) {
@@ -120,6 +129,48 @@ async function main() {
 
     const writer = await pageFor(config.writer);
     await writer.setViewport({ width: 1280, height: 900 });
+    await navigate(writer, '/console/identities', '身份', '#bot-intake-form');
+    assert.equal(await writer.$eval('#bot-intake-form [name=token]', input => input.type), 'password');
+    await fill(writer, '#bot-intake-form [name=token]', '123456:' + 'A'.repeat(35));
+    await Promise.all([
+      writer.waitForResponse(response => response.url().endsWith('/api/v1/identities/bot') && response.status() === 201),
+      writer.$eval('#bot-intake-form', form => form.requestSubmit()),
+    ]);
+    await writer.waitForFunction(() => document.querySelector('#content table')?.textContent.includes('浏览器接入 Bot'));
+    assert.equal(await writer.$eval('#bot-intake-form [name=token]', input => input.value), '');
+    console.log('Bot 接入：真实 HTTP handler、本地 getMe 桩、提交清空和列表刷新通过');
+
+    await writer.click('[data-identity-reauthorize]');
+    assert.equal(await writer.$eval('#identity-qr-form [name=consent]', input => input.checked), false);
+    await fill(writer, '#identity-qr-form [name=api_id]', '12345');
+    await fill(writer, '#identity-qr-form [name=api_hash]', 'b'.repeat(32));
+    await writer.click('#identity-qr-form [name=consent]');
+    await writer.$eval('#identity-qr-form', form => form.requestSubmit());
+    await writer.waitForFunction(() => {
+      const image = document.querySelector('#identity-qr-image');
+      return image && !image.hidden && image.complete && image.naturalWidth === 256;
+    });
+    assert.equal(await writer.$eval('#identity-qr-form [name=api_hash]', input => input.value), '');
+    await writer.waitForFunction(() => document.querySelector('#identity-qr-image')?.naturalWidth === 257, { timeout: 35000 });
+    const desktopIntake = await writer.evaluate(() => ({ viewport: window.innerWidth, width: document.documentElement.scrollWidth }));
+    assert.ok(desktopIntake.width <= desktopIntake.viewport + 1);
+    await writer.setViewport({ width: 320, height: 900 });
+    const intakeDimensions = await writer.evaluate(() => ({ viewport: window.innerWidth, width: document.documentElement.scrollWidth }));
+    assert.ok(intakeDimensions.width <= intakeDimensions.viewport + 1);
+    await writer.waitForFunction(() => !document.querySelector('#identity-password-form').hidden, { timeout: 65000 });
+    assert.equal(await writer.$eval('#identity-qr-image', image => image.hasAttribute('src')), false);
+    await new Promise(resolve => setTimeout(resolve, 2100));
+    await fill(writer, '#identity-password-form [name=password]', 'browser-wrong-password');
+    await writer.$eval('#identity-password-form', form => form.requestSubmit());
+    await writer.waitForFunction(() => document.querySelector('#identity-intake-status').textContent.includes('密码错误'));
+    assert.equal(await writer.$eval('#identity-password-form [name=password]', input => input.value), '');
+    await new Promise(resolve => setTimeout(resolve, 2100));
+    await fill(writer, '#identity-password-form [name=password]', 'browser-right-password');
+    await writer.$eval('#identity-password-form', form => form.requestSubmit());
+    await writer.waitForFunction(() => !document.querySelector('#identity-intake-status').textContent && document.querySelector('#identity-password-form').hidden);
+    await writer.setViewport({ width: 1280, height: 900 });
+    console.log('账号接入页面：本地 HTTP 桩的 QR 轮换、2FA 重试、凭据清空与终态刷新通过；不是 Telegram 真机或 MTProto 落库验收');
+
     await navigate(writer, '/console/keywords', '关键词', '#keyword-form');
     assert.equal(await writer.evaluate(() => Boolean(window.browserInjected)), false);
     assert.equal(await writer.$('#content img'), null);
@@ -214,6 +265,8 @@ async function main() {
     console.log('六页：桌面与窄屏布局、导航键盘焦点通过');
 
     const viewer = await pageFor(config.viewer);
+    await navigate(viewer, '/console/identities', '身份', '[data-identity-edit]');
+    assert.equal(await viewer.$('#identity-intake'), null);
     await navigate(viewer, '/console/keywords', '关键词', '#keyword-form');
     await viewer.waitForFunction(() => getComputedStyle(document.querySelector('#keyword-form')).display === 'none');
     assert.equal(await viewer.$eval('#keyword-form', form => getComputedStyle(form).display), 'none');

@@ -166,6 +166,7 @@ let ruleFilterState={enabled:'',target_ref:'',source_ref:''};
 let ruleListLoading=false;
 let currentRole='';
 let canWrite=false;
+let identityIntakeCleanup=()=>{};
 const escapeHtml=value=>String(value??'').replace(/[&<>'"]/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
 const getCsrf=()=>document.cookie.split(';').map(value=>value.trim()).find(value=>value.startsWith('tgm_csrf='))?.slice('tgm_csrf='.length)||'';
 function showError(error){content.insertAdjacentHTML('afterbegin','<div class="danger">'+escapeHtml(error.message||'请求失败')+'</div>')}
@@ -240,13 +241,139 @@ function readOnlyNotice(){return '<div id="console-readonly-notice" class="notic
 function enforceReadOnly(){if(canWrite)return;if(!document.querySelector('#console-readonly-notice'))content.insertAdjacentHTML('afterbegin',readOnlyNotice());['[data-identity-reset]','[data-identity-delete]','[data-identity-edit]','[data-keyword-toggle]','[data-keyword-delete]','[data-keyword-edit]','[data-target-toggle]','[data-target-delete]','[data-target-edit]'].forEach(selector=>document.querySelectorAll(selector).forEach(element=>{(element.closest('details')||element.closest('.actions')||element).style.display='none'}));['#keyword-form','#keyword-test','#keyword-import-label','#target-form','a[href="/console/rules/new"]'].forEach(selector=>document.querySelectorAll(selector).forEach(element=>{element.style.display='none'}));document.querySelectorAll('a[href^="/console/rules/"]').forEach(element=>{element.style.display='none'})}
 
 async function identities(){
+  identityIntakeCleanup();
   title.textContent='身份';
   const body=await apiAllPages('/api/v1/identities');
   const rows=body.items.map(item=>'<tr><td>'+escapeHtml(item.display_name||'未命名')+'</td><td>'+escapeHtml(item.kind)+'</td><td>'+escapeHtml(item.tg_user_id||'—')+'</td><td>'+identityStatus(item.status)+'</td><td><div class="actions"><button data-identity-reset="'+item.id+'" type="button">状态复位</button><button class="danger-button" data-identity-delete="'+item.id+'" type="button">删除</button></div><details><summary>编辑</summary><form class="inline-form" data-identity-edit="'+item.id+'"><input name="display_name" placeholder="显示名称" value="'+escapeHtml(item.display_name||'')+'"><input name="proxy_url" placeholder="填写才修改代理，留空不变"><label><input name="clear_proxy" type="checkbox">清除代理</label><button type="submit">保存</button></form></details></td></tr>');
-  content.innerHTML='<div class="notice">身份用于读取 Telegram 频道。敏感凭据不在页面回显；状态复位、显示名称和代理配置沿用现有 API。</div>'+(rows.length?renderTable(['名称','类型','Telegram 用户','状态','操作'],rows):'<div class="empty">暂无身份。</div>');
+  content.innerHTML='<div class="notice">身份用于读取 Telegram 频道。敏感凭据不在页面回显；状态复位、显示名称和代理配置沿用现有 API。</div>'+(canWrite?identityIntakeMarkup(body.items):'')+(rows.length?renderTable(['名称','类型','Telegram 用户','状态','操作'],rows):'<div class="empty">暂无身份。</div>');
+  bindIdentityIntake();
   document.querySelectorAll('[data-identity-reset]').forEach(button=>button.addEventListener('click',()=>runWrite(button,async()=>{await writeApi('/api/v1/identities/'+button.dataset.identityReset+'/reset-status','POST');await identities()})));
   document.querySelectorAll('[data-identity-delete]').forEach(button=>button.addEventListener('click',()=>runWrite(button,async()=>{if(!window.confirm('确定删除这个身份吗？'))return;await writeApi('/api/v1/identities/'+button.dataset.identityDelete,'DELETE');await identities()})));
   document.querySelectorAll('[data-identity-edit]').forEach(form=>form.addEventListener('submit',async event=>{event.preventDefault();const data=new FormData(form);const displayName=String(data.get('display_name')||'').trim();const proxyUrl=String(data.get('proxy_url')||'').trim();const body={display_name:displayName||null};if(data.get('clear_proxy')==='on')body.proxy_url=null;else if(proxyUrl)body.proxy_url=proxyUrl;await runWrite(form,async()=>{await writeApi('/api/v1/identities/'+form.dataset.identityEdit,'PATCH',body);await identities()})}));
+}
+
+function identityIntakeMarkup(items){
+  const reauthorize=items.filter(item=>item.kind==='mtproto').map(item=>'<button type="button" class="secondary" data-identity-reauthorize="'+escapeHtml(item.id)+'">重新授权：'+escapeHtml(item.display_name||item.tg_user_id||item.id)+'</button>').join('');
+  return `<section id="identity-intake"><style>#identity-intake [hidden]{display:none!important}</style>
+<h2>接入身份</h2>
+<form id="bot-intake-form" class="toolbar"><label>Bot Token<input name="token" type="password" autocomplete="off" required></label><button>接入 Bot</button></form>
+<p>Telegram 账号接入不是控制台登录，仅 pro 档可用。平台代持的 session 可读取账号会话、以账号发送消息及修改设置；加密不能消除代持风险。请仅接入有权使用的测试账号。</p>
+<p>内测占位授权版本：custody-v0，非正式法律文本。本次授权平台代持 Telegram session，用于读取本人有权访问的频道；投递使用 Bot，不以该用户账号发送。</p>
+<p id="identity-reauthorize-label">新接入 Telegram 账号</p><div class="actions">${reauthorize}</div>
+<form id="identity-qr-form" class="toolbar"><label>API ID<input name="api_id" inputmode="numeric" pattern="[0-9]+" required></label><label>API Hash<input name="api_hash" type="password" autocomplete="off" required></label><label><input name="consent" type="checkbox" required>我已阅读上述权限与代持风险，同意本次按 custody-v0 内测占位版本授权</label><button>开始账号扫码</button></form>
+<img id="identity-qr-image" alt="Telegram 账号接入二维码，包含短期授权凭据，请勿分享" width="256" height="256" style="max-width:100%;height:auto" hidden>
+<form id="identity-password-form" class="toolbar" hidden><label>Telegram 两步验证密码<input name="password" type="password" autocomplete="off" required></label><button>提交两步验证密码</button></form>
+<button id="identity-login-stop" class="secondary" type="button" hidden>结束本页操作</button><p class="muted">结束或离页会清除本页材料；服务端进行中的登录仍会在既有时限内过期，不表示已注销 Telegram 会话。</p>
+<p id="identity-intake-status" role="status" aria-live="polite"></p></section>`;
+}
+
+function bindIdentityIntake(){
+  const botForm=document.querySelector('#bot-intake-form');
+  const qrForm=document.querySelector('#identity-qr-form');
+  if(!botForm||!qrForm)return;
+  const passwordForm=document.querySelector('#identity-password-form');
+  const image=document.querySelector('#identity-qr-image');
+  const status=document.querySelector('#identity-intake-status');
+  const stop=document.querySelector('#identity-login-stop');
+  let generation=0,loginId='',identityId='',timer,expiryTimer,imageTimer,nextRequestAt=0;
+  let controller=new AbortController();
+  const clearImage=()=>{clearTimeout(imageTimer);image.hidden=true;image.removeAttribute('src')};
+  function reset(){
+    generation+=1;controller.abort();controller=new AbortController();
+    clearTimeout(timer);clearTimeout(expiryTimer);clearImage();loginId='';nextRequestAt=0;
+    passwordForm.hidden=true;stop.hidden=true;
+    for(const form of [botForm,qrForm,passwordForm])for(const input of form.elements)if(input.type==='password')input.value='';
+  }
+  const leave=()=>reset();
+  window.addEventListener('pagehide',leave);
+  identityIntakeCleanup=()=>{reset();window.removeEventListener('pagehide',leave)};
+  async function intakeRequest(url,method,body,signal){
+    if(!canWrite)throw new Error('当前角色不能接入身份。');
+    let response;
+    try{
+      response=await fetch(url,{method,credentials:'same-origin',cache:'no-store',signal:AbortSignal.any([signal,AbortSignal.timeout(10000)]),headers:method==='POST'?{'content-type':'application/json','x-csrf-token':getCsrf()}:undefined,body:body===undefined?undefined:JSON.stringify(body)});
+    }catch{throw new Error('接入请求未确认，请核对身份列表后重新开始。')}
+    if(!response.ok){
+      const messages={401:'登录已失效，请重新登录。',403:'无接入权限，请核对角色、pro 档及授权版本。',404:'登录或身份不可用，请重新开始。',429:'请求过于频繁，请稍后重新开始。'};
+      throw new Error(messages[response.status]||'接入未完成，请核对输入与身份列表后重试。');
+    }
+    try{return await response.json()}catch{throw new Error('接入响应无效，请重新开始。')}
+  }
+  function showQr(svg,expiresAt){
+    const expiry=Date.parse(expiresAt);
+    if(typeof svg!=='string'||svg.length>524288||!Number.isFinite(expiry)||expiry<=Date.now())throw new Error('二维码已过期或无效，请重新开始。');
+    const document=new DOMParser().parseFromString(svg,'image/svg+xml');
+    if(document.querySelector('parsererror')||document.documentElement.localName!=='svg'||document.documentElement.namespaceURI!=='http://www.w3.org/2000/svg')throw new Error('二维码响应无效，请重新开始。');
+    clearImage();image.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);image.hidden=false;
+    imageTimer=setTimeout(clearImage,expiry-Date.now());
+  }
+  function finish(message){reset();status.textContent=message}
+  async function update(body,current){
+    if(current!==generation)return;
+    if(body.status==='confirmed'){finish('账号已接入，正在刷新身份列表。');await identities();return}
+    if(body.status==='expired'){finish('账号扫码已过期，请重新开始。');return}
+    if(body.status==='failed'){
+      const reasons={account_mismatch:'登录账号与原身份不一致，未重新授权。',account_already_registered:'该账号已接入，请核对身份列表。'};
+      finish(reasons[body.reason]||'账号接入失败，请核对身份列表后重新开始。');return;
+    }
+    if(body.status==='awaiting_password'){
+      clearImage();passwordForm.hidden=false;status.textContent=body.password_rejected?'两步验证密码错误，请重新输入。':'请填写 Telegram 两步验证密码。';return;
+    }
+    if(body.status!=='pending')throw new Error('无法识别账号登录状态，请重新开始。');
+    passwordForm.hidden=true;showQr(body.qr_svg,body.expires_at);status.textContent='请使用 Telegram 扫描账号接入二维码；不要分享此二维码。';
+    timer=setTimeout(async()=>{
+      if(current!==generation)return;
+      try{nextRequestAt=Date.now()+2000;const result=await intakeRequest('/api/v1/identities/login/qr/'+encodeURIComponent(loginId),'GET',undefined,controller.signal);if(current!==generation)return;nextRequestAt=Date.now()+2000;await update(result,current)}
+      catch(error){if(current===generation)finish(error.message)}
+    },25000);
+  }
+  botForm.addEventListener('submit',async event=>{
+    event.preventDefault();if(botForm.dataset.pending)return;
+    const input=botForm.elements.namedItem('token');const token=input.value;input.value='';
+    const current=generation;
+    await runWrite(botForm,async()=>{
+      try{await intakeRequest('/api/v1/identities/bot','POST',{token},controller.signal);if(current===generation)await identities()}
+      catch(error){if(current===generation)status.textContent=error.message}
+    });
+  });
+  qrForm.addEventListener('submit',async event=>{
+    event.preventDefault();if(qrForm.dataset.pending)return;
+    const hash=qrForm.elements.namedItem('api_hash');const apiHash=hash.value;hash.value='';
+    if(!qrForm.elements.namedItem('consent').checked){status.textContent='请先阅读并主动同意代持授权。';return}
+    const apiId=Number(qrForm.elements.namedItem('api_id').value);
+    if(!Number.isInteger(apiId)||apiId<=0||apiId>2147483647||!/^[a-fA-F0-9]{32}$/.test(apiHash)){status.textContent='请填写有效的 API ID 与 API Hash。';return}
+    reset();const current=generation;stop.hidden=false;
+    const body={api_id:apiId,api_hash:apiHash,consent_text_version:'custody-v0'};
+    if(identityId)body.identity_id=Number(identityId);
+    status.textContent='正在发起账号接入…';
+    expiryTimer=setTimeout(()=>{if(current===generation)finish('本页登录已超时，请核对身份列表后重新开始。')},600000);
+    await runWrite(qrForm,async()=>{
+      try{
+        const result=await intakeRequest('/api/v1/identities/login/qr','POST',body,controller.signal);
+        if(current!==generation)return;
+        if(!/^[A-Za-z0-9_-]{43}$/.test(result.login_id))throw new Error('登录材料无效，请重新开始。');
+        loginId=result.login_id;nextRequestAt=Date.now()+2000;
+        await update({status:'pending',qr_svg:result.qr_svg,expires_at:result.expires_at},current);
+      }catch(error){if(current===generation)finish(error.message)}
+    });
+  });
+  passwordForm.addEventListener('submit',async event=>{
+    event.preventDefault();if(passwordForm.dataset.pending)return;
+    const input=passwordForm.elements.namedItem('password');const password=input.value;input.value='';
+    if(!loginId||passwordForm.hidden||!password)return;
+    if(Date.now()<nextRequestAt){status.textContent='请稍候两秒再提交密码。';return}
+    const current=generation;
+    await runWrite(passwordForm,async()=>{
+      try{const body=await intakeRequest('/api/v1/identities/login/password','POST',{login_id:loginId,password},controller.signal);if(current!==generation)return;nextRequestAt=Date.now()+2000;await update(body,current)}
+      catch(error){if(current===generation)finish(error.message)}
+    });
+  });
+  stop.addEventListener('click',()=>finish('本页操作已结束；服务端登录将按原时限过期。'));
+  document.querySelectorAll('[data-identity-reauthorize]').forEach(button=>button.addEventListener('click',()=>{
+    reset();identityId=button.dataset.identityReauthorize;qrForm.elements.namedItem('consent').checked=false;
+    document.querySelector('#identity-reauthorize-label').textContent='重新授权已有身份 '+identityId+'，必须使用原 Telegram 账号；刷新本页可切回新接入。';
+    status.textContent='请重新填写凭据并主动同意授权。';qrForm.elements.namedItem('api_id').focus();
+  }));
 }
 
 async function keywords(){
@@ -487,6 +614,12 @@ mod tests {
     fn business_writes_prevent_duplicate_submission_and_restore_controls()
     -> Result<(), Box<dyn std::error::Error>> {
         check_page_script(CONSOLE_PAGE, "console_writes.js")
+    }
+
+    #[test]
+    fn identity_intake_clears_credentials_and_serializes_login_states()
+    -> Result<(), Box<dyn std::error::Error>> {
+        check_page_script(CONSOLE_PAGE, "console_identity_intake.js")
     }
 
     #[test]
