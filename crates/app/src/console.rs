@@ -56,6 +56,7 @@ h1{margin:0 0 8px;font-size:28px}p{color:#5d687b;line-height:1.6}
 button,a.button{display:block;width:100%;box-sizing:border-box;border:0;border-radius:10px;padding:12px 16px;margin-top:12px;font:inherit;text-align:center;text-decoration:none;cursor:pointer}
 .primary{background:#2563eb;color:white}.secondary{background:#eef2ff;color:#1e40af}
 #qr{margin-top:20px;padding:16px;background:#f8fafc;border-radius:10px;display:none}
+#qr-image{display:block;width:min(256px,100%);height:auto;margin:12px auto}#qr-image[hidden]{display:none}
 .muted{font-size:13px;color:#687386;word-break:break-all}
 </style>
 </head>
@@ -65,62 +66,82 @@ button,a.button{display:block;width:100%;box-sizing:border-box;border:0;border-r
 <p>使用 Telegram 身份进入控制台。</p>
 <a class="button primary" href="/auth/oidc/start">使用 Telegram 登录</a>
 <button class="secondary" id="qr-start" type="button">扫码登录</button>
-<section id="qr"><strong>这是控制台登录，不是 Telegram 账号接入。请比对网页与 Bot 的确认码后再确认。</strong><p id="qr-code"></p><a id="qr-link" class="muted" target="_blank" rel="noreferrer" hidden></a><p id="qr-state" class="muted" role="status" aria-live="polite"></p></section>
+<section id="qr"><strong>这是控制台登录，不是 Telegram 账号接入。请比对网页与 Bot 的确认码后再确认。</strong><p id="qr-code"></p><img id="qr-image" alt="控制台登录二维码" hidden><a id="qr-link" class="muted" target="_blank" rel="noreferrer" hidden></a><p id="qr-state" class="muted" role="status" aria-live="polite"></p></section>
 </main>
 <script>
 const start=document.querySelector('#qr-start');
 const panel=document.querySelector('#qr');
 const code=document.querySelector('#qr-code');
+const image=document.querySelector('#qr-image');
 const link=document.querySelector('#qr-link');
 const state=document.querySelector('#qr-state');
 let timer;
+let expiryTimer;
 let expiresAt;
-function stopPolling(message){clearTimeout(timer);timer=undefined;state.textContent=message;start.disabled=false;link.hidden=true}
+let generation=0;
+let controller;
+function clearImage(){image.removeAttribute('src');image.hidden=true}
+function clearChallenge(){clearImage();code.textContent='';link.removeAttribute('href');link.textContent='';link.hidden=true}
+function resetChallenge(){generation+=1;controller?.abort();controller=undefined;clearTimeout(timer);clearTimeout(expiryTimer);timer=undefined;expiryTimer=undefined;clearChallenge()}
+function stopPolling(message){resetChallenge();state.textContent=message;start.disabled=false}
 async function loginRequest(url,options={}){
-  const response=await fetch(url,{...options,credentials:'same-origin',signal:AbortSignal.timeout(10000)});
+  const response=await fetch(url,{...options,credentials:'same-origin',cache:'no-store',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
   if(!response.ok){
     if(response.status===403){const body=await response.json();if(body.error?.code==='NOT_INVITED')throw new Error('你的 Telegram 账号已验证，但尚未被邀请加入任何工作区。请联系工作区管理员。')}
     throw new Error('请求失败，请重新开始。');
   }
   return response.json();
 }
-async function pollChallenge(challenge){
+async function pollChallenge(challenge,current){
+  if(current!==generation)return;
   timer=undefined;
   if(Date.now()>=expiresAt){stopPolling('登录挑战已过期，请重新开始。');return}
   try{
     const body=await loginRequest('/auth/qr/challenge/'+encodeURIComponent(challenge.nonce));
-    if(body.state==='confirmed'){state.textContent='登录已确认，正在进入控制台…';window.location.href='/console/identities';return}
+    if(current!==generation)return;
+    if(Date.now()>=expiresAt){stopPolling('登录挑战已过期，请重新开始。');return}
+    if(body.state==='confirmed'){resetChallenge();state.textContent='登录已确认，正在进入控制台…';window.location.href='/console/identities';return}
     if(body.state==='expired'){stopPolling('登录挑战已过期，请重新开始。');return}
     if(body.state==='rejected'){stopPolling('登录已被拒绝，请重新开始；若尚未受邀，请联系工作区管理员。');return}
     if(body.state!=='pending'&&body.state!=='awaiting_confirm')throw new Error('无法识别登录状态，请重新开始。');
     state.textContent=body.state==='pending'?'请在 Telegram 中打开链接，等待 Bot 确认卡片。':'请比对网页与 Bot 的确认码，仅在一致时确认登录。';
-    timer=setTimeout(()=>pollChallenge(challenge),Math.max(0,Math.min(2000,expiresAt-Date.now())));
-  }catch(error){stopPolling(error.message.startsWith('你的 Telegram')?error.message:'轮询失败，请重新开始。')}
+    timer=setTimeout(()=>pollChallenge(challenge,current),Math.max(0,Math.min(2000,expiresAt-Date.now())));
+  }catch(error){if(current===generation)stopPolling(error.message.startsWith('你的 Telegram')?error.message:'轮询失败，请重新开始。')}
 }
 start.addEventListener('click',async()=>{
   if(start.disabled)return;
+  resetChallenge();
+  const current=generation;
+  controller=new AbortController();
   start.disabled=true;
-  clearTimeout(timer);
-  timer=undefined;
   panel.style.display='block';
   state.textContent='正在创建登录挑战…';
-  code.textContent='';
-  link.hidden=true;
-  link.removeAttribute('href');
-  link.textContent='';
   try{
     const challenge=await loginRequest('/auth/qr/challenge',{method:'POST',headers:{'content-type':'application/json'}});
+    if(current!==generation)return;
     expiresAt=Date.parse(challenge.expires_at);
     const deepLink=new URL(challenge.deep_link);
+    if(typeof challenge.qr_svg!=='string'||challenge.qr_svg.length>524288)throw new Error('登录二维码无效，请重新开始。');
+    const parsedQr=new DOMParser().parseFromString(challenge.qr_svg,'image/svg+xml');
+    const root=parsedQr.documentElement;
+    const qrNodes=[...root.querySelectorAll('*')];
+    const qrNames=['rect','path'];
+    const qrAttributes={svg:['xmlns','version','width','height','viewBox','shape-rendering'],rect:['x','y','width','height','fill'],path:['fill','d']};
+    if(parsedQr.querySelector('parsererror')||parsedQr.doctype||root.localName!=='svg'||root.namespaceURI!=='http://www.w3.org/2000/svg'||[...root.attributes].some(attribute=>!qrAttributes.svg.includes(attribute.name))||qrNodes.length!==qrNames.length||qrNodes.some((node,index)=>node.localName!==qrNames[index]||node.namespaceURI!=='http://www.w3.org/2000/svg'||[...node.attributes].some(attribute=>!qrAttributes[node.localName].includes(attribute.name)||(attribute.name==='fill'&&!/^#[0-9a-f]{3,8}$/i.test(attribute.value)))||node.children.length))throw new Error('登录二维码无效，请重新开始。');
     if(!/^[A-Za-z0-9_-]{43}$/.test(challenge.nonce)||!/^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$/.test(challenge.confirm_code)||!Number.isFinite(expiresAt)||expiresAt<=Date.now()||deepLink.origin!=='https://t.me'||deepLink.username||deepLink.password||!/^\/[A-Za-z0-9_]+$/.test(deepLink.pathname)||deepLink.searchParams.get('start')!=='login_'+challenge.nonce)throw new Error('登录挑战无效，请重新开始。');
     code.textContent='确认码：'+challenge.confirm_code;
+    image.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(root.outerHTML);
+    image.hidden=false;
     link.href=deepLink.href;
     link.textContent=deepLink.href;
     link.hidden=false;
-    state.textContent='请在 Telegram 中打开链接，并比对确认码。';
-    timer=setTimeout(()=>pollChallenge(challenge),Math.min(2000,expiresAt-Date.now()));
-  }catch(error){stopPolling(error.message.startsWith('你的 Telegram')?error.message:'无法创建登录挑战，请稍后重试。')}
+    state.textContent='请使用手机相机扫描二维码，或在 Telegram 中打开下方链接，并比对确认码。';
+    expiryTimer=setTimeout(()=>{if(current===generation)stopPolling('登录挑战已过期，请重新开始。')},expiresAt-Date.now());
+    timer=setTimeout(()=>pollChallenge(challenge,current),Math.min(2000,expiresAt-Date.now()));
+  }catch(error){if(current===generation)stopPolling(error.message.startsWith('你的 Telegram')?error.message:'无法创建登录挑战，请稍后重试。')}
 });
+image.addEventListener('error',()=>{if(image.hidden)return;clearImage();state.textContent='二维码加载失败，可使用下方 Telegram 链接；请比对确认码。'});
+window.addEventListener('pagehide',()=>{resetChallenge();start.disabled=false});
 </script>
 </body>
 </html>"###;

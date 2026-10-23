@@ -73,7 +73,7 @@ async function main() {
   async function screenshot(page, name) {
     if (!screenshots) return;
     fs.mkdirSync(screenshots, { recursive: true });
-    const redaction = await page.addStyleTag({ content: '#identity-intake{visibility:hidden!important}' });
+    const redaction = await page.addStyleTag({ content: '#identity-intake,#qr{visibility:hidden!important}' });
     try {
       await page.screenshot({ path: path.join(screenshots, `${name}.png`), fullPage: true });
     } finally {
@@ -123,9 +123,16 @@ async function main() {
     await anonymous.keyboard.press('Tab');
     assert.equal(await anonymous.evaluate(() => document.activeElement.id), 'qr-start');
     await anonymous.keyboard.press('Enter');
-    await anonymous.waitForFunction(() => !document.querySelector('#qr-start').disabled && document.querySelector('#qr-state').textContent.includes('无法创建登录挑战'));
-    assert.equal(await anonymous.$eval('#qr-link', element => element.hidden), true);
-    console.log('登录：窄屏、键盘可达、未配置 Bot 时失败恢复通过；不代表真实扫码通过');
+    await anonymous.waitForFunction(() => {
+      const image = document.querySelector('#qr-image');
+      return image && !image.hidden && image.complete && image.naturalWidth >= 256;
+    });
+    assert.match(await anonymous.$eval('#qr-code', element => element.textContent), /^确认码：[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$/);
+    assert.match(await anonymous.$eval('#qr-link', element => element.href), /^https:\/\/t\.me\/browser_local_bot\?start=login_/);
+    assert.equal(await anonymous.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), true);
+    assert.equal(requests.some(request => request.pathname === '/auth/qr/challenge'), true);
+    await anonymous.goto(config.origin + '/login');
+    console.log('登录：本地挑战 handler、二维码渲染、确认码及窄屏布局通过；未执行 Telegram 真机确认');
 
     const writer = await pageFor(config.writer);
     await writer.setViewport({ width: 1280, height: 900 });

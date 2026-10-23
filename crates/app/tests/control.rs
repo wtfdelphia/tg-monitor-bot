@@ -1190,6 +1190,14 @@ async fn qr_challenge_router_creates_and_polls_without_signing_a_session(admin: 
             .unwrap_or_default()
             .starts_with("https://t.me/control_bot?start=login_")
     );
+    let qr_svg = created_body["qr_svg"]
+        .as_str()
+        .expect("扫码响应缺少二维码 SVG");
+    assert!(qr_svg.starts_with("<?xml"));
+    assert!(qr_svg.contains("<svg "));
+    assert!(qr_svg.contains("<rect "));
+    assert!(qr_svg.contains("<path "));
+    assert!(!qr_svg.contains("<script"));
     assert_eq!(
         created_body["confirm_code"]
             .as_str()
