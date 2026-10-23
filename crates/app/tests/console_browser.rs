@@ -233,12 +233,20 @@ async fn console_real_browser_uses_restricted_http_and_temporary_database(admin:
             }
         }
     });
-    let state = ControlPlaneState::with_auth_pool(app.clone(), auth).with_credential_intake(
-        CredentialIntake {
-            kek: kek.clone(),
-            bot_api_base_url: format!("http://{bot_address}"),
+    let state = ControlPlaneState::with_auth_pool_and_bot(
+        app.clone(),
+        auth,
+        tgm_app::bot_console::BotConsoleConfig {
+            secret_token: "local-browser-secret".to_owned(),
+            bot_identity_id: identity,
+            bot_username: "browser_local_bot".to_owned(),
+            bot_api: None,
         },
-    );
+    )
+    .with_credential_intake(CredentialIntake {
+        kek: kek.clone(),
+        bot_api_base_url: format!("http://{bot_address}"),
+    });
     let polls = Arc::new(AtomicUsize::new(0));
     let server = tokio::spawn(async move {
         axum::serve(

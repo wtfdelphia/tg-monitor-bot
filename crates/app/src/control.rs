@@ -229,6 +229,7 @@ pub struct QrChallengeResponse {
     pub confirm_code: String,
     pub expires_at: String,
     pub deep_link: String,
+    pub qr_svg: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1315,6 +1316,12 @@ async fn create_qr_challenge(
     })?;
     let material = ChallengeMaterial::generate().map_err(AppError::internal)?;
     let expires_at = Utc::now() + Duration::from_secs(120);
+    let encoded_nonce = encode_nonce(material.nonce());
+    let deep_link = format!(
+        "https://t.me/{}?start=login_{encoded_nonce}",
+        config.bot_username
+    );
+    let qr_svg = render_qr_svg(&Secret::new(deep_link.clone()))?;
     let user_agent = headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
@@ -1330,17 +1337,14 @@ async fn create_qr_challenge(
     .await
     .map_err(AppError::internal)?;
 
-    let encoded_nonce = encode_nonce(material.nonce());
     Ok((
         StatusCode::CREATED,
         Json(QrChallengeResponse {
             nonce: encoded_nonce.clone(),
             confirm_code: material.confirm_code().to_owned(),
             expires_at: expires_at.to_rfc3339(),
-            deep_link: format!(
-                "https://t.me/{}?start=login_{encoded_nonce}",
-                config.bot_username
-            ),
+            deep_link,
+            qr_svg,
         }),
     ))
 }

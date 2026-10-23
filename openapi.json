@@ -4174,7 +4174,8 @@
           "nonce",
           "confirm_code",
           "expires_at",
-          "deep_link"
+          "deep_link",
+          "qr_svg"
         ],
         "properties": {
           "confirm_code": {
@@ -4187,6 +4188,9 @@
             "type": "string"
           },
           "nonce": {
+            "type": "string"
+          },
+          "qr_svg": {
             "type": "string"
           }
         }
