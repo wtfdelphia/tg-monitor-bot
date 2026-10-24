@@ -620,6 +620,7 @@ async fn live_target_probe(admin: PgPool) -> Result<(), Box<dyn std::error::Erro
     let expected_send: bool = std::env::var("TGM_TARGET_PROBE_EXPECT_CAN_SEND")?.parse()?;
     let expected_protected: bool = std::env::var("TGM_TARGET_PROBE_EXPECT_PROTECTED")?.parse()?;
     let expected_role = std::env::var("TGM_TARGET_PROBE_EXPECT_ROLE")?;
+    let expected_error = std::env::var("TGM_TARGET_PROBE_EXPECT_ERROR_CODE").ok();
     let (app, admin) = support::pools(admin).await;
     let tenant = support::seed_tenant(&admin, "live-target-probe", 90141).await;
     let identity = support::seed_identity(&admin, tenant).await;
@@ -665,17 +666,23 @@ async fn live_target_probe(admin: PgPool) -> Result<(), Box<dyn std::error::Erro
     let result = read_probe(&app, tenant, target.id)
         .await?
         .ok_or("missing")?;
-    assert_eq!(
-        result.state, "SUCCEEDED",
-        "只读自检未完成：{:?}",
-        result.error_code
-    );
-    assert_eq!(result.can_send, Some(expected_send));
-    assert_eq!(result.content_protected, Some(expected_protected));
-    assert_eq!(result.bot_role.as_deref(), Some(expected_role.as_str()));
-    println!(
-        "真实只读目标自检完成：can_send={expected_send} content_protected={expected_protected} bot_role={expected_role}"
-    );
+    if let Some(expected_error) = expected_error {
+        assert_eq!(result.state, "FAILED");
+        assert_eq!(result.error_code.as_deref(), Some(expected_error.as_str()));
+        println!("真实只读目标自检按预期拒绝：error_code={expected_error}");
+    } else {
+        assert_eq!(
+            result.state, "SUCCEEDED",
+            "只读自检未完成：{:?}",
+            result.error_code
+        );
+        assert_eq!(result.can_send, Some(expected_send));
+        assert_eq!(result.content_protected, Some(expected_protected));
+        assert_eq!(result.bot_role.as_deref(), Some(expected_role.as_str()));
+        println!(
+            "真实只读目标自检完成：can_send={expected_send} content_protected={expected_protected} bot_role={expected_role}"
+        );
+    }
     tgm_db::tenant::tenant_tx(&app, tenant, |conn| {
         Box::pin(async move {
             sqlx::query("DELETE FROM target_channels WHERE tenant_id = $1")
