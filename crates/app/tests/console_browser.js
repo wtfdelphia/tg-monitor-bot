@@ -134,6 +134,62 @@ async function main() {
     await anonymous.goto(config.origin + '/login');
     console.log('登录：本地挑战 handler、二维码渲染、确认码及窄屏布局通过；未执行 Telegram 真机确认');
 
+    const bootstrap = await pageFor(config.empty);
+    await navigate(bootstrap, '/console/identities', '身份', '#bot-intake-form');
+    assert.equal(await bootstrap.$$eval('[data-identity-edit]', elements => elements.length), 0);
+    for (const route of ['/api/v1/identities', '/api/v1/targets', '/api/v1/keywords', '/api/v1/rules']) {
+      const response = await bootstrap.evaluate(async route => {
+        const result = await fetch(route);
+        return { status: result.status, body: await result.json() };
+      }, route);
+      assert.equal(response.status, 200);
+      assert.deepEqual(response.body.items, [], '空租户不能预置业务对象或看到其他租户的数据');
+    }
+    await fill(bootstrap, '#bot-intake-form [name=token]', '123456:' + 'A'.repeat(35));
+    await Promise.all([
+      bootstrap.waitForResponse(response => response.url().endsWith('/api/v1/identities/bot') && response.status() === 201),
+      bootstrap.$eval('#bot-intake-form', form => form.requestSubmit()),
+    ]);
+    await bootstrap.waitForFunction(() => document.querySelector('#content table')?.textContent.includes('浏览器接入 Bot'));
+    assert.equal(await bootstrap.$eval('#bot-intake-form [name=token]', input => input.value), '');
+    await navigate(bootstrap, '/console/targets', '目标频道', '#target-form');
+    const bootstrapIdentity = await bootstrap.$eval('#target-form select', select => [...select.options].find(option => option.textContent.includes('浏览器接入 Bot'))?.value);
+    assert.ok(bootstrapIdentity);
+    await fill(bootstrap, '#target-form [name=chat]', '-10088021');
+    await fill(bootstrap, '#target-form [name=title]', '空租户目标');
+    await bootstrap.select('#target-form [name=sender_identity_id]', bootstrapIdentity);
+    await Promise.all([
+      bootstrap.waitForResponse(response => response.url().endsWith('/api/v1/targets') && response.status() === 201),
+      bootstrap.$eval('#target-form', form => form.requestSubmit()),
+    ]);
+    await bootstrap.waitForFunction(() => document.querySelector('tbody tr')?.textContent.includes('可发送基础文字'));
+    assert.match(await bootstrap.$eval('tbody tr', row => row.textContent), /目标内容保护：开启/);
+    const bootstrapTarget = await bootstrap.$eval('[data-target-toggle]', element => element.dataset.targetToggle);
+    await navigate(bootstrap, '/console/keywords', '关键词', '#keyword-form');
+    await fill(bootstrap, '#keyword-form [name=word]', '空租户验证词');
+    await bootstrap.select('#keyword-form [name=match_type]', 'fuzzy');
+    await Promise.all([
+      bootstrap.waitForResponse(response => response.url().endsWith('/api/v1/keywords') && response.status() === 201),
+      bootstrap.$eval('#keyword-form', form => form.requestSubmit()),
+    ]);
+    await bootstrap.waitForFunction(() => document.querySelector('#content table')?.textContent.includes('空租户验证词'));
+    await navigate(bootstrap, '/console/rules/new', '新建规则', '#rule-form');
+    const bootstrapKeyword = await bootstrap.$eval('[name=keyword_id]', select => [...select.options].find(option => option.textContent === '空租户验证词')?.value);
+    assert.ok(bootstrapKeyword);
+    await bootstrap.select('[name=keyword_id]', bootstrapKeyword);
+    await bootstrap.select('[name=target_ref]', bootstrapTarget);
+    await Promise.all([bootstrap.waitForNavigation(), bootstrap.click('#rule-form button:not([type])')]);
+    await bootstrap.waitForSelector('[data-rule-select]');
+    assert.equal(await bootstrap.$$eval('[data-rule-select]', elements => elements.length), 1);
+    const bootstrapRule = await bootstrap.$eval('#rules-list a', anchor => anchor.getAttribute('href'));
+    await navigate(bootstrap, bootstrapRule, '编辑规则', '#rule-form');
+    await bootstrap.reload();
+    await bootstrap.waitForSelector('#rule-form');
+    assert.equal(await bootstrap.$eval('[name=keyword_id]', select => select.value), bootstrapKeyword);
+    assert.equal(await bootstrap.$eval('[name=target_ref]', select => select.value), bootstrapTarget);
+    await bootstrap.browserContext().close();
+    console.log('空租户：无业务预置，经页面接入 Bot、创建目标并自检、创建关键词与规则，刷新后引用持久化通过');
+
     const writer = await pageFor(config.writer);
     await writer.setViewport({ width: 1280, height: 900 });
     await navigate(writer, '/console/identities', '身份', '#bot-intake-form');
