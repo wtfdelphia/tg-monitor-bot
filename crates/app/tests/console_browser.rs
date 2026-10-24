@@ -91,6 +91,7 @@ async fn console_real_browser_uses_restricted_http_and_temporary_database(admin:
 
     let tenant = support::seed_tenant(&admin, "browser-console", 88001).await;
     let other_tenant = support::seed_tenant(&admin, "browser-other", 88003).await;
+    let empty_tenant = support::seed_tenant(&admin, "browser-empty", 88005).await;
     for (user_id, role) in [(88001_i64, "TENANT_ADMIN"), (88002, "VIEWER")] {
         sqlx::query("INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, $2, $3)")
             .bind(tenant)
@@ -100,6 +101,19 @@ async fn console_real_browser_uses_restricted_http_and_temporary_database(admin:
             .await
             .expect("创建浏览器测试成员失败");
     }
+    sqlx::query(
+        "INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, 88005, 'TENANT_ADMIN')",
+    )
+    .bind(empty_tenant)
+    .execute(admin.raw())
+    .await
+    .expect("创建空租户测试成员失败");
+    let initial_count: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM identities WHERE tenant_id = $1) + (SELECT count(*) FROM target_channels WHERE tenant_id = $1) + (SELECT count(*) FROM keywords WHERE tenant_id = $1) + (SELECT count(*) FROM rules WHERE tenant_id = $1)")
+        .bind(empty_tenant)
+        .fetch_one(admin.raw())
+        .await
+        .expect("核对空租户初始数据失败");
+    assert_eq!(initial_count, 0);
     let identity = support::seed_identity(&admin, tenant).await;
     sqlx::query("INSERT INTO identities (kind, tenant_id, tg_user_id, display_name, status) VALUES ('mtproto', $1, 88004, '扫码测试账号', 'unauthorized')")
         .bind(tenant)
@@ -141,7 +155,7 @@ async fn console_real_browser_uses_restricted_http_and_temporary_database(admin:
     }
 
     let mut sessions = Vec::new();
-    for user_id in [88001_i64, 88002, 88001] {
+    for user_id in [88001_i64, 88002, 88001, 88005] {
         sessions.push(
             issue_web_session_for_user(
                 &auth,
@@ -171,6 +185,10 @@ async fn console_real_browser_uses_restricted_http_and_temporary_database(admin:
         "viewer": {
             "session": URL_SAFE_NO_PAD.encode(&sessions[1].session_id),
             "csrf": URL_SAFE_NO_PAD.encode(&sessions[1].csrf_token),
+        },
+        "empty": {
+            "session": URL_SAFE_NO_PAD.encode(&sessions[3].session_id),
+            "csrf": URL_SAFE_NO_PAD.encode(&sessions[3].csrf_token),
         },
     });
     let bot_listener = TcpListener::bind("127.0.0.1:0")
@@ -211,25 +229,27 @@ async fn console_real_browser_uses_restricted_http_and_temporary_database(admin:
                 _ = probe_shutdown.changed() => break,
                 _ = interval.tick() => {}
             }
-            let claim = tgm_db::target_probe::claim_probe(
-                &probe_pool,
-                tenant,
-                "browser-fixture".to_owned(),
-            )
-            .await
-            .expect("浏览器探测认领");
-            if let Some(claim) = claim {
-                let outcome = tgm_app::target_probe::execute(
+            for probe_tenant in [tenant, empty_tenant] {
+                let claim = tgm_db::target_probe::claim_probe(
                     &probe_pool,
-                    probe_kek.as_ref(),
-                    tenant,
-                    &claim,
-                    &probe_url,
+                    probe_tenant,
+                    "browser-fixture".to_owned(),
                 )
-                .await;
-                tgm_db::target_probe::finish_probe(&probe_pool, tenant, claim, outcome)
-                    .await
-                    .expect("浏览器探测回写");
+                .await
+                .expect("浏览器探测认领");
+                if let Some(claim) = claim {
+                    let outcome = tgm_app::target_probe::execute(
+                        &probe_pool,
+                        probe_kek.as_ref(),
+                        probe_tenant,
+                        &claim,
+                        &probe_url,
+                    )
+                    .await;
+                    tgm_db::target_probe::finish_probe(&probe_pool, probe_tenant, claim, outcome)
+                        .await
+                        .expect("浏览器探测回写");
+                }
             }
         }
     });
@@ -325,4 +345,20 @@ async fn console_real_browser_uses_restricted_http_and_temporary_database(admin:
             .any(|window| window == TEST_BOT_TOKEN.as_bytes())
     );
     assert_eq!(stored.1, "local:env:v1");
+    let configured: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM identities WHERE tenant_id = $1), (SELECT count(*) FROM target_channels WHERE tenant_id = $1), (SELECT count(*) FROM keywords WHERE tenant_id = $1), (SELECT count(*) FROM rules WHERE tenant_id = $1)")
+        .bind(empty_tenant)
+        .fetch_one(admin.raw())
+        .await
+        .expect("核对空租户页面配置持久化失败");
+    assert_eq!(configured, (1, 1, 1, 1));
+    let connected: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM rules r JOIN keywords k ON k.id = r.keyword_id AND k.tenant_id = r.tenant_id JOIN target_channels t ON t.id = r.target_ref AND t.tenant_id = r.tenant_id JOIN identities i ON i.id = t.sender_identity_id AND i.tenant_id = t.tenant_id JOIN identity_secrets s ON s.identity_id = i.id WHERE r.tenant_id = $1 AND k.word = '空租户验证词' AND t.tg_chat_id = -10088021 AND t.probe_state = 'SUCCEEDED' AND t.can_send = TRUE AND t.content_protected = TRUE AND i.tg_user_id = 123456 AND s.kek_id = 'local:env:v1' AND position($2 IN s.secret_ciphertext) = 0)")
+        .bind(empty_tenant)
+        .bind(TEST_BOT_TOKEN.as_bytes())
+        .fetch_one(admin.raw())
+        .await
+        .expect("核对空租户规则引用与凭据密文失败");
+    assert!(
+        connected,
+        "页面创建的规则应关联同租户的关键词、已自检目标与加密 Bot 身份"
+    );
 }
