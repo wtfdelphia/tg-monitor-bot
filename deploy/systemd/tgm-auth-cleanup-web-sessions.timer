@@ -1,0 +1,10 @@
+[Unit]
+Description=TGM expired web session cleanup
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=tgm-auth-cleanup@web-sessions.service
+
+[Install]
+WantedBy=timers.target

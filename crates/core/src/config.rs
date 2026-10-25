@@ -384,6 +384,47 @@ pub fn check_kek_backend(
     }
 }
 
+pub fn check_auth_cleanup(
+    raw_profile: Option<&str>,
+    present: &[&str],
+    rust_log: Option<&str>,
+) -> Vec<ConfigProblem> {
+    let mut problems = Vec::new();
+    let profile = match raw_profile {
+        None => {
+            problems.push(ConfigProblem::ProfileMissing);
+            None
+        }
+        Some(raw) => match Profile::parse(raw) {
+            Ok(profile) => Some(profile),
+            Err(_) => {
+                problems.push(ConfigProblem::ProfileUnknown(raw.to_owned()));
+                None
+            }
+        },
+    };
+    if !present.contains(&"TGM_DB_URL_AUTH_CLEANUP") {
+        problems.push(ConfigProblem::Missing("TGM_DB_URL_AUTH_CLEANUP"));
+    }
+    for name in known_names() {
+        if present.contains(name)
+            && !["TGM_PROFILE", "TGM_DB_URL_AUTH_CLEANUP", "RUST_LOG"].contains(name)
+        {
+            problems.push(ConfigProblem::Unexpected(name));
+        }
+    }
+    if present.contains(&"DATABASE_URL") {
+        problems.push(ConfigProblem::Unexpected("DATABASE_URL"));
+    }
+    if profile.is_some_and(Profile::is_production)
+        && let Some(filter) = rust_log
+        && !filter.contains("sqlx=warn")
+    {
+        problems.push(ConfigProblem::SqlxLogNotSilenced(filter.to_owned()));
+    }
+    problems
+}
+
 /// 校验控制面 OIDC 的固定验签算法。
 ///
 /// 算法来自部署配置，而不是来自未经验证的 `id_token` header；`none`、`HS256`
@@ -410,6 +451,7 @@ fn known_names() -> &'static [&'static str] {
         "TGM_DB_URL_AUTH",
         "TGM_DB_URL_OPS",
         "TGM_DB_URL_OWNER",
+        "TGM_DB_URL_AUTH_CLEANUP",
         "TGM_REDIS_URL",
         "TGM_S3_ENDPOINT",
         "TGM_S3_BUCKET",
@@ -462,9 +504,51 @@ fn known_names() -> &'static [&'static str] {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{
-        COMMON, ConfigProblem, Role, check, check_kek_backend, extra_required, validate_oidc_alg,
+        COMMON, ConfigProblem, Role, check, check_auth_cleanup, check_kek_backend, extra_required,
+        known_names, validate_oidc_alg,
     };
     use crate::oidc::OidcSigningAlgorithm;
+
+    #[test]
+    fn auth_cleanup_configuration_is_an_independent_credential_boundary() {
+        let present = ["TGM_PROFILE", "TGM_DB_URL_AUTH_CLEANUP"];
+        assert!(check_auth_cleanup(Some("production"), &present, None).is_empty());
+        for forbidden in known_names().iter().copied().chain(["DATABASE_URL"]) {
+            if ["TGM_PROFILE", "TGM_DB_URL_AUTH_CLEANUP", "RUST_LOG"].contains(&forbidden) {
+                continue;
+            }
+            let mut mixed = present.to_vec();
+            mixed.push(forbidden);
+            assert!(
+                check_auth_cleanup(Some("production"), &mixed, None)
+                    .contains(&ConfigProblem::Unexpected(forbidden))
+            );
+        }
+        assert!(check_auth_cleanup(None, &[], None).contains(&ConfigProblem::ProfileMissing));
+        assert!(
+            check_auth_cleanup(Some("prod"), &present, None)
+                .iter()
+                .any(|problem| matches!(problem, ConfigProblem::ProfileUnknown(_)))
+        );
+        assert!(
+            check_auth_cleanup(Some("production"), &[], Some("debug"))
+                .contains(&ConfigProblem::Missing("TGM_DB_URL_AUTH_CLEANUP"))
+        );
+        assert!(
+            check_auth_cleanup(Some("production"), &present, Some("debug"))
+                .iter()
+                .any(|problem| matches!(problem, ConfigProblem::SqlxLogNotSilenced(_)))
+        );
+        assert!(
+            check(
+                Role::Rule,
+                Some("production"),
+                &["TGM_PROFILE", "TGM_DB_URL_AUTH_CLEANUP"],
+                None
+            )
+            .contains(&ConfigProblem::Unexpected("TGM_DB_URL_AUTH_CLEANUP"))
+        );
+    }
 
     /// 该角色的一份「刚好合规」的环境。用它当基线，每条测试只动一处。
     fn minimal(role: Role) -> Vec<&'static str> {

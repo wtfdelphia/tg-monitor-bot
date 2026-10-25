@@ -33,6 +33,7 @@ command -v psql >/dev/null 2>&1 || { echo "✗ 找不到 psql"; exit 1; }
 declare -A BREAK=(
   [MAIN]="ALTER TABLE rules DISABLE ROW LEVEL SECURITY;"
   [A1]="GRANT TRUNCATE ON keywords TO app_user;"
+  [C8]="GRANT SELECT (csrf_token) ON web_sessions TO auth_cleanup;"
   [A2a]="ALTER ROLE app_user BYPASSRLS;"
   [A2b]="ALTER TABLE keywords OWNER TO app_user;"
   # NOT VALID：不加的话新约束要校验现有行，而会话里没有 app.tenant_id，
@@ -84,13 +85,14 @@ declare -A BREAK=(
 declare -A UNDO=(
   [MAIN]="ALTER TABLE rules ENABLE ROW LEVEL SECURITY;"
   [A1]="REVOKE TRUNCATE ON keywords FROM app_user;"
+  [C8]="REVOKE SELECT (csrf_token) ON web_sessions FROM auth_cleanup;"
   [A2a]="ALTER ROLE app_user NOBYPASSRLS;"
   # 改回 owner **不还原受赠权限**。实测：ALTER TABLE keywords OWNER TO app_user
   # 之后 relacl 里 app_user 那条受赠条目消失了（被并进 owner 条目），
   # 再 OWNER TO tgm_owner 得到的是 tgm_owner 一条 —— app_user 的四项权限没了。
   # 所以撤销必须显式补 GRANT，权限值照 migrations/0011 的甲类那一行。
   # 这个损耗第一版脚本漏了，而审计照样全绿：没有任何断言查「该有的权限还在不在」。
-  [A2b]="ALTER TABLE keywords OWNER TO tgm_owner; GRANT SELECT, INSERT, UPDATE, DELETE ON keywords TO app_user;"
+  [A2b]="ALTER TABLE keywords OWNER TO tgm_owner; GRANT SELECT, INSERT, UPDATE, DELETE ON keywords TO app_user; GRANT USAGE ON SEQUENCE keywords_id_seq TO app_user;"
   [A3]="ALTER TABLE keywords DROP CONSTRAINT ck_probe_bomb;"
   [A4]="DROP INDEX uq_probe_inc;"
   [A5]="ALTER TABLE keywords ALTER COLUMN tenant_id SET NOT NULL;"
@@ -127,7 +129,7 @@ declare -A AS_SUPER=([A2a]=1 [A2b]=1 [A8]=1 [C5]=1)
 #             必然同时触发 A1。两条断言从不同角度抓同一个事实，是冗余而非耦合
 declare -A ALSO=([A2b]="A1")
 
-ORDER=(MAIN A1 A2a A2b A3 A4 A5 A6 A7 A8 A9 C1 C4 C2 C6 C7 C5)
+ORDER=(MAIN A1 A2a A2b A3 A4 A5 A6 A7 A8 A9 C1 C4 C2 C6 C7 C5 C8)
 
 psql_do() {  # $1=sql  $2=1 表示以超级用户身份
   if [ "${2:-}" = "1" ]; then
@@ -156,7 +158,7 @@ snapshot() {
 SELECT 'TBL|'||c.relname||'|'||c.relrowsecurity||'|'||c.relforcerowsecurity||'|'||pg_get_userbyid(c.relowner)
 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 WHERE n.nspname='public' AND c.relkind IN ('r','p') ORDER BY 1;
-SELECT 'ACL|'||c.relname||'|'||a.grantee::regrole::text||'|'||a.privilege_type
+SELECT 'ACL|'||c.relname||'|'||a.grantee::regrole::text||'|'||a.privilege_type||'|'||a.is_grantable
 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 CROSS JOIN LATERAL aclexplode(c.relacl) a
 WHERE n.nspname='public' AND c.relkind IN ('r','p') ORDER BY 1;
@@ -165,11 +167,15 @@ WHERE n.nspname='public' AND c.relkind IN ('r','p') ORDER BY 1;
 -- （六列 UPDATE 全在 attacl），而 C2 只断言 tenant_id 那一列，
 -- 所以别的列漂移了既不会被断言抓到、也不会被快照抓到。
 -- 实测：GRANT UPDATE (created_at) ON identities 之后，只查 relacl 的快照 diff 干净
-SELECT 'COLACL|'||c.relname||'|'||att.attname||'|'||a.grantee::regrole::text||'|'||a.privilege_type
+SELECT 'COLACL|'||c.relname||'|'||att.attname||'|'||a.grantee::regrole::text||'|'||a.privilege_type||'|'||a.is_grantable
 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 JOIN pg_attribute att ON att.attrelid=c.oid AND att.attnum>0 AND NOT att.attisdropped
 CROSS JOIN LATERAL aclexplode(att.attacl) a
 WHERE n.nspname='public' ORDER BY 1;
+SELECT 'SEQACL|'||c.relname||'|'||a.grantee::regrole::text||'|'||a.privilege_type||'|'||a.is_grantable
+FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+CROSS JOIN LATERAL aclexplode(c.relacl) a
+WHERE n.nspname='public' AND c.relkind='S' ORDER BY 1;
 SELECT 'IDX|'||i.relname||'|'||pg_get_indexdef(x.indexrelid)
 FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid
 JOIN pg_class c ON c.oid=x.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace
@@ -187,7 +193,8 @@ JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' ORDER BY 1;
 -- C5 破坏用例里那个组角色：NOLOGIN 且不叫 tgm* → 残留在库里快照看不见。
 -- 实测放宽前后在干净库上是同样 5 个名字（app_user/auth_lookup/platform_ops/
 -- postgres/tgm_owner），所以这是纯覆盖增益，基线 diff 不动
-SELECT 'ROL|'||rolname||'|'||rolsuper||'|'||rolbypassrls FROM pg_roles
+SELECT 'ROL|'||rolname||'|'||rolsuper||'|'||rolbypassrls||'|'||rolcanlogin
+       ||'|'||rolcreatedb||'|'||rolcreaterole||'|'||rolreplication FROM pg_roles
 WHERE rolname NOT LIKE 'pg\_%' ORDER BY 1;
 -- 成员关系要单独一段，它不在 pg_roles 里。漏了它，C5 的破坏用例
 -- （GRANT 组身份给登录角色）撤销时只 DROP 了角色而漏掉 REVOKE 的话，
@@ -254,7 +261,7 @@ SQL
   # 而「整段消失」正是要防的那个失效 —— 第一版 POL/CON/ETR 三段同时消失时，
   # 剩下的 ACL 段有 323 行，任何一个合理的总数下限都会放它过去
   local missing=""
-  for sec in TBL ACL COLACL IDX POL CON ROL MBR FUN ETR MV NSP; do
+  for sec in TBL ACL COLACL SEQACL IDX POL CON ROL MBR FUN ETR MV NSP; do
     grep -q "^$sec|" <<<"$out" || missing="$missing $sec"
   done
   if [ -n "$missing" ]; then

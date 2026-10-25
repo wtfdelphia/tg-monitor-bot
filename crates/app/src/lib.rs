@@ -6,6 +6,7 @@
 //! 一条评审纪律：本 crate 里出现 `admin_tx` 就是评审阻塞项，
 //! 它意味着某段业务逻辑绕过了租户谓词（eng/00 §4.2）。
 
+pub mod auth_retention;
 pub mod bot_console;
 pub mod bot_gateway;
 pub mod console;

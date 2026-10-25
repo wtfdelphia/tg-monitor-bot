@@ -1,0 +1,8 @@
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'auth_cleanup') THEN
+    CREATE ROLE auth_cleanup LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+  END IF;
+  EXECUTE format('GRANT CONNECT ON DATABASE %I TO auth_cleanup', current_database());
+END
+$$;

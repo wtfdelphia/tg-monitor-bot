@@ -27,13 +27,14 @@ KEK 的两种实现怎么共存。
 2 Secret 不写进镜像、不写进 compose.yaml 本体（用 env_file 指向 .env）
 ```
 
-`--role` 是唯一的命令行参数（`00-工程约定.md` §一），它不是 secret。
+常驻服务通过 `--role` 选择角色（`00-工程约定.md` §一）；一次性鉴权清理命令通过
+`--category` 选择固定类别。两者都不接收命令行 secret。
 
 ---
 
 ## 二、配置项清单
 
-按 `--role` 分组。**某个角色不需要的项，就不该配给它** ——
+按 `--role` 和一次性管理命令分组。**某个角色不需要的项，就不该配给它** ——
 这不是整洁，是最小权限的可执行形式：
 `control-plane` 只拿得到 `kms:Encrypt`，它就**不可能**解密租户凭据（ADR-0032）。
 
@@ -41,11 +42,12 @@ KEK 的两种实现怎么共存。
 |---|---|---|
 | `TGM_PROFILE` | 全部 | `production` / `development`，决定 §四 的严格程度 |
 | `RUST_LOG` | 全部 | 默认 `info,sqlx=warn`，见 §4.5 |
-| `TGM_DB_URL_APP` | 全部 | `app_user` 的连接串，经 PgBouncer |
+| `TGM_DB_URL_APP` | 全部常驻角色 | `app_user` 的连接串，经 PgBouncer |
 | `TGM_DB_URL_AUTH` | control-plane / bot-gateway | `auth_lookup` 的独立池（`../spec/05-安全与租户隔离.md` §3.7） |
 | `TGM_DB_URL_OPS` | control-plane | `platform_ops`，只供 `admin_tx`（`00-工程约定.md` §4.2） |
 | `TGM_DB_URL_OWNER` | 仅 `tgm migrate` | 持有 `tgm_owner` 的角色。`tgm_owner` 自身 `NOLOGIN`，本地为 `postgres`。**常驻进程不得持有** |
-| `TGM_REDIS_URL` | 全部 | 仅唤醒信号，无正确性依赖 |
+| `TGM_DB_URL_AUTH_CLEANUP` | 仅 `tgm cleanup-auth` | 必须直接以 `auth_cleanup` 登录，独立进程和环境文件；普通服务不得持有。仅配 `TGM_PROFILE`、此连接串及可选 `RUST_LOG`，拒绝混入业务、owner、KMS、Telegram、对象存储配置及 `DATABASE_URL` |
+| `TGM_REDIS_URL` | 全部常驻角色 | 仅唤醒信号，无正确性依赖 |
 | `TGM_S3_ENDPOINT` / `TGM_S3_BUCKET` | delivery / mtproto / fanout | MinIO 或 S3。fanout 用它跑对象清理（WP-5-delivery-media 片 3 批准记录第 6 条） |
 | `TGM_S3_ACCESS_KEY_ID` / `TGM_S3_SECRET_ACCESS_KEY` | delivery / mtproto / fanout | 对象存储的独立静态凭据，只能由 Secret 注入。**不走 AWS 默认凭据链**：默认链承载 KMS 身份，共用会让 KMS 角色顺带拿到桶权限（WP-5-delivery-media 片 2 批准记录） |
 | `TGM_S3_REGION` | delivery / mtproto / fanout（可选） | 签名区域，默认 `us-east-1`；MinIO 不校验，AWS S3 必须与桶所在区域一致 |

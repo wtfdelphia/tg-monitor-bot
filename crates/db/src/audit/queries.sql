@@ -663,5 +663,77 @@ SELECT q::text FROM (
   ORDER BY 1, 2
 ) q;
 
+-- name: C8 鉴权清理角色必须存在且权限收敛
+WITH cleaner AS (
+  SELECT * FROM pg_roles WHERE rolname = 'auth_cleanup'
+), allowed_columns(tbl, col, privilege) AS (
+  VALUES ('console_login_challenges', 'nonce', 'SELECT'),
+         ('console_login_challenges', 'expires_at', 'SELECT'),
+         ('web_sessions', 'tenant_id', 'SELECT'), ('web_sessions', 'id', 'SELECT'),
+         ('web_sessions', 'expires_at', 'SELECT'),
+         ('bot_console_sessions', 'tg_user_id', 'SELECT'),
+         ('bot_console_sessions', 'updated_at', 'SELECT'),
+         ('system_logs', 'tenant_id', 'INSERT'), ('system_logs', 'level', 'INSERT'),
+         ('system_logs', 'module', 'INSERT'), ('system_logs', 'event', 'INSERT'),
+         ('system_logs', 'context', 'INSERT')
+), violations AS (
+  SELECT 'auth_cleanup 缺失或属性不符' AS reason
+   WHERE NOT EXISTS (SELECT 1 FROM cleaner WHERE rolcanlogin AND NOT
+          (rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication))
+  UNION ALL
+  SELECT 'auth_cleanup 不得参与角色成员关系'
+    FROM cleaner r WHERE EXISTS (SELECT 1 FROM pg_auth_members WHERE member = r.oid OR roleid = r.oid)
+  UNION ALL
+  SELECT 'auth_cleanup 不得拥有表、schema 或函数'
+    FROM cleaner r WHERE EXISTS (SELECT 1 FROM pg_class WHERE relowner = r.oid)
+       OR EXISTS (SELECT 1 FROM pg_namespace WHERE nspowner = r.oid)
+       OR EXISTS (SELECT 1 FROM pg_proc WHERE proowner = r.oid)
+  UNION ALL
+  SELECT 'auth_cleanup 不得在用户 schema 建对象'
+    FROM cleaner r JOIN pg_namespace n ON n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+   WHERE has_schema_privilege(r.oid, n.oid, 'CREATE')
+  UNION ALL
+  SELECT '表权限不符: ' || n.nspname || '.' || c.relname || ':' || privilege
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER'), ('MAINTAIN')) p(privilege)
+   WHERE c.relkind IN ('r','p','v','m','f') AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND (CASE WHEN privilege = 'MAINTAIN' AND current_setting('server_version_num')::int < 170000
+               THEN false ELSE has_table_privilege(r.oid, c.oid, privilege) END) <>
+       (n.nspname = 'public' AND c.relname IN ('console_login_challenges','web_sessions','bot_console_sessions') AND privilege = 'DELETE')
+  UNION ALL
+  SELECT '表权限不得转授: ' || n.nspname || '.' || c.relname
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   CROSS JOIN LATERAL aclexplode(c.relacl) acl
+   WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND acl.grantee = r.oid AND acl.is_grantable
+  UNION ALL
+  SELECT '列权限不符: ' || n.nspname || '.' || c.relname || '.' || a.attname || ':' || p.privilege
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+   CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')) p(privilege)
+   WHERE c.relkind IN ('r','p','v','m','f') AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND has_column_privilege(r.oid, c.oid, a.attnum, p.privilege) <>
+       EXISTS (SELECT 1 FROM allowed_columns allow WHERE n.nspname = 'public' AND allow.tbl = c.relname AND allow.col = a.attname AND allow.privilege = p.privilege)
+  UNION ALL
+  SELECT '列权限不得转授: ' || n.nspname || '.' || c.relname || '.' || a.attname
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+   CROSS JOIN LATERAL aclexplode(a.attacl) acl
+   WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND acl.grantee = r.oid AND acl.is_grantable
+  UNION ALL
+  SELECT '序列权限不符: ' || n.nspname || '.' || c.relname || ':' || privilege
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   CROSS JOIN (VALUES ('USAGE'), ('SELECT'), ('UPDATE')) p(privilege)
+   WHERE c.relkind = 'S' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND has_sequence_privilege(r.oid, c.oid, privilege) <>
+       (n.nspname = 'public' AND c.relname = 'system_logs_id_seq' AND privilege = 'USAGE')
+  UNION ALL
+  SELECT '必要列缺失: ' || allow.tbl || '.' || allow.col FROM allowed_columns allow
+   WHERE NOT EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = allow.tbl
+       AND a.attname = allow.col AND a.attnum > 0 AND NOT a.attisdropped)
+) SELECT reason::text FROM violations ORDER BY reason;
+
 -- C3（openapi.json 与代码一致）不在本文件里：它比对的是文件而不是数据库状态，
 -- 归 `tgm openapi --check` 这个独立子命令。见 eng/04 §三-5。
