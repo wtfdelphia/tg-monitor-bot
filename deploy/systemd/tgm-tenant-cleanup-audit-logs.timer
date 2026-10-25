@@ -1,0 +1,10 @@
+[Unit]
+Description=TGM tenant retention audit-logs
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=tgm-tenant-cleanup@audit-logs.service
+
+[Install]
+WantedBy=timers.target

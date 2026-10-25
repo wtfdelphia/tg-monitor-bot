@@ -28,3 +28,4 @@ pub mod repo;
 pub mod target_probe;
 /// 租户事务入口。业务唯一入口，`set_config` 的作用域即事务边界。
 pub mod tenant;
+pub mod tenant_retention;

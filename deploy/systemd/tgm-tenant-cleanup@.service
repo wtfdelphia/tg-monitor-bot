@@ -1,0 +1,22 @@
+[Unit]
+Description=TGM tenant retention (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tgm-tenant-cleanup
+Group=tgm-tenant-cleanup
+EnvironmentFile=/etc/tgm/tenant-cleanup.env
+ExecStart=/usr/local/bin/tgm cleanup-tenant --category %i
+TimeoutStartSec=15min
+TimeoutStopSec=30s
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=

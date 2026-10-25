@@ -389,6 +389,23 @@ pub fn check_auth_cleanup(
     present: &[&str],
     rust_log: Option<&str>,
 ) -> Vec<ConfigProblem> {
+    check_cleanup(raw_profile, present, rust_log, "TGM_DB_URL_AUTH_CLEANUP")
+}
+
+pub fn check_tenant_cleanup(
+    raw_profile: Option<&str>,
+    present: &[&str],
+    rust_log: Option<&str>,
+) -> Vec<ConfigProblem> {
+    check_cleanup(raw_profile, present, rust_log, "TGM_DB_URL_TENANT_CLEANUP")
+}
+
+fn check_cleanup(
+    raw_profile: Option<&str>,
+    present: &[&str],
+    rust_log: Option<&str>,
+    database: &'static str,
+) -> Vec<ConfigProblem> {
     let mut problems = Vec::new();
     let profile = match raw_profile {
         None => {
@@ -403,13 +420,11 @@ pub fn check_auth_cleanup(
             }
         },
     };
-    if !present.contains(&"TGM_DB_URL_AUTH_CLEANUP") {
-        problems.push(ConfigProblem::Missing("TGM_DB_URL_AUTH_CLEANUP"));
+    if !present.contains(&database) {
+        problems.push(ConfigProblem::Missing(database));
     }
     for name in known_names() {
-        if present.contains(name)
-            && !["TGM_PROFILE", "TGM_DB_URL_AUTH_CLEANUP", "RUST_LOG"].contains(name)
-        {
+        if present.contains(name) && !["TGM_PROFILE", database, "RUST_LOG"].contains(name) {
             problems.push(ConfigProblem::Unexpected(name));
         }
     }
@@ -452,6 +467,7 @@ fn known_names() -> &'static [&'static str] {
         "TGM_DB_URL_OPS",
         "TGM_DB_URL_OWNER",
         "TGM_DB_URL_AUTH_CLEANUP",
+        "TGM_DB_URL_TENANT_CLEANUP",
         "TGM_REDIS_URL",
         "TGM_S3_ENDPOINT",
         "TGM_S3_BUCKET",
@@ -547,6 +563,44 @@ mod tests {
                 None
             )
             .contains(&ConfigProblem::Unexpected("TGM_DB_URL_AUTH_CLEANUP"))
+        );
+    }
+
+    #[test]
+    fn tenant_cleanup_configuration_rejects_every_other_credential() {
+        let present = ["TGM_PROFILE", "TGM_DB_URL_TENANT_CLEANUP"];
+        assert!(super::check_tenant_cleanup(Some("production"), &present, None).is_empty());
+        for forbidden in known_names().iter().copied().chain(["DATABASE_URL"]) {
+            if ["TGM_PROFILE", "TGM_DB_URL_TENANT_CLEANUP", "RUST_LOG"].contains(&forbidden) {
+                continue;
+            }
+            let mut mixed = present.to_vec();
+            mixed.push(forbidden);
+            assert!(
+                super::check_tenant_cleanup(Some("production"), &mixed, None)
+                    .contains(&ConfigProblem::Unexpected(forbidden))
+            );
+        }
+        assert!(
+            super::check_tenant_cleanup(None, &[], None).contains(&ConfigProblem::ProfileMissing)
+        );
+        assert!(
+            super::check_tenant_cleanup(Some("unknown"), &present, None)
+                .iter()
+                .any(|problem| matches!(problem, ConfigProblem::ProfileUnknown(_)))
+        );
+        assert!(
+            super::check_tenant_cleanup(Some("production"), &[], Some("debug"))
+                .contains(&ConfigProblem::Missing("TGM_DB_URL_TENANT_CLEANUP"))
+        );
+        assert!(
+            super::check_tenant_cleanup(Some("production"), &present, Some("debug"))
+                .iter()
+                .any(|problem| matches!(problem, ConfigProblem::SqlxLogNotSilenced(_)))
+        );
+        assert!(
+            check(Role::Rule, Some("production"), &present, None)
+                .contains(&ConfigProblem::Unexpected("TGM_DB_URL_TENANT_CLEANUP"))
         );
     }
 

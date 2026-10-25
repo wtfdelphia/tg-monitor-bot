@@ -1,0 +1,10 @@
+[Unit]
+Description=TGM tenant retention bot-console-updates
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=tgm-tenant-cleanup@bot-console-updates.service
+
+[Install]
+WantedBy=timers.target
