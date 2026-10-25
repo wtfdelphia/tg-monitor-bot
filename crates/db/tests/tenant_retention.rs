@@ -469,6 +469,18 @@ async fn c9_rejects_extra_missing_and_grantable_permissions(
             "GRANT USAGE ON SEQUENCE system_logs_id_seq TO tenant_cleanup WITH GRANT OPTION",
             "REVOKE GRANT OPTION FOR USAGE ON SEQUENCE system_logs_id_seq FROM tenant_cleanup",
         ),
+        (
+            "REVOKE SELECT (rule_version) ON delivery_tasks FROM tenant_cleanup",
+            "GRANT SELECT (rule_version) ON delivery_tasks TO tenant_cleanup",
+        ),
+        (
+            "GRANT SELECT (snapshot) ON rule_versions TO tenant_cleanup",
+            "REVOKE SELECT (snapshot) ON rule_versions FROM tenant_cleanup",
+        ),
+        (
+            "GRANT SELECT (version) ON rules TO tenant_cleanup WITH GRANT OPTION",
+            "REVOKE GRANT OPTION FOR SELECT (version) ON rules FROM tenant_cleanup",
+        ),
     ] {
         sqlx::raw_sql(broken).execute(&mut *transaction).await?;
         let violations: Vec<String> =

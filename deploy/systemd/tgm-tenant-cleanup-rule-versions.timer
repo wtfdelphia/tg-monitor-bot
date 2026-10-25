@@ -1,0 +1,10 @@
+[Unit]
+Description=TGM tenant retention rule-versions
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=tgm-tenant-cleanup@rule-versions.service
+
+[Install]
+WantedBy=timers.target

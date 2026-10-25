@@ -60,6 +60,7 @@ enum TenantCleanupCategory {
     DeliveryLogs,
     AuditLogs,
     SystemLogs,
+    RuleVersions,
 }
 
 impl From<TenantCleanupCategory> for tgm_db::tenant_retention::Category {
@@ -71,6 +72,7 @@ impl From<TenantCleanupCategory> for tgm_db::tenant_retention::Category {
             TenantCleanupCategory::DeliveryLogs => Self::DeliveryLogs,
             TenantCleanupCategory::AuditLogs => Self::AuditLogs,
             TenantCleanupCategory::SystemLogs => Self::SystemLogs,
+            TenantCleanupCategory::RuleVersions => Self::RuleVersions,
         }
     }
 }

@@ -3710,17 +3710,26 @@ pub async fn load_enabled_rules(
     .await
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum EnqueueError {
+    #[error("rule version is no longer available: {rule_id}/{version}")]
+    VersionUnavailable { rule_id: i64, version: i32 },
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
 pub async fn enqueue_delivery_tasks(
     pool: &PgPool,
     tenant: TenantId,
     tenant_event_id: i64,
     matched_keywords: &[String],
     tasks: &[DeliveryTaskInput],
-) -> Result<Vec<DeliveryTaskWrite>, sqlx::Error> {
+) -> Result<Vec<DeliveryTaskWrite>, EnqueueError> {
     let matched_keywords = matched_keywords.to_vec();
     let tasks = tasks.to_vec();
-    tenant_tx(pool, tenant, |conn| {
+    crate::tenant::tenant_tx_with_error(pool, tenant, |conn| {
         Box::pin(async move {
+            crate::tenant_retention::lock_rule_versions(conn, tenant).await?;
             sqlx::query_scalar::<_, i64>(
                 "SELECT id FROM tenant_events WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
             )
@@ -3738,6 +3747,31 @@ pub async fn enqueue_delivery_tasks(
                     tenant_event_id,
                     task.target_tg_chat_id,
                 );
+                let existing_id = sqlx::query_scalar::<_, i64>(
+                    "SELECT id FROM delivery_tasks WHERE tenant_id = $1 AND idem_key = $2",
+                )
+                .bind(tenant.get())
+                .bind(&idem_key)
+                .fetch_optional(&mut *conn)
+                .await?;
+                if let Some(id) = existing_id {
+                    writes.push(DeliveryTaskWrite { id, inserted: false });
+                    continue;
+                }
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM rule_versions WHERE tenant_id = $1 AND rule_id = $2 AND version = $3)",
+                )
+                .bind(tenant.get())
+                .bind(task.rule_id)
+                .bind(task.rule_version)
+                .fetch_one(&mut *conn)
+                .await?;
+                if !exists {
+                    return Err(EnqueueError::VersionUnavailable {
+                        rule_id: task.rule_id,
+                        version: task.rule_version,
+                    });
+                }
                 let mut write = None;
                 for _ in 0..16 {
                     let telegram_random_id = delivery_random_id()?;
@@ -3800,7 +3834,7 @@ pub async fn enqueue_delivery_tasks(
                 let Some((id, inserted)) = write else {
                     return Err(sqlx::Error::Protocol(
                         "could not allocate unique Telegram random_id after 16 attempts".to_owned(),
-                    ));
+                    ).into());
                 };
 
                 writes.push(DeliveryTaskWrite { id, inserted });
