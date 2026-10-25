@@ -34,6 +34,10 @@ enum Command {
         #[arg(long, value_enum)]
         category: CleanupCategory,
     },
+    CleanupTenant {
+        #[arg(long, value_enum)]
+        category: TenantCleanupCategory,
+    },
     /// 导出 OpenAPI 契约；`--check` 则与仓库内的 openapi.json 比对
     Openapi {
         #[arg(long)]
@@ -46,6 +50,29 @@ enum CleanupCategory {
     Challenges,
     WebSessions,
     BotSessions,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TenantCleanupCategory {
+    LoginSessions,
+    NotifyDedup,
+    BotConsoleUpdates,
+    DeliveryLogs,
+    AuditLogs,
+    SystemLogs,
+}
+
+impl From<TenantCleanupCategory> for tgm_db::tenant_retention::Category {
+    fn from(category: TenantCleanupCategory) -> Self {
+        match category {
+            TenantCleanupCategory::LoginSessions => Self::LoginSessions,
+            TenantCleanupCategory::NotifyDedup => Self::NotifyDedup,
+            TenantCleanupCategory::BotConsoleUpdates => Self::BotConsoleUpdates,
+            TenantCleanupCategory::DeliveryLogs => Self::DeliveryLogs,
+            TenantCleanupCategory::AuditLogs => Self::AuditLogs,
+            TenantCleanupCategory::SystemLogs => Self::SystemLogs,
+        }
+    }
 }
 
 impl From<CleanupCategory> for tgm_db::auth_retention::Category {
@@ -690,6 +717,38 @@ async fn preflight(role: &Role) -> anyhow::Result<tgm_core::profile::Profile> {
 
 fn main() -> anyhow::Result<()> {
     let cmd = Cli::parse().command;
+    if let Command::CleanupTenant { category } = cmd {
+        let present = present_env_names();
+        let names: Vec<&str> = present.iter().map(String::as_str).collect();
+        let profile = std::env::var("TGM_PROFILE").ok();
+        let rust_log = std::env::var("RUST_LOG").ok();
+        let problems =
+            tgm_core::config::check_tenant_cleanup(profile.as_deref(), &names, rust_log.as_deref());
+        if !problems.is_empty() {
+            for problem in problems {
+                eprintln!("tgm: 配置错误：{problem}");
+            }
+            anyhow::bail!("租户清理配置错误，拒绝执行");
+        }
+        return tokio::runtime::Runtime::new()?.block_on(async {
+            let shutdown = tgm_app::shutdown_signal();
+            let url = std::env::var("TGM_DB_URL_TENANT_CLEANUP")
+                .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_TENANT_CLEANUP"))?;
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .map_err(|_| anyhow::anyhow!("租户清理数据库连接失败"))?;
+            let result = tgm_app::tenant_retention::run(&pool, category.into(), shutdown).await;
+            pool.close().await;
+            let result = result.map_err(|error| anyhow::anyhow!("{error}"))?;
+            println!(
+                "tgm: 租户清理结束：deleted={} batches={} tenants={} overlaps={} stopped={}",
+                result.deleted, result.batches, result.tenants, result.overlaps, result.stopped
+            );
+            Ok(())
+        });
+    }
     if let Command::CleanupAuth { category } = cmd {
         let present = present_env_names();
         let names: Vec<&str> = present.iter().map(String::as_str).collect();
@@ -781,6 +840,7 @@ fn main() -> anyhow::Result<()> {
         Command::Migrate => unreachable!("已在上面处理"),
         Command::AuditRls => unreachable!("已在上面处理"),
         Command::CleanupAuth { .. } => unreachable!("已在上面处理"),
+        Command::CleanupTenant { .. } => unreachable!("已在上面处理"),
         Command::Openapi { check } => {
             openapi(check)?;
         }

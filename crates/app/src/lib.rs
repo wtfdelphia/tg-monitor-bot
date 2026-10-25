@@ -23,6 +23,7 @@ pub mod qr_login_control;
 pub mod rule;
 pub mod target_probe;
 pub mod tenant_notify;
+pub mod tenant_retention;
 
 /// 退出信号：`SIGTERM`（`docker stop` / systemd）或 Ctrl-C，先到先完成。
 /// ops/00 §六：收到后停止拉取新任务，等在途请求结束。

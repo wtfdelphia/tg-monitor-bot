@@ -47,6 +47,7 @@ KEK 的两种实现怎么共存。
 | `TGM_DB_URL_OPS` | control-plane | `platform_ops`，只供 `admin_tx`（`00-工程约定.md` §4.2） |
 | `TGM_DB_URL_OWNER` | 仅 `tgm migrate` | 持有 `tgm_owner` 的角色。`tgm_owner` 自身 `NOLOGIN`，本地为 `postgres`。**常驻进程不得持有** |
 | `TGM_DB_URL_AUTH_CLEANUP` | 仅 `tgm cleanup-auth` | 必须直接以 `auth_cleanup` 登录，独立进程和环境文件；普通服务不得持有。仅配 `TGM_PROFILE`、此连接串及可选 `RUST_LOG`，拒绝混入业务、owner、KMS、Telegram、对象存储配置及 `DATABASE_URL` |
+| `TGM_DB_URL_TENANT_CLEANUP` | 仅 `tgm cleanup-tenant` | 必须直接以 `tenant_cleanup` 登录，独立进程和环境文件；仅配 `TGM_PROFILE`、此连接串及可选 `RUST_LOG`。拒绝混入其他已登记凭据和 `DATABASE_URL`，普通服务及鉴权清理也不得持有 |
 | `TGM_REDIS_URL` | 全部常驻角色 | 仅唤醒信号，无正确性依赖 |
 | `TGM_S3_ENDPOINT` / `TGM_S3_BUCKET` | delivery / mtproto / fanout | MinIO 或 S3。fanout 用它跑对象清理（WP-5-delivery-media 片 3 批准记录第 6 条） |
 | `TGM_S3_ACCESS_KEY_ID` / `TGM_S3_SECRET_ACCESS_KEY` | delivery / mtproto / fanout | 对象存储的独立静态凭据，只能由 Secret 注入。**不走 AWS 默认凭据链**：默认链承载 KMS 身份，共用会让 KMS 角色顺带拿到桶权限（WP-5-delivery-media 片 2 批准记录） |

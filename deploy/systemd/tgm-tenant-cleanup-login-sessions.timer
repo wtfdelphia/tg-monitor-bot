@@ -1,0 +1,10 @@
+[Unit]
+Description=TGM tenant retention login-sessions
+
+[Timer]
+OnCalendar=*-*-* *:00/10:00
+Persistent=true
+Unit=tgm-tenant-cleanup@login-sessions.service
+
+[Install]
+WantedBy=timers.target
