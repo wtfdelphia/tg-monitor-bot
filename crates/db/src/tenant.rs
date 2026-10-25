@@ -9,7 +9,7 @@ use tgm_core::ids::TenantId;
 
 /// 闭包返回的 future。`spec/05` §3.2 写的是 `BoxFuture`，
 /// 这里展开成等价的裸类型 —— 只为不引 futures 这个依赖。
-pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, sqlx::Error>> + Send + 'a>>;
+pub type BoxFut<'a, T, E = sqlx::Error> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
 /// 唯一的租户事务入口。业务代码拿不到裸 `Transaction`。
 ///
@@ -23,6 +23,14 @@ pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, sqlx::Error>> + S
 pub async fn tenant_tx<F, T>(pool: &PgPool, tenant: TenantId, f: F) -> Result<T, sqlx::Error>
 where
     F: for<'a> FnOnce(&'a mut PgConnection) -> BoxFut<'a, T>,
+{
+    tenant_tx_with_error(pool, tenant, f).await
+}
+
+pub async fn tenant_tx_with_error<F, T, E>(pool: &PgPool, tenant: TenantId, f: F) -> Result<T, E>
+where
+    F: for<'a> FnOnce(&'a mut PgConnection) -> BoxFut<'a, T, E>,
+    E: From<sqlx::Error>,
 {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT set_config('app.tenant_id', $1, true)")

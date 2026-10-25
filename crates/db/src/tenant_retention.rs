@@ -13,6 +13,7 @@ pub enum Category {
     DeliveryLogs,
     AuditLogs,
     SystemLogs,
+    RuleVersions,
 }
 
 impl Category {
@@ -24,6 +25,7 @@ impl Category {
             Self::DeliveryLogs => "delivery_logs",
             Self::AuditLogs => "audit_logs",
             Self::SystemLogs => "system_logs",
+            Self::RuleVersions => "rule_versions",
         }
     }
 }
@@ -67,13 +69,37 @@ pub async fn try_lock(
     category: Category,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 1952935218))")
-        .bind(format!(
-            "tenant_retention:{}:{}",
-            tenant.get(),
-            category.table()
-        ))
+        .bind(lock_key(tenant, category))
         .fetch_one(connection)
         .await
+}
+
+fn lock_key(tenant: TenantId, category: Category) -> String {
+    format!("tenant_retention:{}:{}", tenant.get(), category.table())
+}
+
+pub async fn lock_rule_versions(
+    connection: &mut PgConnection,
+    tenant: TenantId,
+) -> Result<(), sqlx::Error> {
+    check_isolation(connection).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 1952935218))")
+        .bind(lock_key(tenant, Category::RuleVersions))
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
+async fn check_isolation(connection: &mut PgConnection) -> Result<(), sqlx::Error> {
+    let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
+        .fetch_one(connection)
+        .await?;
+    if isolation != "read committed" {
+        return Err(sqlx::Error::Protocol(
+            "rule version retention requires READ COMMITTED".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn cleanup_batch(
@@ -85,6 +111,9 @@ pub async fn cleanup_batch(
     let mut connection = pool.acquire().await?;
     connection.close_on_drop();
     let mut transaction = sqlx::Connection::begin(&mut *connection).await?;
+    if category == Category::RuleVersions {
+        check_isolation(&mut transaction).await?;
+    }
     sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
         .bind(tenant.get().to_string())
         .execute(&mut *transaction)
@@ -131,6 +160,9 @@ async fn delete_expired(
         Category::SystemLogs => {
             "WITH candidates AS MATERIALIZED (SELECT tenant_id, id FROM system_logs WHERE tenant_id = $1 AND created_at <= $3::timestamptz - interval '90 days' ORDER BY created_at, id LIMIT $2) DELETE FROM system_logs target USING candidates WHERE target.tenant_id = candidates.tenant_id AND target.id = candidates.id AND target.created_at <= $3::timestamptz - interval '90 days'"
         }
+        Category::RuleVersions => {
+            "WITH candidates AS MATERIALIZED (SELECT versions.tenant_id, versions.rule_id, versions.version FROM rule_versions versions JOIN tenants parent ON parent.id = versions.tenant_id WHERE versions.tenant_id = $1 AND versions.created_at <= $3::timestamptz - CASE parent.plan WHEN 'free' THEN interval '90 days' WHEN 'pro' THEN interval '365 days' END AND NOT EXISTS (SELECT 1 FROM rules current_rule WHERE current_rule.tenant_id = versions.tenant_id AND current_rule.id = versions.rule_id AND current_rule.version = versions.version) AND NOT EXISTS (SELECT 1 FROM delivery_tasks task WHERE task.tenant_id = versions.tenant_id AND task.rule_id = versions.rule_id AND task.rule_version = versions.version) ORDER BY versions.created_at, versions.rule_id, versions.version LIMIT $2) DELETE FROM rule_versions target USING candidates WHERE target.tenant_id = candidates.tenant_id AND target.rule_id = candidates.rule_id AND target.version = candidates.version"
+        }
     };
     Ok(sqlx::query(query)
         .bind(tenant.get())
@@ -151,7 +183,10 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         sqlx::raw_sql("INSERT INTO tenants (name,owner_user_id,plan) VALUES ('boundary-free',92001,'free'),('boundary-pro',92002,'pro');
             INSERT INTO identities (tenant_id,kind) SELECT id,'bot' FROM tenants;
-            INSERT INTO delivery_tasks (tenant_id,sender_identity_id,target_tg_chat_id,action) SELECT tenant_id,id,-1001,'COPY' FROM identities;")
+            INSERT INTO delivery_tasks (tenant_id,sender_identity_id,target_tg_chat_id,action) SELECT tenant_id,id,-1001,'COPY' FROM identities;
+            INSERT INTO keywords (tenant_id,word,match_type) SELECT id,'boundary','exact' FROM tenants;
+            INSERT INTO target_channels (tenant_id,tg_chat_id,sender_identity_id) SELECT tenant_id,-1002,id FROM identities;
+            INSERT INTO rules (tenant_id,keyword_id,target_ref,action,version) SELECT words.tenant_id,words.id,targets.id,'COPY',3 FROM keywords words JOIN target_channels targets ON targets.tenant_id=words.tenant_id;")
             .execute(&admin).await?;
         let tenants: Vec<TenantId> = sqlx::query_scalar("SELECT id FROM tenants ORDER BY id")
             .fetch_all(&admin)
@@ -180,6 +215,7 @@ mod tests {
                     "INSERT INTO delivery_logs (task_id,attempt,ok,created_at) SELECT id,1,true,$2::timestamptz-interval '90 days' FROM delivery_tasks WHERE tenant_id=$1",
                     "INSERT INTO audit_logs (tenant_id,action,resource,created_at) SELECT id,'boundary','sentinel',$2::timestamptz-CASE plan WHEN 'free' THEN interval '90 days' WHEN 'pro' THEN interval '365 days' END FROM tenants WHERE id=$1",
                     "INSERT INTO system_logs (tenant_id,level,module,event,created_at) VALUES ($1,'INFO','boundary','sentinel',$2::timestamptz-interval '90 days')",
+                    "INSERT INTO rule_versions (tenant_id,rule_id,version,snapshot,created_at) SELECT rules.tenant_id,rules.id,$3::bigint::int+1,'{}',$2::timestamptz-CASE tenants.plan WHEN 'free' THEN interval '90 days' WHEN 'pro' THEN interval '365 days' END FROM rules JOIN tenants ON tenants.id=rules.tenant_id WHERE rules.tenant_id=$1",
                 ] {
                     let extra_parameter = query.contains("$3");
                     let query = sqlx::query(query).bind(tenant.get()).bind(instant);
@@ -202,6 +238,7 @@ mod tests {
                 Category::DeliveryLogs,
                 Category::AuditLogs,
                 Category::SystemLogs,
+                Category::RuleVersions,
             ] {
                 assert_eq!(
                     delete_expired(&mut transaction, tenant, category, cutoff).await?,

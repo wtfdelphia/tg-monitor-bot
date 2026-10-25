@@ -5,11 +5,11 @@ use std::time::Duration;
 use tgm_core::error::AppError;
 use tgm_core::ids::TenantId;
 use tgm_db::repo::{
-    DeliveryTaskInput, DeliveryTaskWrite, RuleConditionRecord, RuleRecord, TenantEventRecord,
-    aggregate_ready_media_groups, enqueue_delivery_tasks, fanout_canonical_event,
-    list_all_active_tenants, list_unfanned_canonical_event_ids, list_unprocessed_tenant_event_ids,
-    load_enabled_rules, load_media_group_members, load_rule_version, load_tenant_event,
-    load_tenant_plan, mark_canonical_event_fanned_out,
+    DeliveryTaskInput, DeliveryTaskWrite, EnqueueError, RuleConditionRecord, RuleRecord,
+    TenantEventRecord, aggregate_ready_media_groups, enqueue_delivery_tasks,
+    fanout_canonical_event, list_all_active_tenants, list_unfanned_canonical_event_ids,
+    list_unprocessed_tenant_event_ids, load_enabled_rules, load_media_group_members,
+    load_rule_version, load_tenant_event, load_tenant_plan, mark_canonical_event_fanned_out,
 };
 use tokio::sync::watch;
 
@@ -223,7 +223,7 @@ impl RuleWorker {
                     tracing::warn!(
                         error = %error,
                         retry_after_ms = retry_delay.as_millis(),
-                        "rule worker 数据库操作失败，将退避重试"
+                        "rule worker 操作失败，将退避重试"
                     );
                     if !wait_for_worker_retry(&mut shutdown, retry_delay).await {
                         return Ok(RuleWorkerExit::Shutdown);
@@ -251,6 +251,30 @@ impl RuleWorker {
 
 fn is_retryable_worker_error(error: &AppError) -> bool {
     matches!(error, AppError::Db(_))
+        || matches!(error, AppError::Other(source) if source.is::<StaleRulePlan>())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("规则计划已失效，需要重新读取规则")]
+struct StaleRulePlan;
+
+#[derive(Debug, thiserror::Error)]
+#[error("当前规则版本缺少快照")]
+struct MissingCurrentRuleSnapshot;
+
+async fn unavailable_rule_version(
+    pool: &PgPool,
+    tenant: TenantId,
+    rule_id: i64,
+    version: i32,
+) -> Result<AppError, AppError> {
+    let rule = tgm_db::repo::load_rule_detail(pool, tenant, rule_id).await?;
+    if let Some((rule, _, _)) = rule
+        && rule.version == version
+    {
+        return Ok(AppError::internal(MissingCurrentRuleSnapshot));
+    }
+    Ok(AppError::internal(StaleRulePlan))
 }
 
 fn next_worker_retry_delay(current: Duration, poll_interval: Duration) -> Duration {
@@ -340,9 +364,17 @@ pub async fn process_tenant_event(
     let mut tasks = Vec::with_capacity(matches.len());
     for matched in &matches {
         let record = raw_rules.get(&matched.rule_id).ok_or(AppError::NotFound)?;
-        let version = load_rule_version(pool, tenant, matched.rule_id, matched.rule_version)
-            .await?
-            .ok_or(AppError::NotFound)?;
+        let Some(version) =
+            load_rule_version(pool, tenant, matched.rule_id, matched.rule_version).await?
+        else {
+            return Err(unavailable_rule_version(
+                pool,
+                tenant,
+                matched.rule_id,
+                matched.rule_version,
+            )
+            .await?);
+        };
         let media = media_route(
             &plan,
             matched.action,
@@ -366,8 +398,21 @@ pub async fn process_tenant_event(
             dead_error_code: (media == MediaRoute::TooLarge).then(|| "MEDIA_TOO_LARGE".to_owned()),
         });
     }
-    let writes =
-        enqueue_delivery_tasks(pool, tenant, tenant_event_id, &matched_keywords, &tasks).await?;
+    let writes = match enqueue_delivery_tasks(
+        pool,
+        tenant,
+        tenant_event_id,
+        &matched_keywords,
+        &tasks,
+    )
+    .await
+    {
+        Ok(writes) => writes,
+        Err(EnqueueError::Database(error)) => return Err(error.into()),
+        Err(EnqueueError::VersionUnavailable { rule_id, version }) => {
+            return Err(unavailable_rule_version(pool, tenant, rule_id, version).await?);
+        }
+    };
 
     Ok(RuleProcessingResult {
         processed: true,
@@ -494,6 +539,18 @@ mod worker_tests {
     use super::{MAX_WORKER_RETRY_DELAY, MIN_WORKER_RETRY_DELAY, next_worker_retry_delay};
     use std::time::Duration;
 
+    #[test]
+    fn stale_plans_retry_but_missing_current_snapshots_and_not_found_do_not() {
+        assert!(super::is_retryable_worker_error(
+            &super::AppError::internal(super::StaleRulePlan)
+        ));
+        assert!(!super::is_retryable_worker_error(
+            &super::AppError::internal(super::MissingCurrentRuleSnapshot)
+        ));
+        assert!(!super::is_retryable_worker_error(
+            &super::AppError::NotFound
+        ));
+    }
     #[test]
     fn retry_delay_starts_at_poll_interval_and_caps() {
         assert_eq!(

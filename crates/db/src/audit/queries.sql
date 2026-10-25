@@ -744,6 +744,15 @@ WITH cleaner AS (
          ('tenants', 'plan', 'SELECT'),
          ('delivery_tasks', 'id', 'SELECT'),
          ('delivery_tasks', 'tenant_id', 'SELECT'),
+         ('delivery_tasks', 'rule_id', 'SELECT'),
+         ('delivery_tasks', 'rule_version', 'SELECT'),
+         ('rules', 'tenant_id', 'SELECT'),
+         ('rules', 'id', 'SELECT'),
+         ('rules', 'version', 'SELECT'),
+         ('rule_versions', 'tenant_id', 'SELECT'),
+         ('rule_versions', 'rule_id', 'SELECT'),
+         ('rule_versions', 'version', 'SELECT'),
+         ('rule_versions', 'created_at', 'SELECT'),
          ('login_sessions', 'tenant_id', 'SELECT'),
          ('login_sessions', 'id', 'SELECT'),
          ('login_sessions', 'expires_at', 'SELECT'),
@@ -792,7 +801,7 @@ WITH cleaner AS (
    WHERE c.relkind IN ('r','p','v','m','f') AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
      AND (CASE WHEN privilege = 'MAINTAIN' AND current_setting('server_version_num')::int < 170000
                THEN false ELSE has_table_privilege(r.oid, c.oid, privilege) END) <>
-       (n.nspname = 'public' AND c.relname IN ('login_sessions','notify_dedup','bot_console_updates','delivery_logs','audit_logs','system_logs') AND privilege = 'DELETE')
+       (n.nspname = 'public' AND c.relname IN ('login_sessions','notify_dedup','bot_console_updates','delivery_logs','audit_logs','system_logs','rule_versions') AND privilege = 'DELETE')
   UNION ALL
   SELECT '表权限不得转授: ' || n.nspname || '.' || c.relname
     FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
