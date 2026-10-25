@@ -18,6 +18,7 @@
 pub mod admin;
 /// RLS 静态审计。`tgm audit-rls` 的实现体，断言全文见 `audit/queries.sql`。
 pub mod audit;
+pub mod auth_retention;
 /// 身份凭据的信封加密落库（spec/05 §七）。KEK 调用不在事务内。
 pub mod credentials;
 /// 启动期校验里要连库的两条（eng/01 §4.2 版本下限、§4.3 角色自检）。

@@ -1,0 +1,10 @@
+[Unit]
+Description=TGM inactive control bot session cleanup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=tgm-auth-cleanup@bot-sessions.service
+
+[Install]
+WantedBy=timers.target

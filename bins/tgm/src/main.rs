@@ -30,11 +30,32 @@ enum Command {
     Migrate,
     /// RLS 静态审计：主查询 + eng/04 §二 + §三（C3 除外，它比对文件不查库）
     AuditRls,
+    CleanupAuth {
+        #[arg(long, value_enum)]
+        category: CleanupCategory,
+    },
     /// 导出 OpenAPI 契约；`--check` 则与仓库内的 openapi.json 比对
     Openapi {
         #[arg(long)]
         check: bool,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CleanupCategory {
+    Challenges,
+    WebSessions,
+    BotSessions,
+}
+
+impl From<CleanupCategory> for tgm_db::auth_retention::Category {
+    fn from(category: CleanupCategory) -> Self {
+        match category {
+            CleanupCategory::Challenges => Self::Challenges,
+            CleanupCategory::WebSessions => Self::WebSessions,
+            CleanupCategory::BotSessions => Self::BotSessions,
+        }
+    }
 }
 
 /// 角色取值与 eng/00 §一 的 `tgm serve --role` 列表一一对应。
@@ -669,6 +690,39 @@ async fn preflight(role: &Role) -> anyhow::Result<tgm_core::profile::Profile> {
 
 fn main() -> anyhow::Result<()> {
     let cmd = Cli::parse().command;
+    if let Command::CleanupAuth { category } = cmd {
+        let present = present_env_names();
+        let names: Vec<&str> = present.iter().map(String::as_str).collect();
+        let profile = std::env::var("TGM_PROFILE").ok();
+        let rust_log = std::env::var("RUST_LOG").ok();
+        let problems =
+            tgm_core::config::check_auth_cleanup(profile.as_deref(), &names, rust_log.as_deref());
+        if !problems.is_empty() {
+            for problem in problems {
+                eprintln!("tgm: 配置错误：{problem}");
+            }
+            anyhow::bail!("鉴权清理配置错误，拒绝执行");
+        }
+        let runtime = tokio::runtime::Runtime::new()?;
+        return runtime.block_on(async {
+            let shutdown = tgm_app::shutdown_signal();
+            let url = std::env::var("TGM_DB_URL_AUTH_CLEANUP")
+                .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_AUTH_CLEANUP"))?;
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .map_err(|_| anyhow::anyhow!("鉴权清理数据库连接失败"))?;
+            let result = tgm_app::auth_retention::run(&pool, category.into(), shutdown).await;
+            pool.close().await;
+            let result = result.map_err(|error| anyhow::anyhow!("{error}"))?;
+            println!(
+                "tgm: 鉴权清理结束：deleted={} batches={} overlapped={} stopped={}",
+                result.deleted, result.batches, result.overlapped, result.stopped
+            );
+            Ok(())
+        });
+    }
     if let Command::Migrate = cmd {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(migrate())?;
@@ -726,6 +780,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Migrate => unreachable!("已在上面处理"),
         Command::AuditRls => unreachable!("已在上面处理"),
+        Command::CleanupAuth { .. } => unreachable!("已在上面处理"),
         Command::Openapi { check } => {
             openapi(check)?;
         }

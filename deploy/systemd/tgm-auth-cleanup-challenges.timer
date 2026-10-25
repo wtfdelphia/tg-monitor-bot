@@ -1,0 +1,10 @@
+[Unit]
+Description=TGM expired console challenge cleanup
+
+[Timer]
+OnCalendar=*-*-* *:00/10:00
+Persistent=true
+Unit=tgm-auth-cleanup@challenges.service
+
+[Install]
+WantedBy=timers.target
