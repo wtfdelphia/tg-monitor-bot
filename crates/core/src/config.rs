@@ -400,6 +400,14 @@ pub fn check_tenant_cleanup(
     check_cleanup(raw_profile, present, rust_log, "TGM_DB_URL_TENANT_CLEANUP")
 }
 
+pub fn check_shared_cleanup(
+    raw_profile: Option<&str>,
+    present: &[&str],
+    rust_log: Option<&str>,
+) -> Vec<ConfigProblem> {
+    check_cleanup(raw_profile, present, rust_log, "TGM_DB_URL_SHARED_CLEANUP")
+}
+
 fn check_cleanup(
     raw_profile: Option<&str>,
     present: &[&str],
@@ -468,6 +476,7 @@ fn known_names() -> &'static [&'static str] {
         "TGM_DB_URL_OWNER",
         "TGM_DB_URL_AUTH_CLEANUP",
         "TGM_DB_URL_TENANT_CLEANUP",
+        "TGM_DB_URL_SHARED_CLEANUP",
         "TGM_REDIS_URL",
         "TGM_S3_ENDPOINT",
         "TGM_S3_BUCKET",
@@ -520,8 +529,8 @@ fn known_names() -> &'static [&'static str] {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{
-        COMMON, ConfigProblem, Role, check, check_auth_cleanup, check_kek_backend, extra_required,
-        known_names, validate_oidc_alg,
+        COMMON, ConfigProblem, Role, check, check_auth_cleanup, check_kek_backend,
+        check_shared_cleanup, extra_required, known_names, validate_oidc_alg,
     };
     use crate::oidc::OidcSigningAlgorithm;
 
@@ -602,6 +611,51 @@ mod tests {
             check(Role::Rule, Some("production"), &present, None)
                 .contains(&ConfigProblem::Unexpected("TGM_DB_URL_TENANT_CLEANUP"))
         );
+    }
+
+    #[test]
+    fn shared_cleanup_configuration_is_an_independent_credential_boundary() {
+        let present = ["TGM_PROFILE", "TGM_DB_URL_SHARED_CLEANUP"];
+        assert!(check_shared_cleanup(Some("production"), &present, None).is_empty());
+        for forbidden in known_names().iter().copied().chain(["DATABASE_URL"]) {
+            if ["TGM_PROFILE", "TGM_DB_URL_SHARED_CLEANUP", "RUST_LOG"].contains(&forbidden) {
+                continue;
+            }
+            let mut mixed = present.to_vec();
+            mixed.push(forbidden);
+            assert!(
+                check_shared_cleanup(Some("production"), &mixed, None)
+                    .contains(&ConfigProblem::Unexpected(forbidden))
+            );
+        }
+        assert!(
+            check_shared_cleanup(Some("production"), &[], None)
+                .contains(&ConfigProblem::Missing("TGM_DB_URL_SHARED_CLEANUP"))
+        );
+        assert!(check_shared_cleanup(None, &[], None).contains(&ConfigProblem::ProfileMissing));
+        assert!(
+            check_shared_cleanup(Some("prod"), &present, None)
+                .iter()
+                .any(|problem| matches!(problem, ConfigProblem::ProfileUnknown(_)))
+        );
+        assert!(
+            check_shared_cleanup(Some("production"), &present, Some("debug"))
+                .iter()
+                .any(|problem| matches!(problem, ConfigProblem::SqlxLogNotSilenced(_)))
+        );
+        for role in [
+            Role::ControlPlane,
+            Role::BotGateway,
+            Role::MtprotoWorker,
+            Role::Fanout,
+            Role::Rule,
+            Role::Delivery,
+        ] {
+            assert!(
+                check(role, Some("production"), &present, None)
+                    .contains(&ConfigProblem::Unexpected("TGM_DB_URL_SHARED_CLEANUP"))
+            );
+        }
     }
 
     /// 该角色的一份「刚好合规」的环境。用它当基线，每条测试只动一处。

@@ -35,6 +35,8 @@ declare -A BREAK=(
   [A1]="GRANT TRUNCATE ON keywords TO app_user;"
   [C8]="GRANT SELECT (csrf_token) ON web_sessions TO auth_cleanup;"
   [C9]="GRANT SELECT (login_token) ON login_sessions TO tenant_cleanup;"
+  [C10]="GRANT SELECT (text) ON canonical_events TO shared_cleanup;"
+  [C11]="ALTER TABLE tenant_events DROP CONSTRAINT tenant_events_canonical_event_id_fkey; ALTER TABLE tenant_events ADD CONSTRAINT tenant_events_canonical_event_id_fkey FOREIGN KEY (canonical_event_id) REFERENCES canonical_events(id) ON DELETE CASCADE;"
   [A2a]="ALTER ROLE app_user BYPASSRLS;"
   [A2b]="ALTER TABLE keywords OWNER TO app_user;"
   # NOT VALID：不加的话新约束要校验现有行，而会话里没有 app.tenant_id，
@@ -88,6 +90,8 @@ declare -A UNDO=(
   [A1]="REVOKE TRUNCATE ON keywords FROM app_user;"
   [C8]="REVOKE SELECT (csrf_token) ON web_sessions FROM auth_cleanup;"
   [C9]="REVOKE SELECT (login_token) ON login_sessions FROM tenant_cleanup;"
+  [C10]="REVOKE SELECT (text) ON canonical_events FROM shared_cleanup;"
+  [C11]="ALTER TABLE tenant_events DROP CONSTRAINT tenant_events_canonical_event_id_fkey; ALTER TABLE tenant_events ADD CONSTRAINT tenant_events_canonical_event_id_fkey FOREIGN KEY (canonical_event_id) REFERENCES canonical_events(id) ON DELETE NO ACTION;"
   [A2a]="ALTER ROLE app_user NOBYPASSRLS;"
   # 改回 owner **不还原受赠权限**。实测：ALTER TABLE keywords OWNER TO app_user
   # 之后 relacl 里 app_user 那条受赠条目消失了（被并进 owner 条目），
@@ -131,7 +135,7 @@ declare -A AS_SUPER=([A2a]=1 [A2b]=1 [A8]=1 [C5]=1)
 #             必然同时触发 A1。两条断言从不同角度抓同一个事实，是冗余而非耦合
 declare -A ALSO=([A2b]="A1")
 
-ORDER=(MAIN A1 A2a A2b A3 A4 A5 A6 A7 A8 A9 C1 C4 C2 C6 C7 C5 C8 C9)
+ORDER=(MAIN A1 A2a A2b A3 A4 A5 A6 A7 A8 A9 C1 C4 C2 C6 C7 C5 C8 C9 C10 C11)
 
 psql_do() {  # $1=sql  $2=1 表示以超级用户身份
   if [ "${2:-}" = "1" ]; then

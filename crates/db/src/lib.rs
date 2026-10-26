@@ -25,6 +25,7 @@ pub mod credentials;
 pub mod preflight;
 /// Repo 层。方法第一个参数必须是 `TenantId`（eng/00 §4.1）。
 pub mod repo;
+pub mod shared_retention;
 pub mod target_probe;
 /// 租户事务入口。业务唯一入口，`set_config` 的作用域即事务边界。
 pub mod tenant;

@@ -21,6 +21,7 @@ pub mod mtproto_worker;
 pub mod pipeline;
 pub mod qr_login_control;
 pub mod rule;
+pub mod shared_retention;
 pub mod target_probe;
 pub mod tenant_notify;
 pub mod tenant_retention;

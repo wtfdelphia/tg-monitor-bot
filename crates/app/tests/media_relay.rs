@@ -279,6 +279,96 @@ async fn object_bytes(store: &MediaStore, key: &str) -> Vec<u8> {
     bytes
 }
 
+struct ExpiringOpener {
+    app: PgPool,
+    cleanup: PgPool,
+    event: i64,
+}
+
+#[async_trait::async_trait]
+impl MediaOpener for ExpiringOpener {
+    async fn open(
+        &self,
+        _tg_chat_id: i64,
+        _tg_message_id: i64,
+    ) -> Result<Box<dyn MediaSource>, TelegramClientError> {
+        sqlx::query("UPDATE media_relay_jobs SET next_retry_at=clock_timestamp()-interval '1 hour' WHERE canonical_event_id=$1")
+            .bind(self.event).execute(&self.app).await.expect("设置下载过期失败");
+        assert_eq!(
+            tgm_db::shared_retention::cleanup_batch(&self.cleanup)
+                .await
+                .expect("回收事件失败"),
+            Some(1)
+        );
+        Ok(Box::new(FakeSource {
+            chunks: vec![b"late download".to_vec()].into_iter(),
+        }))
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn shared_cleanup_during_download_rolls_back_archive_and_deletes_uploaded_object(
+    admin: PgPool,
+) {
+    let world = world(admin).await;
+    let event = media_event(&world, 90001, "expired orphan", Some(13)).await;
+    sqlx::query("UPDATE canonical_events SET fanned_out=true,created_at=clock_timestamp()-interval '32 days' WHERE id=$1")
+        .bind(event).execute(&world.app).await.expect("设置原始事件到期失败");
+    sqlx::query(
+        "INSERT INTO media_relay_jobs (canonical_event_id,receiver_identity_id) VALUES ($1,$2)",
+    )
+    .bind(event)
+    .bind(world.receiver)
+    .execute(&world.app)
+    .await
+    .expect("创建孤儿 job 失败");
+    let cleanup = sqlx::postgres::PgPoolOptions::new()
+        .connect_with(
+            world
+                .app
+                .connect_options()
+                .as_ref()
+                .clone()
+                .username("shared_cleanup")
+                .password("scpw"),
+        )
+        .await
+        .expect("连接共享清理角色失败");
+    tgm_db::shared_retention::check_connection(&cleanup)
+        .await
+        .expect("清理角色检查失败");
+    let store = support::media_store("tgm-test-shared-expired-download").await;
+    let opener = ExpiringOpener {
+        app: world.app.clone(),
+        cleanup,
+        event,
+    };
+    let guard = lease(&world, "shared-expired-download").await;
+    assert_eq!(
+        run_relay_once(&world.app, &guard, &opener, &store)
+            .await
+            .expect("迟到下载处理失败"),
+        RelayOutcome::LeaseLost
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM media_archive")
+            .fetch_one(&world.app)
+            .await
+            .expect("读取档案失败"),
+        0
+    );
+    let cutoff = aws_sdk_s3::primitives::DateTime::from(
+        std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+    );
+    assert!(
+        store
+            .list_older_than("staging/", cutoff)
+            .await
+            .expect("列举上传对象失败")
+            .is_empty()
+    );
+}
+
 /// pro 档建 job、free 档不建；同一事件两个 pro 租户共用一个 job。
 #[sqlx::test(migrations = "../../migrations-test")]
 async fn only_pro_media_creates_one_shared_job(admin: PgPool) {
