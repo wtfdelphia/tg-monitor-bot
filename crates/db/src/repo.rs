@@ -3494,6 +3494,7 @@ pub async fn aggregate_ready_media_groups(pool: &PgPool, limit: i64) -> Result<(
         else {
             continue;
         };
+        crate::shared_retention::lock_writer(&mut tx, identity).await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!("media-group:{identity}:{chat}:{group}"))
             .execute(&mut *tx)
@@ -3602,6 +3603,16 @@ pub async fn mark_canonical_event_fanned_out(
     pool: &PgPool,
     canonical_event_id: i64,
 ) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if let Some(identity) = sqlx::query_scalar::<_, i64>(
+        "SELECT receiver_identity_id FROM canonical_events WHERE id = $1",
+    )
+    .bind(canonical_event_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        crate::shared_retention::lock_writer(&mut tx, identity).await?;
+    }
     let result = sqlx::query(
         "UPDATE canonical_events
             SET fanned_out = TRUE
@@ -3609,8 +3620,9 @@ pub async fn mark_canonical_event_fanned_out(
             AND NOT fanned_out",
     )
     .bind(canonical_event_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() == 1)
 }
 
@@ -3731,6 +3743,16 @@ pub async fn enqueue_delivery_tasks(
         Box::pin(async move {
             crate::tenant_retention::lock_rule_versions(conn, tenant).await?;
             crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
+            let identity = sqlx::query_scalar::<_, i64>(
+                "SELECT event.receiver_identity_id FROM tenant_events projection
+                   JOIN canonical_events event ON event.id = projection.canonical_event_id
+                  WHERE projection.tenant_id = $1 AND projection.id = $2",
+            )
+            .bind(tenant.get())
+            .bind(tenant_event_id)
+            .fetch_one(&mut *conn)
+            .await?;
+            crate::shared_retention::lock_writer(conn, identity).await?;
             sqlx::query_scalar::<_, i64>(
                 "SELECT id FROM tenant_events WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
             )
@@ -4508,6 +4530,7 @@ pub async fn claim_media_relay_job(
         tx.rollback().await?;
         return Ok(None);
     }
+    crate::shared_retention::lock_writer(&mut tx, lease.identity_id.get()).await?;
     let job = sqlx::query_as::<_, MediaRelayJobRecord>(
         r#"
         WITH candidate AS (
@@ -4560,6 +4583,7 @@ pub async fn fail_media_relay_job(
         tx.rollback().await?;
         return Ok(false);
     }
+    crate::shared_retention::lock_writer(&mut tx, lease.identity_id.get()).await?;
     let updated = sqlx::query(
         r#"
         UPDATE media_relay_jobs
@@ -4599,6 +4623,7 @@ pub async fn complete_media_relay_job(
         tx.rollback().await?;
         return Ok(None);
     }
+    crate::shared_retention::lock_writer(&mut tx, lease.identity_id.get()).await?;
     let (archive_id, object_key) = sqlx::query_as::<_, (i64, String)>(
         r#"
         INSERT INTO media_archive (
@@ -4931,6 +4956,7 @@ async fn insert_canonical_event_in(
     conn: &mut sqlx::PgConnection,
     event: &CanonicalEventInput,
 ) -> Result<CanonicalEventWrite, sqlx::Error> {
+    crate::shared_retention::lock_writer(conn, event.receiver_identity_id.get()).await?;
     if let Some(group) = &event.media_group_id {
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!(
@@ -5032,6 +5058,15 @@ pub async fn fanout_canonical_event(
 ) -> Result<Option<TenantEventWrite>, sqlx::Error> {
     tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            if let Some(identity) = sqlx::query_scalar::<_, i64>(
+                "SELECT receiver_identity_id FROM canonical_events WHERE id = $1",
+            )
+            .bind(canonical_event_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            {
+                crate::shared_retention::lock_writer(conn, identity).await?;
+            }
             let inserted_id = sqlx::query_scalar!(
                 r#"
                 INSERT INTO tenant_events (tenant_id, canonical_event_id, source_ref)

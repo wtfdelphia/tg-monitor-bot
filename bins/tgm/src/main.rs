@@ -38,6 +38,7 @@ enum Command {
         #[arg(long, value_enum)]
         category: TenantCleanupCategory,
     },
+    CleanupShared,
     /// 导出 OpenAPI 契约；`--check` 则与仓库内的 openapi.json 比对
     Openapi {
         #[arg(long)]
@@ -788,6 +789,39 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         });
     }
+    if let Command::CleanupShared = cmd {
+        let present = present_env_names();
+        let names: Vec<&str> = present.iter().map(String::as_str).collect();
+        let profile = std::env::var("TGM_PROFILE").ok();
+        let rust_log = std::env::var("RUST_LOG").ok();
+        let problems =
+            tgm_core::config::check_shared_cleanup(profile.as_deref(), &names, rust_log.as_deref());
+        if !problems.is_empty() {
+            for problem in problems {
+                eprintln!("tgm: 配置错误：{problem}");
+            }
+            anyhow::bail!("共享事件清理配置错误，拒绝执行");
+        }
+        let runtime = tokio::runtime::Runtime::new()?;
+        return runtime.block_on(async {
+            let shutdown = tgm_app::shutdown_signal();
+            let url = std::env::var("TGM_DB_URL_SHARED_CLEANUP")
+                .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_SHARED_CLEANUP"))?;
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .map_err(|_| anyhow::anyhow!("共享事件清理数据库连接失败"))?;
+            let result = tgm_app::shared_retention::run(&pool, shutdown).await;
+            pool.close().await;
+            let result = result.map_err(|error| anyhow::anyhow!("{error}"))?;
+            println!(
+                "tgm: 共享事件清理结束：deleted={} batches={} overlapped={} stopped={}",
+                result.deleted, result.batches, result.overlapped, result.stopped
+            );
+            Ok(())
+        });
+    }
     if let Command::Migrate = cmd {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(migrate())?;
@@ -847,6 +881,7 @@ fn main() -> anyhow::Result<()> {
         Command::AuditRls => unreachable!("已在上面处理"),
         Command::CleanupAuth { .. } => unreachable!("已在上面处理"),
         Command::CleanupTenant { .. } => unreachable!("已在上面处理"),
+        Command::CleanupShared => unreachable!("已在上面处理"),
         Command::Openapi { check } => {
             openapi(check)?;
         }
