@@ -54,6 +54,8 @@ enum CleanupCategory {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum TenantCleanupCategory {
+    TenantEvents,
+    DeliveryTasks,
     LoginSessions,
     NotifyDedup,
     BotConsoleUpdates,
@@ -66,6 +68,8 @@ enum TenantCleanupCategory {
 impl From<TenantCleanupCategory> for tgm_db::tenant_retention::Category {
     fn from(category: TenantCleanupCategory) -> Self {
         match category {
+            TenantCleanupCategory::TenantEvents => Self::TenantEvents,
+            TenantCleanupCategory::DeliveryTasks => Self::DeliveryTasks,
             TenantCleanupCategory::LoginSessions => Self::LoginSessions,
             TenantCleanupCategory::NotifyDedup => Self::NotifyDedup,
             TenantCleanupCategory::BotConsoleUpdates => Self::BotConsoleUpdates,

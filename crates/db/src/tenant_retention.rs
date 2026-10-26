@@ -7,6 +7,8 @@ pub const TENANT_PAGE_LIMIT: i64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
+    TenantEvents,
+    DeliveryTasks,
     LoginSessions,
     NotifyDedup,
     BotConsoleUpdates,
@@ -19,6 +21,8 @@ pub enum Category {
 impl Category {
     pub fn table(self) -> &'static str {
         match self {
+            Self::TenantEvents => "tenant_events",
+            Self::DeliveryTasks => "delivery_tasks",
             Self::LoginSessions => "login_sessions",
             Self::NotifyDedup => "notify_dedup",
             Self::BotConsoleUpdates => "bot_console_updates",
@@ -36,6 +40,8 @@ pub enum RetentionError {
     Preflight(#[from] crate::preflight::PreflightError),
     #[error("租户清理必须直接使用无额外属性或成员关系的 tenant_cleanup 登录")]
     WrongRole,
+    #[error("租户套餐值无效，拒绝按默认期限清理")]
+    InvalidPlan,
     #[error("租户清理批次失败，未提交的删除和日志已回滚")]
     Database(#[from] sqlx::Error),
 }
@@ -75,7 +81,21 @@ pub async fn try_lock(
 }
 
 fn lock_key(tenant: TenantId, category: Category) -> String {
+    if matches!(category, Category::TenantEvents | Category::DeliveryTasks) {
+        return format!("tenant_retention:{}:event_lifecycle", tenant.get());
+    }
     format!("tenant_retention:{}:{}", tenant.get(), category.table())
+}
+
+pub async fn lock_event_lifecycle_shared(
+    connection: &mut PgConnection,
+    tenant: TenantId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 1952935218))")
+        .bind(lock_key(tenant, Category::TenantEvents))
+        .execute(connection)
+        .await?;
+    Ok(())
 }
 
 pub async fn lock_rule_versions(
@@ -111,7 +131,10 @@ pub async fn cleanup_batch(
     let mut connection = pool.acquire().await?;
     connection.close_on_drop();
     let mut transaction = sqlx::Connection::begin(&mut *connection).await?;
-    if category == Category::RuleVersions {
+    if matches!(
+        category,
+        Category::RuleVersions | Category::TenantEvents | Category::DeliveryTasks
+    ) {
         check_isolation(&mut transaction).await?;
     }
     sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
@@ -121,6 +144,15 @@ pub async fn cleanup_batch(
     if !try_lock(&mut transaction, tenant, category).await? {
         transaction.rollback().await?;
         return Ok(None);
+    }
+    if category == Category::TenantEvents {
+        let plan: String = sqlx::query_scalar("SELECT plan FROM tenants WHERE id = $1")
+            .bind(tenant.get())
+            .fetch_one(&mut *transaction)
+            .await?;
+        if plan != "free" && plan != "pro" {
+            return Err(RetentionError::InvalidPlan);
+        }
     }
     let cutoff = sqlx::query_scalar("SELECT statement_timestamp()")
         .fetch_one(&mut *transaction)
@@ -162,6 +194,12 @@ async fn delete_expired(
         }
         Category::RuleVersions => {
             "WITH candidates AS MATERIALIZED (SELECT versions.tenant_id, versions.rule_id, versions.version FROM rule_versions versions JOIN tenants parent ON parent.id = versions.tenant_id WHERE versions.tenant_id = $1 AND versions.created_at <= $3::timestamptz - CASE parent.plan WHEN 'free' THEN interval '90 days' WHEN 'pro' THEN interval '365 days' END AND NOT EXISTS (SELECT 1 FROM rules current_rule WHERE current_rule.tenant_id = versions.tenant_id AND current_rule.id = versions.rule_id AND current_rule.version = versions.version) AND NOT EXISTS (SELECT 1 FROM delivery_tasks task WHERE task.tenant_id = versions.tenant_id AND task.rule_id = versions.rule_id AND task.rule_version = versions.version) ORDER BY versions.created_at, versions.rule_id, versions.version LIMIT $2) DELETE FROM rule_versions target USING candidates WHERE target.tenant_id = candidates.tenant_id AND target.rule_id = candidates.rule_id AND target.version = candidates.version"
+        }
+        Category::TenantEvents => {
+            "WITH candidates AS MATERIALIZED (SELECT events.tenant_id, events.id FROM tenant_events events JOIN tenants parent ON parent.id = events.tenant_id WHERE events.tenant_id = $1 AND events.created_at < $3::timestamptz - CASE parent.plan WHEN 'free' THEN interval '7 days' WHEN 'pro' THEN interval '30 days' END AND NOT EXISTS (SELECT 1 FROM delivery_tasks task WHERE task.tenant_id = events.tenant_id AND task.tenant_event_id = events.id AND task.status IN ('PENDING', 'SENDING', 'FAILED')) ORDER BY events.created_at, events.id LIMIT $2) DELETE FROM tenant_events target USING candidates, tenants parent WHERE target.tenant_id = candidates.tenant_id AND target.id = candidates.id AND parent.id = target.tenant_id AND target.created_at < $3::timestamptz - CASE parent.plan WHEN 'free' THEN interval '7 days' WHEN 'pro' THEN interval '30 days' END AND NOT EXISTS (SELECT 1 FROM delivery_tasks task WHERE task.tenant_id = target.tenant_id AND task.tenant_event_id = target.id AND task.status IN ('PENDING', 'SENDING', 'FAILED'))"
+        }
+        Category::DeliveryTasks => {
+            "WITH candidates AS MATERIALIZED (SELECT task.id FROM delivery_tasks task WHERE task.tenant_id = $1 AND task.tenant_event_id IS NULL AND task.status IN ('DONE', 'DEAD', 'CANCELLED') AND NOT EXISTS (SELECT 1 FROM delivery_logs log WHERE log.task_id = task.id) AND ((task.status = 'DEAD' AND task.updated_at <= $3::timestamptz - interval '30 days') OR (task.updated_at <= $3::timestamptz - interval '90 days')) ORDER BY task.updated_at, task.id LIMIT $2) DELETE FROM delivery_tasks target USING candidates WHERE target.tenant_id = $1 AND target.id = candidates.id AND target.tenant_event_id IS NULL AND target.status IN ('DONE', 'DEAD', 'CANCELLED') AND NOT EXISTS (SELECT 1 FROM delivery_logs log WHERE log.task_id = target.id) AND ((target.status = 'DEAD' AND target.updated_at <= $3::timestamptz - interval '30 days') OR (target.updated_at <= $3::timestamptz - interval '90 days'))"
         }
     };
     Ok(sqlx::query(query)

@@ -50,14 +50,58 @@ async fn seed_task(
     sender_identity_id: IdentityId,
     key: &str,
 ) -> i64 {
-    sqlx::query_scalar(
-        "INSERT INTO delivery_tasks
-            (tenant_id, target_tg_chat_id, sender_identity_id, action, status,
-             telegram_random_id, idem_key, payload_snapshot)
-         VALUES ($1, $2, $3, 'COPY', 'PENDING', $5, $4, $6)
+    let source_ref: i64 = sqlx::query_scalar(
+        "INSERT INTO source_subscriptions (tenant_id, tg_chat_id, receiver_identity_id)
+         VALUES ($1, -1001, $2)
+         ON CONFLICT (tenant_id, tg_chat_id, receiver_identity_id)
+         DO UPDATE SET updated_at = clock_timestamp()
          RETURNING id",
     )
     .bind(tenant)
+    .bind(sender_identity_id)
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建投递测试来源失败");
+    let message_id: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(tg_message_id), 0) + 1
+           FROM canonical_events
+          WHERE receiver_identity_id = $1 AND tg_chat_id = -1001",
+    )
+    .bind(sender_identity_id)
+    .fetch_one(admin.raw())
+    .await
+    .expect("分配投递测试消息号失败");
+    let canonical_event_id: i64 = sqlx::query_scalar(
+        "INSERT INTO canonical_events
+            (adapter, receiver_identity_id, tg_chat_id, tg_message_id, message_date)
+         VALUES ('bot', $1, -1001, $2, now())
+         RETURNING id",
+    )
+    .bind(sender_identity_id)
+    .bind(message_id)
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建投递测试规范化事件失败");
+    let tenant_event_id: i64 = sqlx::query_scalar(
+        "INSERT INTO tenant_events (tenant_id, canonical_event_id, source_ref)
+         VALUES ($1, $2, $3)
+         RETURNING id",
+    )
+    .bind(tenant)
+    .bind(canonical_event_id)
+    .bind(source_ref)
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建投递测试租户事件失败");
+    sqlx::query_scalar(
+        "INSERT INTO delivery_tasks
+            (tenant_id, tenant_event_id, target_tg_chat_id, sender_identity_id, action, status,
+             telegram_random_id, idem_key, payload_snapshot)
+         VALUES ($1, $2, $3, $4, 'COPY', 'PENDING', $6, $5, $7)
+         RETURNING id",
+    )
+    .bind(tenant)
+    .bind(tenant_event_id)
     .bind(-30_000 - tenant.get())
     .bind(sender_identity_id)
     .bind(key)

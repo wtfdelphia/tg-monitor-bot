@@ -1,6 +1,6 @@
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::Duration;
-use tgm_core::ids::TenantId;
+use tgm_core::ids::{IdentityId, TenantId};
 use tgm_db::tenant_retention::{Category, check_connection, cleanup_batch};
 
 mod support;
@@ -68,6 +68,70 @@ async fn seed(admin: &PgPool) -> Result<Vec<TenantId>, sqlx::Error> {
         .await
 }
 
+async fn seed_event(
+    admin: &PgPool,
+    tenant: TenantId,
+    identity_id: i64,
+    source_ref: i64,
+    message_id: i64,
+    age_days: i32,
+    status: Option<&str>,
+    log_age_days: Option<i32>,
+) -> Result<(i64, Option<i64>), sqlx::Error> {
+    let canonical_event_id: i64 = sqlx::query_scalar(
+        "INSERT INTO canonical_events
+            (adapter, receiver_identity_id, tg_chat_id, tg_message_id, message_date, created_at)
+         VALUES ('bot', $1, -2001, $2, now(), clock_timestamp() - make_interval(days => $3))
+         RETURNING id",
+    )
+    .bind(identity_id)
+    .bind(message_id)
+    .bind(age_days)
+    .fetch_one(admin)
+    .await?;
+    let tenant_event_id: i64 = sqlx::query_scalar(
+        "INSERT INTO tenant_events
+            (tenant_id, canonical_event_id, source_ref, created_at)
+         VALUES ($1, $2, $3, clock_timestamp() - make_interval(days => $4))
+         RETURNING id",
+    )
+    .bind(tenant.get())
+    .bind(canonical_event_id)
+    .bind(source_ref)
+    .bind(age_days)
+    .fetch_one(admin)
+    .await?;
+    let Some(status) = status else {
+        return Ok((tenant_event_id, None));
+    };
+    let task_id: i64 = sqlx::query_scalar(
+        "INSERT INTO delivery_tasks
+            (tenant_id, tenant_event_id, sender_identity_id, target_tg_chat_id, action,
+             status, updated_at)
+         VALUES ($1, $2, $3, -3001, 'COPY', $4,
+                 clock_timestamp() - make_interval(days => $5))
+         RETURNING id",
+    )
+    .bind(tenant.get())
+    .bind(tenant_event_id)
+    .bind(identity_id)
+    .bind(status)
+    .bind(age_days)
+    .fetch_one(admin)
+    .await?;
+    if let Some(log_age_days) = log_age_days {
+        sqlx::query(
+            "INSERT INTO delivery_logs (task_id, attempt, ok, created_at)
+             VALUES ($1, 1, TRUE, clock_timestamp() - make_interval(days => $2))",
+        )
+        .bind(task_id)
+        .bind(log_age_days)
+        .execute(admin)
+        .await?;
+    }
+    Ok((tenant_event_id, Some(task_id)))
+}
+
 async fn wait_for_lock(admin: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -79,6 +143,334 @@ async fn wait_for_lock(admin: &PgPool) -> Result<(), Box<dyn std::error::Error>>
         assert!(tokio::time::Instant::now() < deadline, "清理未等到真实行锁");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn event_retention_detaches_terminal_tasks_and_preserves_in_flight_rows(
+    injected: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (cleanup, admin) = setup(injected).await?;
+    let tenants = seed(admin.raw()).await?;
+    let active: TenantId = sqlx::query_scalar(
+        "INSERT INTO tenants (name, owner_user_id, plan, status)
+         VALUES ('retention-active', 91003, 'free', 'active')
+         RETURNING id",
+    )
+    .fetch_one(admin.raw())
+    .await?;
+    let mut all_tenants = tenants.clone();
+    all_tenants.push(active);
+    for tenant in &all_tenants {
+        sqlx::query("INSERT INTO identities (tenant_id, kind) VALUES ($1, 'bot')")
+            .bind(tenant.get())
+            .execute(admin.raw())
+            .await?;
+        sqlx::query(
+            "INSERT INTO source_subscriptions (tenant_id, tg_chat_id, receiver_identity_id)
+             SELECT $1, -2100 - $1, id FROM identities WHERE tenant_id = $1
+             RETURNING id",
+        )
+        .bind(tenant.get())
+        .execute(admin.raw())
+        .await?;
+    }
+
+    for (index, tenant) in all_tenants.iter().enumerate() {
+        let identity_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM identities WHERE tenant_id = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(tenant.get())
+        .fetch_one(admin.raw())
+        .await?;
+        let source_ref: i64 = sqlx::query_scalar(
+            "SELECT id FROM source_subscriptions WHERE tenant_id = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(tenant.get())
+        .fetch_one(admin.raw())
+        .await?;
+        let old_days = if *tenant == tenants[1] { 31 } else { 8 };
+        let recent_days = if *tenant == tenants[1] { 29 } else { 6 };
+        let old_event = seed_event(
+            admin.raw(),
+            *tenant,
+            identity_id,
+            source_ref,
+            50_000 + i64::try_from(index)?,
+            old_days,
+            None,
+            None,
+        )
+        .await?;
+        let recent_event = seed_event(
+            admin.raw(),
+            *tenant,
+            identity_id,
+            source_ref,
+            51_000 + i64::try_from(index)?,
+            recent_days,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            cleanup_batch(&cleanup, *tenant, Category::TenantEvents).await?,
+            Some(1)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tenant_events WHERE id = $1",)
+                .bind(old_event.0)
+                .fetch_one(admin.raw())
+                .await?,
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tenant_events WHERE id = $1",)
+                .bind(recent_event.0)
+                .fetch_one(admin.raw())
+                .await?,
+            1
+        );
+    }
+
+    let tenant = tenants[0];
+    let identity_id: i64 = sqlx::query_scalar(
+        "SELECT id FROM identities WHERE tenant_id = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(tenant.get())
+    .fetch_one(admin.raw())
+    .await?;
+    let source_ref: i64 = sqlx::query_scalar(
+        "SELECT id FROM source_subscriptions WHERE tenant_id = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(tenant.get())
+    .fetch_one(admin.raw())
+    .await?;
+    let protected_ids = ["PENDING", "SENDING", "FAILED"];
+    for (index, status) in protected_ids.iter().enumerate() {
+        let (event_id, _) = seed_event(
+            admin.raw(),
+            tenant,
+            identity_id,
+            source_ref,
+            52_000 + i64::try_from(index)?,
+            8,
+            Some(status),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            cleanup_batch(&cleanup, tenant, Category::TenantEvents).await?,
+            Some(0)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tenant_events WHERE id = $1")
+                .bind(event_id)
+                .fetch_one(admin.raw())
+                .await?,
+            1
+        );
+    }
+
+    let (done_event, done_task) = seed_event(
+        admin.raw(),
+        tenant,
+        identity_id,
+        source_ref,
+        53_000,
+        8,
+        Some("DONE"),
+        Some(100),
+    )
+    .await?;
+    let (dead_event, dead_task) = seed_event(
+        admin.raw(),
+        tenant,
+        identity_id,
+        source_ref,
+        53_001,
+        8,
+        Some("DEAD"),
+        None,
+    )
+    .await?;
+    sqlx::query("UPDATE delivery_tasks SET updated_at = clock_timestamp() - interval '100 days' WHERE id = $1")
+        .bind(done_task)
+        .execute(admin.raw())
+        .await?;
+    sqlx::query("UPDATE delivery_tasks SET updated_at = clock_timestamp() - interval '31 days' WHERE id = $1")
+        .bind(dead_task)
+        .execute(admin.raw())
+        .await?;
+    assert_eq!(
+        cleanup_batch(&cleanup, tenant, Category::TenantEvents).await?,
+        Some(2)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT tenant_event_id FROM delivery_tasks WHERE id = $1",
+        )
+        .bind(done_task)
+        .fetch_one(admin.raw())
+        .await?,
+        None
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT tenant_event_id FROM delivery_tasks WHERE id = $1",
+        )
+        .bind(dead_task)
+        .fetch_one(admin.raw())
+        .await?,
+        None
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM delivery_logs WHERE task_id = $1")
+            .bind(done_task)
+            .fetch_one(admin.raw())
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tenant_events WHERE id IN ($1, $2)")
+            .bind(done_event)
+            .bind(dead_event)
+            .fetch_one(admin.raw())
+            .await?,
+        0
+    );
+    assert_eq!(
+        cleanup_batch(&cleanup, tenant, Category::DeliveryTasks).await?,
+        Some(1)
+    );
+    assert_eq!(
+        cleanup_batch(&cleanup, tenant, Category::DeliveryLogs).await?,
+        Some(2)
+    );
+    assert_eq!(
+        cleanup_batch(&cleanup, tenant, Category::DeliveryTasks).await?,
+        Some(1)
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn event_retention_rejects_unknown_plan_and_delivery_waits_for_cleanup_lock(
+    injected: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (app, admin) = support::pools(injected).await;
+    let cleanup = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(
+            admin
+                .raw()
+                .connect_options()
+                .as_ref()
+                .clone()
+                .username("tenant_cleanup")
+                .password("tcpw"),
+        )
+        .await?;
+    let tenant: TenantId = sqlx::query_scalar(
+        "INSERT INTO tenants (name, owner_user_id, plan, status)
+         VALUES ('retention-lock', 91004, 'free', 'active')
+         RETURNING id",
+    )
+    .fetch_one(admin.raw())
+    .await?;
+    let identity_id: IdentityId = sqlx::query_scalar(
+        "INSERT INTO identities (tenant_id, kind) VALUES ($1, 'bot') RETURNING id",
+    )
+    .bind(tenant.get())
+    .fetch_one(admin.raw())
+    .await?;
+    let source_ref: i64 = sqlx::query_scalar(
+        "INSERT INTO source_subscriptions (tenant_id, tg_chat_id, receiver_identity_id)
+         VALUES ($1, -2200, $2) RETURNING id",
+    )
+    .bind(tenant.get())
+    .bind(identity_id)
+    .fetch_one(admin.raw())
+    .await?;
+    let (event_id, _) = seed_event(
+        admin.raw(),
+        tenant,
+        identity_id.get(),
+        source_ref,
+        54_000,
+        8,
+        None,
+        None,
+    )
+    .await?;
+    let mut owner = admin.raw().begin().await?;
+    sqlx::raw_sql(
+        "SET LOCAL ROLE tgm_owner;
+         ALTER TABLE tenants DROP CONSTRAINT tenants_plan_check;",
+    )
+    .execute(&mut *owner)
+    .await?;
+    sqlx::query("UPDATE tenants SET plan = 'legacy' WHERE id = $1")
+        .bind(tenant.get())
+        .execute(&mut *owner)
+        .await?;
+    sqlx::raw_sql(
+        "ALTER TABLE tenants ADD CONSTRAINT tenants_plan_check CHECK (plan IN ('free','pro','legacy')) NOT VALID;
+         RESET ROLE;",
+    )
+    .execute(&mut *owner)
+    .await?;
+    owner.commit().await?;
+    let error = match cleanup_batch(&cleanup, tenant, Category::TenantEvents).await {
+        Ok(value) => return Err(format!("未知套餐意外清理出 {value:?}").into()),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        tgm_db::tenant_retention::RetentionError::InvalidPlan
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tenant_events WHERE id = $1")
+            .bind(event_id)
+            .fetch_one(admin.raw())
+            .await?,
+        1
+    );
+
+    let mut held = cleanup.begin().await?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.get().to_string())
+        .execute(&mut *held)
+        .await?;
+    assert!(tgm_db::tenant_retention::try_lock(&mut held, tenant, Category::TenantEvents).await?);
+    let pending = tokio::spawn({
+        let app = app.clone();
+        async move { tgm_db::repo::claim_due_delivery_task(&app, tenant, identity_id).await }
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+               SELECT 1 FROM pg_locks locks
+               JOIN pg_stat_activity activity ON activity.pid = locks.pid
+               WHERE activity.datname = current_database()
+                 AND activity.usename = 'app_user'
+                 AND NOT locks.granted
+             )",
+        )
+        .fetch_one(admin.raw())
+        .await?;
+        if waiting {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "投递入口未等待清理共享锁"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    held.rollback().await?;
+    assert!(pending.await??.is_none());
+    Ok(())
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]
@@ -472,6 +864,10 @@ async fn c9_rejects_extra_missing_and_grantable_permissions(
         (
             "REVOKE SELECT (rule_version) ON delivery_tasks FROM tenant_cleanup",
             "GRANT SELECT (rule_version) ON delivery_tasks TO tenant_cleanup",
+        ),
+        (
+            "REVOKE UPDATE (tenant_event_id) ON delivery_tasks FROM tenant_cleanup",
+            "GRANT UPDATE (tenant_event_id) ON delivery_tasks TO tenant_cleanup",
         ),
         (
             "GRANT SELECT (snapshot) ON rule_versions TO tenant_cleanup",

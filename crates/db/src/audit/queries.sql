@@ -586,6 +586,7 @@ SELECT q::text FROM (
                         'rule_version', 'target_tg_chat_id', 'sender_identity_id',
                         'action', 'telegram_random_id', 'payload_snapshot', 'idem_key')
      AND has_column_privilege(rr.oid, att.attrelid, att.attnum, 'UPDATE')
+     AND NOT (rr.rolname = 'tenant_cleanup' AND att.attname = 'tenant_event_id')
    ORDER BY 1, 2
 ) q;
 
@@ -744,8 +745,15 @@ WITH cleaner AS (
          ('tenants', 'plan', 'SELECT'),
          ('delivery_tasks', 'id', 'SELECT'),
          ('delivery_tasks', 'tenant_id', 'SELECT'),
+         ('delivery_tasks', 'tenant_event_id', 'SELECT'),
+         ('delivery_tasks', 'tenant_event_id', 'UPDATE'),
+         ('delivery_tasks', 'status', 'SELECT'),
+         ('delivery_tasks', 'updated_at', 'SELECT'),
          ('delivery_tasks', 'rule_id', 'SELECT'),
          ('delivery_tasks', 'rule_version', 'SELECT'),
+         ('tenant_events', 'tenant_id', 'SELECT'),
+         ('tenant_events', 'id', 'SELECT'),
+         ('tenant_events', 'created_at', 'SELECT'),
          ('rules', 'tenant_id', 'SELECT'),
          ('rules', 'id', 'SELECT'),
          ('rules', 'version', 'SELECT'),
@@ -801,7 +809,7 @@ WITH cleaner AS (
    WHERE c.relkind IN ('r','p','v','m','f') AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
      AND (CASE WHEN privilege = 'MAINTAIN' AND current_setting('server_version_num')::int < 170000
                THEN false ELSE has_table_privilege(r.oid, c.oid, privilege) END) <>
-       (n.nspname = 'public' AND c.relname IN ('login_sessions','notify_dedup','bot_console_updates','delivery_logs','audit_logs','system_logs','rule_versions') AND privilege = 'DELETE')
+       (n.nspname = 'public' AND c.relname IN ('tenant_events','delivery_tasks','login_sessions','notify_dedup','bot_console_updates','delivery_logs','audit_logs','system_logs','rule_versions') AND privilege = 'DELETE')
   UNION ALL
   SELECT '表权限不得转授: ' || n.nspname || '.' || c.relname
     FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace

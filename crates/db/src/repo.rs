@@ -3730,6 +3730,7 @@ pub async fn enqueue_delivery_tasks(
     crate::tenant::tenant_tx_with_error(pool, tenant, |conn| {
         Box::pin(async move {
             crate::tenant_retention::lock_rule_versions(conn, tenant).await?;
+            crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             sqlx::query_scalar::<_, i64>(
                 "SELECT id FROM tenant_events WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
             )
@@ -3913,6 +3914,7 @@ pub async fn claim_due_delivery_task(
 ) -> Result<Option<DeliveryTaskRecord>, sqlx::Error> {
     tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             sqlx::query_as::<_, DeliveryTaskRecord>(
                 r#"
                 WITH candidate AS (
@@ -3920,6 +3922,7 @@ pub async fn claim_due_delivery_task(
                       FROM delivery_tasks
                      WHERE tenant_id = $1
                        AND sender_identity_id = $2
+                       AND tenant_event_id IS NOT NULL
                        AND telegram_random_id IS NOT NULL
                        AND payload_snapshot IS NOT NULL
                        AND status IN ('PENDING', 'FAILED')
@@ -4052,6 +4055,7 @@ pub async fn recover_stale_delivery_tasks(
 ) -> Result<u64, sqlx::Error> {
     tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             let updated = sqlx::query(
                 r#"
                 UPDATE delivery_tasks
@@ -4060,6 +4064,7 @@ pub async fn recover_stale_delivery_tasks(
                        updated_at = clock_timestamp()
                  WHERE tenant_id = $1
                    AND sender_identity_id = $2
+                   AND tenant_event_id IS NOT NULL
                    AND telegram_random_id IS NOT NULL
                    AND payload_snapshot IS NOT NULL
                    AND status = 'SENDING'
@@ -4240,6 +4245,7 @@ pub async fn retry_delivery_task(
 ) -> Result<bool, sqlx::Error> {
     tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             let updated = sqlx::query(
                 r#"
                 UPDATE delivery_tasks
@@ -4250,6 +4256,7 @@ pub async fn retry_delivery_task(
                        updated_at = clock_timestamp()
                  WHERE tenant_id = $1
                    AND id = $2
+                   AND tenant_event_id IS NOT NULL
                    AND status IN ('DEAD', 'FAILED')
                 "#,
             )
@@ -4353,6 +4360,7 @@ pub async fn complete_delivery_task(
 ) -> Result<bool, sqlx::Error> {
     tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             let attempt = sqlx::query_scalar::<_, i32>(
                 r#"
                 UPDATE delivery_tasks
@@ -4402,6 +4410,7 @@ pub async fn record_delivery_failure(
     tenant_tx(pool, tenant, |conn| {
         let status = failure.status.as_str();
         Box::pin(async move {
+            crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             let updated = sqlx::query_as::<_, DeliveryTaskFailureWrite>(
                 r#"
                 UPDATE delivery_tasks
@@ -4833,6 +4842,7 @@ pub async fn defer_delivery_task(
 ) -> Result<bool, sqlx::Error> {
     tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             let updated = sqlx::query(
                 r#"
                 UPDATE delivery_tasks
