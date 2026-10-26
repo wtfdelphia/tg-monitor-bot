@@ -743,6 +743,10 @@ WITH cleaner AS (
 ), allowed_columns(tbl, col, privilege) AS (
   VALUES ('tenants', 'id', 'SELECT'),
          ('tenants', 'plan', 'SELECT'),
+         ('tenant_notifications', 'tenant_id', 'SELECT'),
+         ('tenant_notifications', 'id', 'SELECT'),
+         ('tenant_notifications', 'status', 'SELECT'),
+         ('tenant_notifications', 'terminal_at', 'SELECT'),
          ('delivery_tasks', 'id', 'SELECT'),
          ('delivery_tasks', 'tenant_id', 'SELECT'),
          ('delivery_tasks', 'tenant_event_id', 'SELECT'),
@@ -815,7 +819,7 @@ WITH cleaner AS (
    WHERE c.relkind IN ('r','p','v','m','f') AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
      AND (CASE WHEN privilege = 'MAINTAIN' AND current_setting('server_version_num')::int < 170000
                THEN false ELSE has_table_privilege(r.oid, c.oid, privilege) END) <>
-       (n.nspname = 'public' AND c.relname IN ('tenant_events','delivery_tasks','login_sessions','notify_dedup','bot_console_updates','delivery_logs','audit_logs','system_logs','rule_versions') AND privilege = 'DELETE')
+       (n.nspname = 'public' AND c.relname IN ('tenant_events','delivery_tasks','login_sessions','notify_dedup','bot_console_updates','delivery_logs','audit_logs','system_logs','rule_versions','tenant_notifications') AND privilege = 'DELETE')
   UNION ALL
   SELECT '表权限不得转授: ' || n.nspname || '.' || c.relname
     FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace

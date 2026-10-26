@@ -5401,11 +5401,23 @@ pub async fn record_tenant_notification(
 ) -> Result<bool, sqlx::Error> {
     tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            if sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM tenant_notifications WHERE tenant_id = $1 AND id = $2 AND status = 'PENDING' FOR UPDATE",
+            )
+            .bind(tenant.get())
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .is_none()
+            {
+                return Ok(false);
+            }
             let updated = match outcome {
                 TenantNotificationOutcome::Sent => {
                     sqlx::query(
                         "UPDATE tenant_notifications
-                            SET status = 'SENT', sent_at = clock_timestamp(),
+                            SET status = 'SENT', sent_at = statement_timestamp(),
+                                terminal_at = statement_timestamp(),
                                 attempt_count = attempt_count + 1, last_error_code = NULL
                           WHERE tenant_id = $1 AND id = $2 AND status = 'PENDING'",
                     )
@@ -5434,7 +5446,8 @@ pub async fn record_tenant_notification(
                 TenantNotificationOutcome::Dead { error_code } => {
                     sqlx::query(
                         "UPDATE tenant_notifications
-                            SET status = 'DEAD', attempt_count = attempt_count + 1,
+                            SET status = 'DEAD', terminal_at = statement_timestamp(),
+                                attempt_count = attempt_count + 1,
                                 last_error_code = $3
                           WHERE tenant_id = $1 AND id = $2 AND status = 'PENDING'",
                     )

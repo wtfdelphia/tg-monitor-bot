@@ -486,10 +486,12 @@ async fn notifications_are_tenant_isolated(admin: PgPool) {
         .await
         .expect("查询失败");
     assert_eq!(visible, 0);
-    let updated = sqlx::query("UPDATE tenant_notifications SET status = 'SENT', sent_at = now()")
-        .execute(&mut *tx)
-        .await
-        .expect("更新失败");
+    let updated = sqlx::query(
+        "UPDATE tenant_notifications SET status = 'SENT', sent_at = now(), terminal_at = now()",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("更新失败");
     assert_eq!(updated.rows_affected(), 0);
     let forged = sqlx::query(
         "INSERT INTO tenant_notifications (tenant_id, kind, identity_id) VALUES ($1, 'identity.banned', $2)",
