@@ -3701,6 +3701,8 @@ async fn task_router_lists_details_filters_tenants_and_retries_failed_tasks(admi
     let tenant_b = support::seed_tenant(&admin, "task-tenant-b", 5402).await;
     let identity_a = support::seed_identity(&admin, tenant_a).await;
     let identity_b = support::seed_identity(&admin, tenant_b).await;
+    let source_a = support::seed_source(&admin, tenant_a, identity_a, -5401, "Task A").await;
+    let source_b = support::seed_source(&admin, tenant_b, identity_b, -5420, "Task B").await;
 
     let target_a: i64 = sqlx::query_scalar(
         "INSERT INTO target_channels (tenant_id, tg_chat_id, sender_identity_id, enabled)
@@ -3756,16 +3758,60 @@ async fn task_router_lists_details_filters_tenants_and_retries_failed_tasks(admi
     .await
     .expect("创建任务测试新规则快照失败");
 
+    let canonical_event_a: i64 = sqlx::query_scalar(
+        "INSERT INTO canonical_events
+            (adapter, receiver_identity_id, tg_chat_id, tg_message_id, message_date)
+         VALUES ('bot', $1, -5410, 1, clock_timestamp())
+         RETURNING id",
+    )
+    .bind(identity_a)
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建租户 A 规范化事件失败");
+    let tenant_event_a: i64 = sqlx::query_scalar(
+        "INSERT INTO tenant_events (tenant_id, canonical_event_id, source_ref)
+         VALUES ($1, $2, $3)
+         RETURNING id",
+    )
+    .bind(tenant_a)
+    .bind(canonical_event_a)
+    .bind(source_a)
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建租户 A 事件失败");
+    let canonical_event_b: i64 = sqlx::query_scalar(
+        "INSERT INTO canonical_events
+            (adapter, receiver_identity_id, tg_chat_id, tg_message_id, message_date)
+         VALUES ('bot', $1, -5420, 1, clock_timestamp())
+         RETURNING id",
+    )
+    .bind(identity_b)
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建租户 B 规范化事件失败");
+    let tenant_event_b: i64 = sqlx::query_scalar(
+        "INSERT INTO tenant_events (tenant_id, canonical_event_id, source_ref)
+         VALUES ($1, $2, $3)
+         RETURNING id",
+    )
+    .bind(tenant_b)
+    .bind(canonical_event_b)
+    .bind(source_b)
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建租户 B 事件失败");
+
     let task_a1: i64 = sqlx::query_scalar(
         "INSERT INTO delivery_tasks
-            (tenant_id, rule_id, rule_version, target_tg_chat_id, sender_identity_id, action,
+            (tenant_id, tenant_event_id, rule_id, rule_version, target_tg_chat_id, sender_identity_id, action,
              status, attempt_count, last_error_code, created_at, updated_at, idem_key)
-         VALUES ($1, $2, 1, -5410, $3, 'COPY', 'DEAD', 2, 'TIMEOUT',
+         VALUES ($1, $2, $3, 1, -5410, $4, 'COPY', 'DEAD', 2, 'TIMEOUT',
                  clock_timestamp() - interval '2 minutes',
                  clock_timestamp() - interval '2 minutes', 'task-a1')
          RETURNING id",
     )
     .bind(tenant_a)
+    .bind(tenant_event_a)
     .bind(rule_a)
     .bind(identity_a)
     .fetch_one(admin.raw())
@@ -3773,14 +3819,15 @@ async fn task_router_lists_details_filters_tenants_and_retries_failed_tasks(admi
     .expect("创建租户 A 死信任务失败");
     let _task_a2: i64 = sqlx::query_scalar(
         "INSERT INTO delivery_tasks
-            (tenant_id, rule_id, rule_version, target_tg_chat_id, sender_identity_id, action,
+            (tenant_id, tenant_event_id, rule_id, rule_version, target_tg_chat_id, sender_identity_id, action,
              status, attempt_count, created_at, updated_at, idem_key)
-         VALUES ($1, $2, 1, -5411, $3, 'COPY', 'FAILED', 1,
+         VALUES ($1, $2, $3, 1, -5411, $4, 'COPY', 'FAILED', 1,
                  clock_timestamp() - interval '1 minute',
                  clock_timestamp() - interval '1 minute', 'task-a2')
          RETURNING id",
     )
     .bind(tenant_a)
+    .bind(tenant_event_a)
     .bind(rule_a)
     .bind(identity_a)
     .fetch_one(admin.raw())
@@ -3788,11 +3835,12 @@ async fn task_router_lists_details_filters_tenants_and_retries_failed_tasks(admi
     .expect("创建租户 A 失败任务失败");
     let task_b: i64 = sqlx::query_scalar(
         "INSERT INTO delivery_tasks
-            (tenant_id, target_tg_chat_id, sender_identity_id, action, status, idem_key)
-         VALUES ($1, -5420, $2, 'COPY', 'DEAD', 'task-b1')
+            (tenant_id, tenant_event_id, target_tg_chat_id, sender_identity_id, action, status, idem_key)
+         VALUES ($1, $2, -5420, $3, 'COPY', 'DEAD', 'task-b1')
          RETURNING id",
     )
     .bind(tenant_b)
+    .bind(tenant_event_b)
     .bind(identity_b)
     .fetch_one(admin.raw())
     .await

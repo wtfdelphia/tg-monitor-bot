@@ -36,6 +36,8 @@ async fn cli_uses_only_cleanup_identity_redacts_failures_and_stops_on_sigterm(
         .execute(&admin)
         .await?;
     for category in [
+        "tenant-events",
+        "delivery-tasks",
         "login-sessions",
         "notify-dedup",
         "bot-console-updates",
@@ -162,6 +164,8 @@ fn scheduling_units_keep_tenant_cleanup_credentials_separate() -> Result<()> {
         assert!(service.contains(required));
     }
     for (category, calendar) in [
+        ("tenant-events", "daily"),
+        ("delivery-tasks", "daily"),
         ("login-sessions", "*-*-* *:00/10:00"),
         ("notify-dedup", "hourly"),
         ("bot-console-updates", "daily"),

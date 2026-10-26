@@ -195,6 +195,38 @@ async fn frozen_requests_survive_subprocess_kill_before_and_after_simulated_send
     .fetch_one(&admin)
     .await
     .expect("创建身份失败");
+    let source_ref: i64 = sqlx::query_scalar(
+        "INSERT INTO source_subscriptions
+            (tenant_id, tg_chat_id, receiver_identity_id)
+         VALUES ($1, -1001, $2)
+         RETURNING id",
+    )
+    .bind(tenant)
+    .bind(sender)
+    .fetch_one(&admin)
+    .await
+    .expect("创建来源失败");
+    let canonical_event_id: i64 = sqlx::query_scalar(
+        "INSERT INTO canonical_events
+            (adapter, receiver_identity_id, tg_chat_id, tg_message_id, message_date)
+         VALUES ('mtproto', $1, -1001, 42, clock_timestamp())
+         RETURNING id",
+    )
+    .bind(sender)
+    .fetch_one(&admin)
+    .await
+    .expect("创建规范化事件失败");
+    let tenant_event_id: i64 = sqlx::query_scalar(
+        "INSERT INTO tenant_events (tenant_id, canonical_event_id, source_ref)
+         VALUES ($1, $2, $3)
+         RETURNING id",
+    )
+    .bind(tenant)
+    .bind(canonical_event_id)
+    .bind(source_ref)
+    .fetch_one(&admin)
+    .await
+    .expect("创建租户事件失败");
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("读取时间失败")
@@ -205,13 +237,22 @@ async fn frozen_requests_survive_subprocess_kill_before_and_after_simulated_send
             std::process::id()
         )));
         std::fs::create_dir(&directory.0).expect("创建检查点目录失败");
-        let task_id: i64 = sqlx::query_scalar("INSERT INTO delivery_tasks
-            (tenant_id, sender_identity_id, target_tg_chat_id, action, telegram_random_id, payload_snapshot)
-            VALUES ($1, $2, -2001, 'COPY', 1234567, $3) RETURNING id")
-            .bind(tenant).bind(sender).bind(json!({
-                "source": {"tg_chat_id": -1001, "tg_message_id": 42, "media_type": "TEXT"},
-                "message": {"text": "frozen &lt;message&gt;", "parse_mode": "HTML"}
-            })).fetch_one(&admin).await.expect("创建快照任务失败");
+        let task_id: i64 = sqlx::query_scalar(
+            "INSERT INTO delivery_tasks
+            (tenant_id, tenant_event_id, sender_identity_id, target_tg_chat_id, action,
+             telegram_random_id, payload_snapshot)
+            VALUES ($1, $2, $3, -2001, 'COPY', 1234567, $4) RETURNING id",
+        )
+        .bind(tenant)
+        .bind(tenant_event_id)
+        .bind(sender)
+        .bind(json!({
+            "source": {"tg_chat_id": -1001, "tg_message_id": 42, "media_type": "TEXT"},
+            "message": {"text": "frozen &lt;message&gt;", "parse_mode": "HTML"}
+        }))
+        .fetch_one(&admin)
+        .await
+        .expect("创建快照任务失败");
         let mut first = RestartProcess::start(&url, tenant, &directory.0, phase);
         let marker = match phase {
             "before-send" => "before-send.payload",
@@ -258,6 +299,11 @@ async fn frozen_requests_survive_subprocess_kill_before_and_after_simulated_send
                 .await
                 .expect("读取完成状态失败");
         assert_eq!(completed, ("DONE".to_owned(), Some(9877)));
+        sqlx::query("DELETE FROM delivery_logs WHERE task_id = $1")
+            .bind(task_id)
+            .execute(&admin)
+            .await
+            .expect("清理投递日志失败");
         sqlx::query("DELETE FROM delivery_tasks WHERE id = $1")
             .bind(task_id)
             .execute(&admin)
