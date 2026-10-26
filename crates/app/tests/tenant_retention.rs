@@ -4,6 +4,61 @@ use tgm_core::ids::TenantId;
 use tgm_db::tenant_retention::Category;
 
 #[sqlx::test(migrations = "../../migrations-test")]
+async fn notification_batches_preserve_pending_and_resume(
+    admin: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::raw_sql("INSERT INTO tenants (name,owner_user_id,status) VALUES ('notification-batch',99351,'suspended');
+        INSERT INTO identities (tenant_id,kind) SELECT id,'bot' FROM tenants;
+        INSERT INTO tenant_notifications (tenant_id,identity_id,kind,status,terminal_at)
+          SELECT identities.tenant_id,identities.id,'identity.banned','DEAD',now()-interval '100 days' FROM identities CROSS JOIN generate_series(1,5001);
+        INSERT INTO tenant_notifications (tenant_id,identity_id,kind,created_at)
+          SELECT identities.tenant_id,identities.id,'identity.banned',now()-interval '400 days' FROM identities;")
+        .execute(&admin).await?;
+    let cleanup = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            admin
+                .connect_options()
+                .as_ref()
+                .clone()
+                .username("tenant_cleanup")
+                .password("tcpw"),
+        )
+        .await?;
+    let started = Instant::now();
+    let result = tgm_app::tenant_retention::run(
+        &cleanup,
+        Category::TenantNotifications,
+        std::future::pending(),
+    )
+    .await?;
+    assert_eq!(
+        (result.deleted, result.batches, result.tenants),
+        (5001, 2, 1)
+    );
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM tenant_notifications WHERE status='PENDING'"
+        )
+        .fetch_one(&admin)
+        .await?,
+        1
+    );
+    let counts:Vec<i64>=sqlx::query_scalar("SELECT (context->>'rows')::bigint FROM system_logs WHERE context->>'table'='tenant_notifications' ORDER BY id").fetch_all(&admin).await?;
+    assert_eq!(counts, vec![5000, 1]);
+    let rerun = tgm_app::tenant_retention::run(
+        &cleanup,
+        Category::TenantNotifications,
+        std::future::pending(),
+    )
+    .await?;
+    assert_eq!(rerun.deleted, 0);
+    cleanup.close().await;
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn paginated_all_status_cleanup_waits_skips_overlap_and_cancels_locked_query(
     admin: PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {

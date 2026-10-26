@@ -17,6 +17,7 @@ pub enum Category {
     AuditLogs,
     SystemLogs,
     RuleVersions,
+    TenantNotifications,
 }
 
 impl Category {
@@ -32,6 +33,7 @@ impl Category {
             Self::AuditLogs => "audit_logs",
             Self::SystemLogs => "system_logs",
             Self::RuleVersions => "rule_versions",
+            Self::TenantNotifications => "tenant_notifications",
         }
     }
 }
@@ -203,6 +205,17 @@ async fn delete_expired(
     cutoff: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,
 ) -> Result<u64, sqlx::Error> {
     let query = match category {
+        Category::TenantNotifications => {
+            "WITH candidates AS MATERIALIZED (
+                SELECT tenant_id, id FROM tenant_notifications
+                WHERE tenant_id = $1 AND status IN ('SENT', 'DEAD')
+                  AND terminal_at <= $3::timestamptz - interval '90 days'
+                ORDER BY terminal_at, id LIMIT $2
+            ) DELETE FROM tenant_notifications target USING candidates
+              WHERE target.tenant_id = candidates.tenant_id AND target.id = candidates.id
+                AND target.status IN ('SENT', 'DEAD')
+                AND target.terminal_at <= $3::timestamptz - interval '90 days'"
+        }
         Category::UnmatchedEvents => {
             "WITH candidates AS MATERIALIZED (
                 SELECT events.tenant_id, events.id FROM tenant_events events
@@ -297,6 +310,8 @@ mod tests {
                     "INSERT INTO delivery_logs (task_id,attempt,ok,created_at) SELECT id,1,true,$2::timestamptz-interval '90 days' FROM delivery_tasks WHERE tenant_id=$1",
                     "INSERT INTO audit_logs (tenant_id,action,resource,created_at) SELECT id,'boundary','sentinel',$2::timestamptz-CASE plan WHEN 'free' THEN interval '90 days' WHEN 'pro' THEN interval '365 days' END FROM tenants WHERE id=$1",
                     "INSERT INTO system_logs (tenant_id,level,module,event,created_at) VALUES ($1,'INFO','boundary','sentinel',$2::timestamptz-interval '90 days')",
+                    "INSERT INTO tenant_notifications (tenant_id,identity_id,kind,status,sent_at,terminal_at) SELECT tenant_id,id,'identity.banned','SENT',$2::timestamptz-interval '90 days',$2::timestamptz-interval '90 days' FROM identities WHERE tenant_id=$1",
+                    "INSERT INTO tenant_notifications (tenant_id,identity_id,kind,status,terminal_at) SELECT tenant_id,id,'identity.banned','DEAD',$2::timestamptz-interval '90 days' FROM identities WHERE tenant_id=$1",
                     "INSERT INTO rule_versions (tenant_id,rule_id,version,snapshot,created_at) SELECT rules.tenant_id,rules.id,$3::bigint::int+1,'{}',$2::timestamptz-CASE tenants.plan WHEN 'free' THEN interval '90 days' WHEN 'pro' THEN interval '365 days' END FROM rules JOIN tenants ON tenants.id=rules.tenant_id WHERE rules.tenant_id=$1",
                 ] {
                     let extra_parameter = query.contains("$3");
@@ -328,6 +343,16 @@ mod tests {
                     "{category:?}"
                 );
             }
+            assert_eq!(
+                delete_expired(
+                    &mut transaction,
+                    tenant,
+                    Category::TenantNotifications,
+                    cutoff
+                )
+                .await?,
+                2
+            );
             transaction.commit().await?;
         }
         Ok(())

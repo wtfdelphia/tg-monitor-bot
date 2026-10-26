@@ -36,6 +36,7 @@ async fn cli_uses_only_cleanup_identity_redacts_failures_and_stops_on_sigterm(
         .execute(&admin)
         .await?;
     for category in [
+        "tenant-notifications",
         "unmatched-events",
         "tenant-events",
         "delivery-tasks",
@@ -165,6 +166,7 @@ fn scheduling_units_keep_tenant_cleanup_credentials_separate() -> Result<()> {
         assert!(service.contains(required));
     }
     for (category, calendar) in [
+        ("tenant-notifications", "daily"),
         ("tenant-events", "daily"),
         ("delivery-tasks", "daily"),
         ("login-sessions", "*-*-* *:00/10:00"),
@@ -180,6 +182,81 @@ fn scheduling_units_keep_tenant_cleanup_credentials_separate() -> Result<()> {
         assert!(timer.contains(&format!("Unit=tgm-tenant-cleanup@{category}.service\n")));
         assert!(timer.contains("Persistent=true"));
     }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn notification_cli_cancels_locked_batch_and_resumes(admin: PgPool) -> Result<()> {
+    sqlx::raw_sql(
+        "INSERT INTO tenants (name,owner_user_id) VALUES ('notification-cli',99352);
+        INSERT INTO identities (tenant_id,kind) SELECT id,'bot' FROM tenants;
+        INSERT INTO tenant_notifications (tenant_id,identity_id,kind,status,terminal_at)
+          SELECT identities.tenant_id,identities.id,'identity.banned','DEAD',now()-interval '100 days' FROM identities;",
+    )
+    .execute(&admin)
+    .await?;
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&admin)
+        .await?;
+    let url = format!(
+        "postgres://tenant_cleanup:tcpw@127.0.0.1:55432/{database}?application_name=tgm-notification-retention-cli"
+    );
+    let mut held = admin.begin().await?;
+    sqlx::query("SELECT id FROM tenant_notifications FOR UPDATE")
+        .execute(&mut *held)
+        .await?;
+    let mut process = CleanupProcess(
+        command(&url, "tenant-notifications")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let waiting:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks locks JOIN pg_stat_activity activity ON activity.pid=locks.pid WHERE activity.datname=current_database() AND activity.application_name='tgm-notification-retention-cli' AND NOT locks.granted)").fetch_one(&admin).await?;
+        if waiting {
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "通知清理未等待行锁");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    anyhow::ensure!(
+        Command::new("kill")
+            .args(["-TERM", &process.0.id().to_string()])
+            .status()?
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = process.0.try_wait()? {
+            assert!(status.success());
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "通知清理未及时停止");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    held.rollback().await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tenant_notifications")
+            .fetch_one(&admin)
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM system_logs WHERE context->>'table'='tenant_notifications'"
+        )
+        .fetch_one(&admin)
+        .await?,
+        0
+    );
+    let output = command(&url, "tenant-notifications").output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("deleted=1"));
     Ok(())
 }
 
