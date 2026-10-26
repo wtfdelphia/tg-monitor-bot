@@ -7,6 +7,7 @@ pub const TENANT_PAGE_LIMIT: i64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
+    UnmatchedEvents,
     TenantEvents,
     DeliveryTasks,
     LoginSessions,
@@ -21,6 +22,7 @@ pub enum Category {
 impl Category {
     pub fn table(self) -> &'static str {
         match self {
+            Self::UnmatchedEvents => "tenant_events",
             Self::TenantEvents => "tenant_events",
             Self::DeliveryTasks => "delivery_tasks",
             Self::LoginSessions => "login_sessions",
@@ -69,6 +71,27 @@ pub async fn list_tenants(pool: &PgPool, after: i64) -> Result<Vec<TenantId>, Re
     )
 }
 
+pub async fn retained_unmatched(pool: &PgPool, tenant: TenantId) -> Result<u64, RetentionError> {
+    let mut connection = pool.acquire().await?;
+    connection.close_on_drop();
+    let mut transaction = sqlx::Connection::begin(&mut *connection).await?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.get().to_string())
+        .execute(&mut *transaction)
+        .await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM tenant_events events
+         JOIN canonical_events parent ON parent.id = events.canonical_event_id
+         WHERE events.tenant_id = $1 AND NOT events.matched
+           AND parent.created_at < statement_timestamp() - interval '24 hours'",
+    )
+    .bind(tenant.get())
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(count.cast_unsigned())
+}
+
 pub async fn try_lock(
     connection: &mut PgConnection,
     tenant: TenantId,
@@ -81,7 +104,10 @@ pub async fn try_lock(
 }
 
 fn lock_key(tenant: TenantId, category: Category) -> String {
-    if matches!(category, Category::TenantEvents | Category::DeliveryTasks) {
+    if matches!(
+        category,
+        Category::UnmatchedEvents | Category::TenantEvents | Category::DeliveryTasks
+    ) {
         return format!("tenant_retention:{}:event_lifecycle", tenant.get());
     }
     format!("tenant_retention:{}:{}", tenant.get(), category.table())
@@ -133,7 +159,10 @@ pub async fn cleanup_batch(
     let mut transaction = sqlx::Connection::begin(&mut *connection).await?;
     if matches!(
         category,
-        Category::RuleVersions | Category::TenantEvents | Category::DeliveryTasks
+        Category::UnmatchedEvents
+            | Category::RuleVersions
+            | Category::TenantEvents
+            | Category::DeliveryTasks
     ) {
         check_isolation(&mut transaction).await?;
     }
@@ -174,6 +203,21 @@ async fn delete_expired(
     cutoff: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,
 ) -> Result<u64, sqlx::Error> {
     let query = match category {
+        Category::UnmatchedEvents => {
+            "WITH candidates AS MATERIALIZED (
+                SELECT events.tenant_id, events.id FROM tenant_events events
+                JOIN canonical_events parent ON parent.id = events.canonical_event_id
+                WHERE events.tenant_id = $1 AND events.processed_at IS NOT NULL AND NOT events.matched
+                  AND parent.fanned_out AND parent.created_at < $3::timestamptz - interval '24 hours'
+                  AND NOT EXISTS (SELECT 1 FROM delivery_tasks task WHERE task.tenant_id = events.tenant_id AND task.tenant_event_id = events.id)
+                ORDER BY parent.created_at, parent.id, events.id LIMIT $2
+            ) DELETE FROM tenant_events target USING candidates, canonical_events parent
+              WHERE target.tenant_id = candidates.tenant_id AND target.id = candidates.id
+                AND target.processed_at IS NOT NULL AND NOT target.matched
+                AND parent.id = target.canonical_event_id AND parent.fanned_out
+                AND parent.created_at < $3::timestamptz - interval '24 hours'
+                AND NOT EXISTS (SELECT 1 FROM delivery_tasks task WHERE task.tenant_id = target.tenant_id AND task.tenant_event_id = target.id)"
+        }
         Category::LoginSessions => {
             "WITH candidates AS MATERIALIZED (SELECT tenant_id, id FROM login_sessions WHERE tenant_id = $1 AND expires_at <= $3 ORDER BY expires_at, id LIMIT $2) DELETE FROM login_sessions target USING candidates WHERE target.tenant_id = candidates.tenant_id AND target.id = candidates.id AND target.expires_at <= $3"
         }
@@ -286,6 +330,62 @@ mod tests {
             }
             transaction.commit().await?;
         }
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations-test")]
+    async fn unmatched_cutoff_uses_original_event_age_and_strict_boundary(
+        admin: PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::raw_sql(
+            "INSERT INTO tenants (name,owner_user_id) VALUES ('short-boundary',99111);
+            INSERT INTO identities (kind) VALUES ('mtproto');
+            INSERT INTO source_subscriptions (tenant_id,tg_chat_id,receiver_identity_id)
+                SELECT tenants.id,-1001,identities.id FROM tenants CROSS JOIN identities;",
+        )
+        .execute(&admin)
+        .await?;
+        let tenant: TenantId = sqlx::query_scalar("SELECT id FROM tenants")
+            .fetch_one(&admin)
+            .await?;
+        let cutoff: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc> =
+            sqlx::query_scalar("SELECT statement_timestamp()")
+                .fetch_one(&admin)
+                .await?;
+        for offset in [-1_i64, 0, 1] {
+            sqlx::query("INSERT INTO canonical_events (adapter,receiver_identity_id,tg_chat_id,tg_message_id,message_date,created_at,fanned_out)
+                SELECT 'mtproto',id,-1001,$1,now(),$2::timestamptz-interval '24 hours'+$3*interval '1 microsecond',true FROM identities")
+                .bind(offset+10).bind(cutoff).bind(offset).execute(&admin).await?;
+        }
+        sqlx::raw_sql("INSERT INTO tenant_events (tenant_id,canonical_event_id,source_ref,processed_at,created_at)
+            SELECT sources.tenant_id,events.id,sources.id,now(),now() FROM canonical_events events CROSS JOIN source_subscriptions sources;")
+            .execute(&admin).await?;
+        let cleanup = sqlx::postgres::PgPoolOptions::new()
+            .connect_with(
+                admin
+                    .connect_options()
+                    .as_ref()
+                    .clone()
+                    .username("tenant_cleanup")
+                    .password("tcpw"),
+            )
+            .await?;
+        let mut transaction = cleanup.begin().await?;
+        sqlx::query("SELECT set_config('app.tenant_id',$1,true)")
+            .bind(tenant.get().to_string())
+            .execute(&mut *transaction)
+            .await?;
+        assert_eq!(
+            delete_expired(&mut transaction, tenant, Category::UnmatchedEvents, cutoff).await?,
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tenant_events")
+                .fetch_one(&mut *transaction)
+                .await?,
+            2
+        );
+        transaction.rollback().await?;
         Ok(())
     }
 }

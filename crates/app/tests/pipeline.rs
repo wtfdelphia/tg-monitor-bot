@@ -414,6 +414,58 @@ async fn pipeline_fanout_rule_match_and_delivery_outbox_are_idempotent(admin: Pg
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]
+async fn reclaimed_projection_remains_not_found_and_new_events_continue(
+    admin: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let app = app_pool(&admin).await;
+    let tenant = seed_tenant(&admin).await;
+    let identity = seed_identity(&admin, tenant).await;
+    sqlx::query("INSERT INTO source_subscriptions (tenant_id,tg_chat_id,receiver_identity_id) VALUES ($1,-1001,$2)")
+        .bind(tenant).bind(identity).execute(&admin).await?;
+    let event: i64 = sqlx::query_scalar("INSERT INTO canonical_events (adapter,receiver_identity_id,tg_chat_id,tg_message_id,message_date,created_at)
+        VALUES ('mtproto',$1,-1001,1,now(),now()-interval '2 days') RETURNING id").bind(identity).fetch_one(&admin).await?;
+    let projection = fanout_canonical_event(&app, tenant, event)
+        .await?
+        .ok_or("没有投影")?;
+    tgm_db::repo::mark_canonical_event_fanned_out(&app, event).await?;
+    assert!(
+        tgm_app::pipeline::process_tenant_event(&app, tenant, projection.id)
+            .await?
+            .processed
+    );
+    let cleanup = PgPoolOptions::new()
+        .connect_with(
+            admin
+                .connect_options()
+                .as_ref()
+                .clone()
+                .username("tenant_cleanup")
+                .password("tcpw"),
+        )
+        .await?;
+    assert_eq!(
+        tgm_db::tenant_retention::cleanup_batch(
+            &cleanup,
+            tenant,
+            tgm_db::tenant_retention::Category::UnmatchedEvents
+        )
+        .await?,
+        Some(1)
+    );
+    assert!(matches!(
+        tgm_app::pipeline::process_tenant_event(&app, tenant, projection.id).await,
+        Err(tgm_core::error::AppError::NotFound)
+    ));
+    assert!(fanout_canonical_event(&app, tenant, event).await?.is_none());
+    sqlx::query("INSERT INTO canonical_events (adapter,receiver_identity_id,tg_chat_id,tg_message_id,message_date)
+        VALUES ('mtproto',$1,-1001,2,now())").bind(identity).execute(&admin).await?;
+    assert_eq!(run_fanout_once(&app, 10).await?.event_count, 1);
+    assert_eq!(run_rule_once(&app, 10).await?.event_count, 1);
+    assert_eq!(run_rule_once(&app, 10).await?.event_count, 0);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn delivery_worker_stops_cleanly_when_shutdown_is_requested(admin: PgPool) {
     let app = app_pool(&admin).await;
     let tenant = seed_tenant(&admin).await;

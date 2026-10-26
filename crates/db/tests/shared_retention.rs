@@ -106,9 +106,14 @@ async fn respects_age_fanout_and_all_tenant_references(
     let tenants: Vec<TenantId> = sqlx::query_scalar("SELECT id FROM tenants ORDER BY id")
         .fetch_all(admin.raw())
         .await?;
+    sqlx::query("UPDATE canonical_events SET fanned_out=false WHERE id=$1")
+        .bind(old)
+        .execute(admin.raw())
+        .await?;
     for tenant in &tenants {
         repo::fanout_canonical_event(&app, *tenant, old).await?;
     }
+    repo::mark_canonical_event_fanned_out(&app, old).await?;
     sqlx::query("UPDATE tenant_events SET processed_at=now(),matched=false,created_at=now()-interval '8 days'")
         .execute(admin.raw()).await?;
     assert_eq!(cleanup_batch(&cleanup).await?, Some(1));
@@ -223,7 +228,12 @@ async fn group_references_and_live_downloads_survive_then_release(
     let tenant: TenantId = sqlx::query_scalar("SELECT id FROM tenants LIMIT 1")
         .fetch_one(admin.raw())
         .await?;
+    sqlx::query("UPDATE canonical_events SET fanned_out=false WHERE id=$1")
+        .bind(group)
+        .execute(admin.raw())
+        .await?;
     repo::fanout_canonical_event(&app, tenant, group).await?;
+    repo::mark_canonical_event_fanned_out(&app, group).await?;
     assert_eq!(cleanup_batch(&cleanup).await?, Some(0));
     assert!(
         sqlx::query("DELETE FROM canonical_events WHERE id=$1")
@@ -330,7 +340,12 @@ async fn reference_policy_limits_recent_metadata_and_broadening_is_detected(
     let tenant: TenantId = sqlx::query_scalar("SELECT id FROM tenants LIMIT 1")
         .fetch_one(admin.raw())
         .await?;
+    sqlx::query("UPDATE canonical_events SET fanned_out=false WHERE id=$1")
+        .bind(recent)
+        .execute(admin.raw())
+        .await?;
     repo::fanout_canonical_event(&app, tenant, recent).await?;
+    repo::mark_canonical_event_fanned_out(&app, recent).await?;
     assert!(
         sqlx::query_scalar::<_, i64>("SELECT canonical_event_id FROM tenant_events")
             .fetch_all(&cleanup)

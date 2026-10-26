@@ -83,3 +83,98 @@ async fn paginated_all_status_cleanup_waits_skips_overlap_and_cancels_locked_que
     );
     Ok(())
 }
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn unmatched_batches_report_protected_backlog_and_cancel_uncommitted_rows(
+    admin: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::raw_sql("INSERT INTO tenants (name,owner_user_id) VALUES ('short-batch',99201);
+        INSERT INTO identities (kind) VALUES ('mtproto');
+        INSERT INTO source_subscriptions (tenant_id,tg_chat_id,receiver_identity_id)
+            SELECT tenants.id,-1001,identities.id FROM tenants CROSS JOIN identities;
+        INSERT INTO canonical_events (adapter,receiver_identity_id,tg_chat_id,tg_message_id,message_date,created_at,fanned_out)
+            SELECT 'mtproto',id,-1001,number,now(),now()-interval '2 days',true FROM identities CROSS JOIN generate_series(1,5001) number;
+        INSERT INTO tenant_events (tenant_id,canonical_event_id,source_ref,processed_at)
+            SELECT sources.tenant_id,events.id,sources.id,now() FROM source_subscriptions sources CROSS JOIN canonical_events events;")
+        .execute(&admin).await?;
+    let tenant: TenantId = sqlx::query_scalar("SELECT id FROM tenants")
+        .fetch_one(&admin)
+        .await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            admin
+                .connect_options()
+                .as_ref()
+                .clone()
+                .username("tenant_cleanup")
+                .password("tcpw"),
+        )
+        .await?;
+    let mut held = admin.begin().await?;
+    sqlx::query("SELECT id FROM tenant_events ORDER BY id LIMIT 1 FOR UPDATE")
+        .execute(&mut *held)
+        .await?;
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task_pool = pool.clone();
+    let task = tokio::spawn(async move {
+        tgm_app::tenant_retention::run(&task_pool, Category::UnmatchedEvents, async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let waiting:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks locks JOIN pg_stat_activity activity ON activity.pid=locks.pid WHERE activity.datname=current_database() AND activity.usename='tenant_cleanup' AND NOT locks.granted)").fetch_one(&admin).await?;
+        if waiting {
+            break;
+        }
+        assert!(Instant::now() < deadline, "清理未等待行锁");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    stop.send(()).map_err(|_| "清理提前结束")?;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await???
+            .stopped
+    );
+    held.rollback().await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tenant_events")
+            .fetch_one(&admin)
+            .await?,
+        5001
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM system_logs WHERE module='tenant_retention'"
+        )
+        .fetch_one(&admin)
+        .await?,
+        0
+    );
+    sqlx::query(
+        "UPDATE tenant_events SET processed_at=NULL WHERE id=(SELECT max(id) FROM tenant_events)",
+    )
+    .execute(&admin)
+    .await?;
+    let started = Instant::now();
+    let result =
+        tgm_app::tenant_retention::run(&pool, Category::UnmatchedEvents, std::future::pending())
+            .await?;
+    assert_eq!(
+        (result.deleted, result.retained, result.batches),
+        (5000, 1, 2)
+    );
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    sqlx::query("UPDATE tenant_events SET processed_at=now() WHERE tenant_id=$1")
+        .bind(tenant)
+        .execute(&admin)
+        .await?;
+    let result =
+        tgm_app::tenant_retention::run(&pool, Category::UnmatchedEvents, std::future::pending())
+            .await?;
+    assert_eq!((result.deleted, result.retained), (1, 0));
+    assert_eq!(sqlx::query_scalar::<_,i64>("SELECT sum((context->>'rows')::bigint)::bigint FROM system_logs WHERE module='tenant_retention'").fetch_one(&admin).await?,5001);
+    Ok(())
+}

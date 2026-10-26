@@ -3724,6 +3724,10 @@ pub async fn load_enabled_rules(
 
 #[derive(Debug, thiserror::Error)]
 pub enum EnqueueError {
+    #[error("tenant event is no longer available")]
+    EventUnavailable,
+    #[error("tenant event has already been processed")]
+    EventProcessed,
     #[error("rule version is no longer available: {rule_id}/{version}")]
     VersionUnavailable { rule_id: i64, version: i32 },
     #[error(transparent)]
@@ -3750,16 +3754,18 @@ pub async fn enqueue_delivery_tasks(
             )
             .bind(tenant.get())
             .bind(tenant_event_id)
-            .fetch_one(&mut *conn)
-            .await?;
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or(EnqueueError::EventUnavailable)?;
             crate::shared_retention::lock_writer(conn, identity).await?;
-            sqlx::query_scalar::<_, i64>(
-                "SELECT id FROM tenant_events WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+            let processed = sqlx::query_scalar::<_, bool>(
+                "SELECT processed_at IS NOT NULL FROM tenant_events WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
             )
             .bind(tenant.get())
             .bind(tenant_event_id)
-            .fetch_one(&mut *conn)
-            .await?;
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or(EnqueueError::EventUnavailable)?;
 
             let mut writes = Vec::with_capacity(tasks.len());
             for task in &tasks {
@@ -3779,6 +3785,9 @@ pub async fn enqueue_delivery_tasks(
                 .await?;
                 if let Some(id) = existing_id {
                     writes.push(DeliveryTaskWrite { id, inserted: false });
+                    continue;
+                }
+                if processed {
                     continue;
                 }
                 let exists: bool = sqlx::query_scalar(
@@ -3861,6 +3870,13 @@ pub async fn enqueue_delivery_tasks(
                 };
 
                 writes.push(DeliveryTaskWrite { id, inserted });
+            }
+
+            if processed {
+                if writes.is_empty() {
+                    return Err(EnqueueError::EventProcessed);
+                }
+                return Ok(writes);
             }
 
             // 一条 canonical event 一个 job，多租户命中同一条消息只下载一次。
@@ -5058,6 +5074,7 @@ pub async fn fanout_canonical_event(
 ) -> Result<Option<TenantEventWrite>, sqlx::Error> {
     tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             if let Some(identity) = sqlx::query_scalar::<_, i64>(
                 "SELECT receiver_identity_id FROM canonical_events WHERE id = $1",
             )
@@ -5078,6 +5095,7 @@ pub async fn fanout_canonical_event(
                    AND ss.receiver_identity_id = ce.receiver_identity_id
                    AND ss.enabled
                  WHERE ce.id = $2
+                   AND NOT ce.fanned_out
                 ON CONFLICT (tenant_id, canonical_event_id) DO NOTHING
                 RETURNING id
                 "#,
