@@ -1,6 +1,8 @@
 [Unit]
 Description=TGM shared event retention
 After=network-online.target
+Requires=tgm-tenant-cleanup@unmatched-events.service
+After=tgm-tenant-cleanup@unmatched-events.service
 Wants=network-online.target
 
 [Service]

@@ -842,6 +842,18 @@ async fn c9_rejects_extra_missing_and_grantable_permissions(
         .await?;
     for (broken, restored) in [
         (
+            "GRANT SELECT (text) ON canonical_events TO tenant_cleanup",
+            "REVOKE SELECT (text) ON canonical_events FROM tenant_cleanup",
+        ),
+        (
+            "REVOKE SELECT (fanned_out) ON canonical_events FROM tenant_cleanup",
+            "GRANT SELECT (fanned_out) ON canonical_events TO tenant_cleanup",
+        ),
+        (
+            "GRANT SELECT (processed_at) ON tenant_events TO tenant_cleanup WITH GRANT OPTION",
+            "REVOKE GRANT OPTION FOR SELECT (processed_at) ON tenant_events FROM tenant_cleanup",
+        ),
+        (
             "GRANT SELECT (login_token) ON login_sessions TO tenant_cleanup",
             "REVOKE SELECT (login_token) ON login_sessions FROM tenant_cleanup",
         ),

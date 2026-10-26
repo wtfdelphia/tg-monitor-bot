@@ -55,6 +55,7 @@ enum CleanupCategory {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum TenantCleanupCategory {
+    UnmatchedEvents,
     TenantEvents,
     DeliveryTasks,
     LoginSessions,
@@ -69,6 +70,7 @@ enum TenantCleanupCategory {
 impl From<TenantCleanupCategory> for tgm_db::tenant_retention::Category {
     fn from(category: TenantCleanupCategory) -> Self {
         match category {
+            TenantCleanupCategory::UnmatchedEvents => Self::UnmatchedEvents,
             TenantCleanupCategory::TenantEvents => Self::TenantEvents,
             TenantCleanupCategory::DeliveryTasks => Self::DeliveryTasks,
             TenantCleanupCategory::LoginSessions => Self::LoginSessions,
@@ -750,9 +752,17 @@ fn main() -> anyhow::Result<()> {
             pool.close().await;
             let result = result.map_err(|error| anyhow::anyhow!("{error}"))?;
             println!(
-                "tgm: 租户清理结束：deleted={} batches={} tenants={} overlaps={} stopped={}",
-                result.deleted, result.batches, result.tenants, result.overlaps, result.stopped
+                "tgm: 租户清理结束：deleted={} retained={} batches={} tenants={} overlaps={} stopped={}",
+                result.deleted, result.retained, result.batches, result.tenants, result.overlaps, result.stopped
             );
+            if matches!(category, TenantCleanupCategory::UnmatchedEvents) {
+                if result.retained > 0 {
+                    eprintln!("tgm: 仍有受保护的到龄未命中投影，短期留存尚未全部回收");
+                }
+                if result.overlaps > 0 || result.stopped {
+                    anyhow::bail!("未命中投影清理未完整执行，拒绝将本轮标记为成功");
+                }
+            }
             Ok(())
         });
     }

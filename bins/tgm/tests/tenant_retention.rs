@@ -36,6 +36,7 @@ async fn cli_uses_only_cleanup_identity_redacts_failures_and_stops_on_sigterm(
         .execute(&admin)
         .await?;
     for category in [
+        "unmatched-events",
         "tenant-events",
         "delivery-tasks",
         "login-sessions",
@@ -179,5 +180,52 @@ fn scheduling_units_keep_tenant_cleanup_credentials_separate() -> Result<()> {
         assert!(timer.contains(&format!("Unit=tgm-tenant-cleanup@{category}.service\n")));
         assert!(timer.contains("Persistent=true"));
     }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn unmatched_cli_reports_protected_rows_and_refuses_incomplete_cycle(
+    admin: PgPool,
+) -> Result<()> {
+    sqlx::raw_sql("INSERT INTO tenants (name,owner_user_id) VALUES ('short-cli',99202);
+        INSERT INTO identities (kind) VALUES ('mtproto');
+        INSERT INTO source_subscriptions (tenant_id,tg_chat_id,receiver_identity_id)
+            SELECT tenants.id,-1001,identities.id FROM tenants CROSS JOIN identities;
+        INSERT INTO canonical_events (adapter,receiver_identity_id,tg_chat_id,tg_message_id,message_date,created_at,fanned_out)
+            SELECT 'mtproto',id,-1001,1,now(),now()-interval '2 days',true FROM identities;
+        INSERT INTO tenant_events (tenant_id,canonical_event_id,source_ref)
+            SELECT sources.tenant_id,events.id,sources.id FROM source_subscriptions sources CROSS JOIN canonical_events events;")
+        .execute(&admin).await?;
+    let tenant: tgm_core::ids::TenantId = sqlx::query_scalar("SELECT id FROM tenants")
+        .fetch_one(&admin)
+        .await?;
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&admin)
+        .await?;
+    let url = format!("postgres://tenant_cleanup:tcpw@127.0.0.1:55432/{database}");
+    let output = command(&url, "unmatched-events").output()?;
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("retained=1"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("受保护"));
+    let cleanup = sqlx::postgres::PgPoolOptions::new().connect(&url).await?;
+    let mut held = cleanup.begin().await?;
+    assert!(
+        tgm_db::tenant_retention::try_lock(
+            &mut held,
+            tenant,
+            tgm_db::tenant_retention::Category::UnmatchedEvents
+        )
+        .await?
+    );
+    let output = command(&url, "unmatched-events").output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("overlaps=1"));
+    held.rollback().await?;
+    sqlx::query("UPDATE tenant_events SET processed_at=now()")
+        .execute(&admin)
+        .await?;
+    let output = command(&url, "unmatched-events").output()?;
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("deleted=1 retained=0"));
     Ok(())
 }

@@ -309,7 +309,13 @@ pub async fn run_rule_once(
     for tenant in tenants {
         let event_ids = list_unprocessed_tenant_event_ids(pool, tenant, event_batch_size).await?;
         for event_id in event_ids {
-            process_tenant_event(pool, tenant, event_id).await?;
+            match process_tenant_event(pool, tenant, event_id).await {
+                Err(AppError::NotFound)
+                    if load_tenant_event(pool, tenant, event_id).await?.is_none() => {}
+                result => {
+                    result?;
+                }
+            }
             event_count += 1;
         }
     }
@@ -408,6 +414,13 @@ pub async fn process_tenant_event(
     .await
     {
         Ok(writes) => writes,
+        Err(EnqueueError::EventUnavailable | EnqueueError::EventProcessed) => {
+            return Ok(RuleProcessingResult {
+                processed: false,
+                matched_rule_ids: Vec::new(),
+                tasks: Vec::new(),
+            });
+        }
         Err(EnqueueError::Database(error)) => return Err(error.into()),
         Err(EnqueueError::VersionUnavailable { rule_id, version }) => {
             return Err(unavailable_rule_version(pool, tenant, rule_id, version).await?);

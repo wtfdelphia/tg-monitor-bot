@@ -5,6 +5,7 @@ use tgm_db::tenant_retention::{BATCH_LIMIT, Category, RetentionError};
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CleanupResult {
     pub deleted: u64,
+    pub retained: u64,
     pub batches: u64,
     pub tenants: u64,
     pub overlaps: u64,
@@ -52,6 +53,13 @@ pub async fn run(
                     _ = &mut shutdown => { result.stopped = true; return Ok(result); }
                     _ = tokio::time::sleep(Duration::from_millis(200)) => {}
                 }
+            }
+            if category == Category::UnmatchedEvents {
+                result.retained += tokio::select! {
+                    biased;
+                    _ = &mut shutdown => { result.stopped = true; return Ok(result); }
+                    count = tgm_db::tenant_retention::retained_unmatched(pool, tenant) => count?,
+                };
             }
         }
     }

@@ -138,6 +138,8 @@ async fn cli_uses_only_its_own_credentials_and_redacts_database_failures(
 #[test]
 fn independent_hourly_timer_and_credential_file_are_consistent() {
     let service = include_str!("../../../deploy/systemd/tgm-shared-cleanup.service");
+    assert!(service.contains("Requires=tgm-tenant-cleanup@unmatched-events.service\n"));
+    assert!(service.contains("After=tgm-tenant-cleanup@unmatched-events.service\n"));
     let timer = include_str!("../../../deploy/systemd/tgm-shared-cleanup.timer");
     let environment = include_str!("../../../deploy/systemd/shared-cleanup.env.example");
     assert!(service.contains("User=tgm-shared-cleanup"));
