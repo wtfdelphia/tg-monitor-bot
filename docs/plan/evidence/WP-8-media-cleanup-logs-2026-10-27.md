@@ -75,8 +75,11 @@ TGM_DB_URL_TASK_SCHEMA_OWNER='postgres://postgres:pw@127.0.0.1:55432/tgm_test_sc
 
 ## 五、发布状态
 
-本片已完成实现和本地验收，但当前仍未提交、未推送、未开 PR。后续发布需维护人另行明确授权，
-并按“一次提交、推送到 `dev`、开 PR、等待 CI”执行；PR CI 才是最终裁决。
+维护人于 2026-10-27 授权本批合为一个提交、推送并开 PR 到 `dev`，随后授权合入 PR #57。
+实现提交为 `a8c16a93bd3beb8a4f30f830594ddf479d4fb576`，合并提交为
+`97c449bbb2d0ce93642f47310a51df017434ce31`。
+PR CI（run `40428023187`）与合并后 push CI（run `40430682047`）均成功；
+合并后 `static`、`database` 作业也已逐项核对通过。未执行生产部署，不据此宣布整个 WP-8 通过。
 
 [report]
 task: WP-8-media-cleanup-logs

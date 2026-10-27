@@ -409,6 +409,19 @@ pub fn check_shared_cleanup(
     check_cleanup(raw_profile, present, rust_log, "TGM_DB_URL_SHARED_CLEANUP")
 }
 
+pub fn check_platform_cleanup(
+    raw_profile: Option<&str>,
+    present: &[&str],
+    rust_log: Option<&str>,
+) -> Vec<ConfigProblem> {
+    check_cleanup(
+        raw_profile,
+        present,
+        rust_log,
+        "TGM_DB_URL_PLATFORM_CLEANUP",
+    )
+}
+
 fn check_cleanup(
     raw_profile: Option<&str>,
     present: &[&str],
@@ -479,6 +492,7 @@ fn known_names() -> &'static [&'static str] {
         "TGM_DB_URL_TENANT_CLEANUP",
         "TGM_DB_URL_SHARED_CLEANUP",
         "TGM_DB_URL_MEDIA_CLEANUP",
+        "TGM_DB_URL_PLATFORM_CLEANUP",
         "TGM_REDIS_URL",
         "TGM_S3_ENDPOINT",
         "TGM_S3_BUCKET",
@@ -532,7 +546,8 @@ fn known_names() -> &'static [&'static str] {
 mod tests {
     use super::{
         COMMON, ConfigProblem, Role, check, check_auth_cleanup, check_kek_backend,
-        check_shared_cleanup, extra_required, known_names, validate_oidc_alg,
+        check_platform_cleanup, check_shared_cleanup, check_tenant_cleanup, extra_required,
+        known_names, validate_oidc_alg,
     };
     use crate::oidc::OidcSigningAlgorithm;
 
@@ -840,6 +855,48 @@ mod tests {
                 check(role, Some("development"), &role_env, None),
                 vec![ConfigProblem::Unexpected("TGM_DB_URL_MEDIA_CLEANUP")]
             );
+        }
+    }
+
+    #[test]
+    fn platform_cleanup_is_an_independent_credential_boundary() {
+        let present = ["TGM_PROFILE", "TGM_DB_URL_PLATFORM_CLEANUP"];
+        assert!(check_platform_cleanup(Some("development"), &present, None).is_empty());
+        for name in known_names().iter().copied().chain(["DATABASE_URL"]) {
+            if ["TGM_PROFILE", "TGM_DB_URL_PLATFORM_CLEANUP", "RUST_LOG"].contains(&name) {
+                continue;
+            }
+            let names = ["TGM_PROFILE", "TGM_DB_URL_PLATFORM_CLEANUP", name];
+            assert!(
+                check_platform_cleanup(Some("development"), &names, None)
+                    .contains(&ConfigProblem::Unexpected(name))
+            );
+        }
+        assert!(
+            check_platform_cleanup(Some("development"), &["TGM_PROFILE"], None)
+                .contains(&ConfigProblem::Missing("TGM_DB_URL_PLATFORM_CLEANUP"))
+        );
+        for role in [
+            Role::ControlPlane,
+            Role::BotGateway,
+            Role::MtprotoWorker,
+            Role::Fanout,
+            Role::Rule,
+            Role::Delivery,
+        ] {
+            let mut names = minimal(role);
+            names.push("TGM_DB_URL_PLATFORM_CLEANUP");
+            assert!(
+                check(role, Some("development"), &names, None)
+                    .contains(&ConfigProblem::Unexpected("TGM_DB_URL_PLATFORM_CLEANUP"))
+            );
+        }
+        for problems in [
+            check_auth_cleanup(Some("development"), &present, None),
+            check_tenant_cleanup(Some("development"), &present, None),
+            check_shared_cleanup(Some("development"), &present, None),
+        ] {
+            assert!(problems.contains(&ConfigProblem::Unexpected("TGM_DB_URL_PLATFORM_CLEANUP")));
         }
     }
 
