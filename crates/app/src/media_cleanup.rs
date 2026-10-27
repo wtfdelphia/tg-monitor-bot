@@ -13,9 +13,7 @@ use std::time::{Duration, Instant};
 
 use aws_sdk_s3::primitives::DateTime as S3DateTime;
 use sqlx::PgPool;
-use tgm_db::repo::{
-    clear_media_archive_object, delete_stale_media_archive, list_expired_media_objects,
-};
+use tgm_db::repo::list_expired_media_objects;
 
 use crate::media_relay::{MediaStore, MediaStoreError};
 
@@ -40,38 +38,47 @@ pub struct CleanupOutcome {
 #[derive(Debug, thiserror::Error)]
 pub enum CleanupError {
     #[error(transparent)]
+    Role(#[from] tgm_db::media_cleanup::MediaCleanupError),
+    #[error(transparent)]
     Db(#[from] sqlx::Error),
     #[error(transparent)]
     Store(#[from] MediaStoreError),
 }
 
 /// 跑一轮清理。`staging_max_age` 只在测试里调小。
-// ponytail: 清理结果只进 tracing、不进 system_logs（spec/04 §1.1 第 2 条）—— app_user 写不进
-// tenant_id IS NULL 的行（0010 末尾的注释），平台级日志写入策略定下来后改为写库
 pub async fn run_cleanup_once(
     pool: &PgPool,
     store: &MediaStore,
     staging_max_age: Duration,
 ) -> Result<CleanupOutcome, CleanupError> {
+    tgm_db::media_cleanup::check_connection(pool).await?;
     let mut outcome = CleanupOutcome::default();
 
-    let started = Instant::now();
+    let mut object_log_written = false;
     loop {
+        let started = Instant::now();
         let expired = list_expired_media_objects(pool, BATCH).await?;
         let mut progressed = false;
+        let mut deleted = Vec::new();
         for (archive_id, key) in &expired {
             match store.delete(key).await {
-                Ok(()) => {
-                    if clear_media_archive_object(pool, *archive_id, key).await? {
-                        outcome.objects_deleted += 1;
-                        progressed = true;
-                    }
-                }
+                Ok(()) => deleted.push((*archive_id, key.clone())),
                 Err(error) => {
                     outcome.object_failures += 1;
                     tracing::warn!(archive_id, error = %error, "删除过期媒体对象失败，下一轮再试");
                 }
             }
+        }
+        if !deleted.is_empty() {
+            let cleared = tgm_db::media_cleanup::clear_expired_objects_and_log(
+                pool,
+                &deleted,
+                elapsed_ms(started),
+            )
+            .await?;
+            outcome.objects_deleted += cleared;
+            progressed = cleared > 0;
+            object_log_written = true;
         }
         // 一批里全部失败时不再重读同一批，免得在对象存储故障时空转。
         if (expired.len() as i64) < BATCH || !progressed {
@@ -79,46 +86,57 @@ pub async fn run_cleanup_once(
         }
         tokio::time::sleep(BATCH_PAUSE).await;
     }
-    log_done("media_archive.object", outcome.objects_deleted, started);
+    if !object_log_written {
+        tgm_db::media_cleanup::log_cleanup_batch(pool, "media_archive.object", 0, 0).await?;
+    }
 
-    let started = Instant::now();
     loop {
-        let deleted = delete_stale_media_archive(pool, ARCHIVE_RETENTION_DAYS, BATCH).await?;
+        let started = Instant::now();
+        let deleted = tgm_db::media_cleanup::delete_stale_archives_and_log(
+            pool,
+            ARCHIVE_RETENTION_DAYS,
+            BATCH,
+            elapsed_ms(started),
+        )
+        .await?;
         outcome.archives_deleted += deleted;
         if (deleted as i64) < BATCH {
             break;
         }
         tokio::time::sleep(BATCH_PAUSE).await;
     }
-    log_done("media_archive", outcome.archives_deleted, started);
-
-    let started = Instant::now();
     let cutoff = std::time::SystemTime::now()
         .checked_sub(staging_max_age)
         .unwrap_or(std::time::UNIX_EPOCH);
     let cutoff = S3DateTime::from(cutoff);
-    for key in store.list_older_than(STAGING_PREFIX, cutoff).await? {
-        match store.delete(&key).await {
-            Ok(()) => outcome.staging_deleted += 1,
-            Err(error) => {
-                outcome.object_failures += 1;
-                tracing::warn!(key = %key, error = %error, "删除 staging 孤儿对象失败，下一轮再试");
+    let staging_keys = store.list_older_than(STAGING_PREFIX, cutoff).await?;
+    let mut staging_log_written = false;
+    for chunk in staging_keys.chunks(BATCH as usize) {
+        let started = Instant::now();
+        let mut deleted = 0_u64;
+        for key in chunk {
+            match store.delete(key).await {
+                Ok(()) => deleted += 1,
+                Err(error) => {
+                    outcome.object_failures += 1;
+                    tracing::warn!(key = %key, error = %error, "删除 staging 孤儿对象失败，下一轮再试");
+                }
             }
         }
+        outcome.staging_deleted += deleted;
+        tgm_db::media_cleanup::log_cleanup_batch(pool, "staging", deleted, elapsed_ms(started))
+            .await?;
+        staging_log_written = true;
     }
-    log_done("staging", outcome.staging_deleted, started);
+    if !staging_log_written {
+        tgm_db::media_cleanup::log_cleanup_batch(pool, "staging", 0, 0).await?;
+    }
 
     Ok(outcome)
 }
 
-fn log_done(table: &str, rows: u64, started: Instant) {
-    tracing::info!(
-        event = "cleanup.done",
-        table,
-        rows,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "清理完成"
-    );
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// 生产默认的 staging 孤儿判定年龄。

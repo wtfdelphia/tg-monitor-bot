@@ -21,6 +21,7 @@ pub mod audit;
 pub mod auth_retention;
 /// 身份凭据的信封加密落库（spec/05 §七）。KEK 调用不在事务内。
 pub mod credentials;
+pub mod media_cleanup;
 /// 启动期校验里要连库的两条（eng/01 §4.2 版本下限、§4.3 角色自检）。
 pub mod preflight;
 /// Repo 层。方法第一个参数必须是 `TenantId`（eng/00 §4.1）。
