@@ -841,6 +841,105 @@ WITH cleaner AS (
    )
 ) SELECT reason::text FROM violations ORDER BY reason;
 
+-- name: C13 平台日志清理角色必须存在且权限收敛
+WITH cleaner AS (
+  SELECT * FROM pg_roles WHERE rolname = 'platform_cleanup'
+), allowed_columns(tbl, col, privilege) AS (
+  VALUES ('system_logs', 'tenant_id', 'SELECT'),
+         ('system_logs', 'id', 'SELECT'),
+         ('system_logs', 'created_at', 'SELECT'),
+         ('system_logs', 'tenant_id', 'INSERT'),
+         ('system_logs', 'level', 'INSERT'),
+         ('system_logs', 'module', 'INSERT'),
+         ('system_logs', 'event', 'INSERT'),
+         ('system_logs', 'context', 'INSERT')
+), violations AS (
+  SELECT 'platform_cleanup 缺失或属性不符' AS reason
+   WHERE NOT EXISTS (SELECT 1 FROM cleaner WHERE rolcanlogin AND NOT
+          (rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication))
+  UNION ALL
+  SELECT 'platform_cleanup 不得参与角色成员关系'
+    FROM cleaner r WHERE EXISTS (SELECT 1 FROM pg_auth_members WHERE member = r.oid OR roleid = r.oid)
+  UNION ALL
+  SELECT 'platform_cleanup 不得拥有表、schema 或函数'
+    FROM cleaner r WHERE EXISTS (SELECT 1 FROM pg_class WHERE relowner = r.oid)
+       OR EXISTS (SELECT 1 FROM pg_namespace WHERE nspowner = r.oid)
+       OR EXISTS (SELECT 1 FROM pg_proc WHERE proowner = r.oid)
+  UNION ALL
+  SELECT 'platform_cleanup 不得在用户 schema 建对象'
+    FROM cleaner r JOIN pg_namespace n ON n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+   WHERE has_schema_privilege(r.oid, n.oid, 'CREATE')
+  UNION ALL
+  SELECT '表权限不符: ' || n.nspname || '.' || c.relname || ':' || privilege
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER'), ('MAINTAIN')) p(privilege)
+   WHERE c.relkind IN ('r','p','v','m','f') AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND (CASE WHEN privilege = 'MAINTAIN' AND current_setting('server_version_num')::int < 170000
+               THEN false ELSE has_table_privilege(r.oid, c.oid, privilege) END) <>
+       (n.nspname = 'public' AND c.relname = 'system_logs' AND privilege = 'DELETE')
+  UNION ALL
+  SELECT '表权限不得转授: ' || n.nspname || '.' || c.relname
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   CROSS JOIN LATERAL aclexplode(c.relacl) acl
+   WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND acl.grantee = r.oid AND acl.is_grantable
+  UNION ALL
+  SELECT '列权限不符: ' || n.nspname || '.' || c.relname || '.' || a.attname || ':' || p.privilege
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+   CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')) p(privilege)
+   WHERE c.relkind IN ('r','p','v','m','f') AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND has_column_privilege(r.oid, c.oid, a.attnum, p.privilege) <>
+       EXISTS (SELECT 1 FROM allowed_columns allow WHERE n.nspname = 'public' AND allow.tbl = c.relname AND allow.col = a.attname AND allow.privilege = p.privilege)
+  UNION ALL
+  SELECT '列权限不得转授: ' || n.nspname || '.' || c.relname || '.' || a.attname
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+   CROSS JOIN LATERAL aclexplode(a.attacl) acl
+   WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND acl.grantee = r.oid AND acl.is_grantable
+  UNION ALL
+  SELECT '序列权限不符: ' || n.nspname || '.' || c.relname || ':' || privilege
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   CROSS JOIN (VALUES ('USAGE'), ('SELECT'), ('UPDATE')) p(privilege)
+   WHERE c.relkind = 'S' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND has_sequence_privilege(r.oid, c.oid, privilege) <>
+       (n.nspname = 'public' AND c.relname = 'system_logs_id_seq' AND privilege = 'USAGE')
+  UNION ALL
+  SELECT '必要列缺失: ' || allow.tbl || '.' || allow.col FROM allowed_columns allow
+   WHERE NOT EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = allow.tbl
+       AND a.attname = allow.col AND a.attnum > 0 AND NOT a.attisdropped)
+  UNION ALL
+  SELECT '序列权限不得转授: ' || n.nspname || '.' || c.relname
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   CROSS JOIN LATERAL aclexplode(c.relacl) acl
+   WHERE c.relkind = 'S' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND acl.grantee = r.oid AND acl.is_grantable
+  UNION ALL
+  SELECT 'platform_cleanup 到期策略缺失或范围不符'
+    FROM cleaner r CROSS JOIN (VALUES ('platform_cleanup_select', 'r'), ('platform_cleanup_delete', 'd')) expected(name, command)
+   WHERE NOT EXISTS (SELECT 1 FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'public' AND c.relname = 'system_logs' AND p.polname = expected.name
+         AND p.polcmd::text = expected.command AND p.polpermissive AND p.polroles = ARRAY[r.oid]::oid[]
+         AND p.polwithcheck IS NULL AND pg_get_expr(p.polqual, p.polrelid) LIKE '%tenant_id IS NULL%'
+         AND pg_get_expr(p.polqual, p.polrelid) LIKE '%created_at <=%'
+         AND pg_get_expr(p.polqual, p.polrelid) LIKE '%statement_timestamp()%'
+         AND pg_get_expr(p.polqual, p.polrelid) LIKE '%90 days%')
+  UNION ALL
+  SELECT 'platform_cleanup 日志策略缺失或范围不符'
+    FROM cleaner r
+   WHERE NOT EXISTS (SELECT 1 FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'public' AND c.relname = 'system_logs' AND p.polname = 'platform_cleanup_log'
+         AND p.polcmd = 'a' AND p.polpermissive AND p.polroles = ARRAY[r.oid]::oid[] AND p.polqual IS NULL
+         AND pg_get_expr(p.polwithcheck, p.polrelid) LIKE '%tenant_id IS NULL%'
+         AND pg_get_expr(p.polwithcheck, p.polrelid) LIKE '%module = ''platform_retention''%'
+         AND pg_get_expr(p.polwithcheck, p.polrelid) LIKE '%event = ''cleanup.done''%'
+         AND pg_get_expr(p.polwithcheck, p.polrelid) LIKE '%system_logs%'
+         AND pg_get_expr(p.polwithcheck, p.polrelid) LIKE '%5000%')
+) SELECT reason::text FROM violations ORDER BY reason;
 -- name: C9 租户清理角色必须存在且权限收敛
 WITH cleaner AS (
   SELECT * FROM pg_roles WHERE rolname = 'tenant_cleanup'

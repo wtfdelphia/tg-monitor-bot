@@ -19,6 +19,7 @@ pub mod media_relay;
 pub mod mtproto_session;
 pub mod mtproto_worker;
 pub mod pipeline;
+pub mod platform_retention;
 pub mod qr_login_control;
 pub mod rule;
 pub mod shared_retention;
