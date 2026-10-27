@@ -99,6 +99,7 @@ pub async fn try_lock(
     tenant: TenantId,
     category: Category,
 ) -> Result<bool, sqlx::Error> {
+    crate::lifecycle::lock(connection, tenant, false).await?;
     sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 1952935218))")
         .bind(lock_key(tenant, category))
         .fetch_one(connection)

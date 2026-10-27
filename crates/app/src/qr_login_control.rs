@@ -80,6 +80,30 @@ pub fn new_login_id() -> Result<String, getrandom::Error> {
 }
 
 impl<T> QrLoginStore<T> {
+    pub fn tenants(&self) -> Vec<i64> {
+        let mut tenants: Vec<_> = self
+            .lock()
+            .logins
+            .values()
+            .map(|slot| slot.tenant_id)
+            .collect();
+        tenants.sort_unstable();
+        tenants.dedup();
+        tenants
+    }
+
+    pub fn remove_tenant(&self, tenant: i64) -> Vec<Arc<tokio::sync::Mutex<T>>> {
+        let mut removed = Vec::new();
+        self.lock().logins.retain(|_, slot| {
+            if slot.tenant_id == tenant {
+                removed.push(Arc::clone(&slot.login));
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner<T>> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }

@@ -2,7 +2,7 @@ use sqlx::PgPool;
 use sqlx::types::chrono::{DateTime, Utc};
 use tgm_core::ids::{IdentityId, TenantId};
 
-use crate::tenant::tenant_tx;
+use crate::tenant::{tenant_tx, tenant_write_tx};
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TargetProbe {
@@ -61,7 +61,7 @@ pub async fn request_probe(
     tenant: TenantId,
     id: i64,
 ) -> Result<Option<TargetProbe>, sqlx::Error> {
-    tenant_tx(pool, tenant, |conn| Box::pin(async move {
+    tenant_write_tx(pool, tenant, |conn| Box::pin(async move {
         sqlx::query_as("UPDATE target_channels SET
             probe_generation = probe_generation + CASE WHEN probe_state IN ('PENDING', 'RUNNING') THEN 0 ELSE 1 END,
             probe_attempts = CASE WHEN probe_state IN ('PENDING', 'RUNNING') THEN probe_attempts ELSE 0 END,
@@ -80,7 +80,7 @@ pub async fn claim_probe(
     tenant: TenantId,
     token: String,
 ) -> Result<Option<ProbeClaim>, sqlx::Error> {
-    tenant_tx(pool, tenant, |conn| Box::pin(async move {
+    tenant_write_tx(pool, tenant, |conn| Box::pin(async move {
         let sender = sqlx::query_scalar::<_, IdentityId>("SELECT i.id FROM identities i
           WHERE i.tenant_id = $1 AND i.target_probe_not_before <= clock_timestamp()
             AND EXISTS (SELECT 1 FROM target_channels t WHERE t.tenant_id = $1 AND t.sender_identity_id = i.id
@@ -115,7 +115,7 @@ pub async fn finish_probe(
     claim: ProbeClaim,
     outcome: ProbeOutcome,
 ) -> Result<bool, sqlx::Error> {
-    tenant_tx(pool, tenant, |conn| Box::pin(async move {
+    tenant_write_tx(pool, tenant, |conn| Box::pin(async move {
         sqlx::query("SELECT id FROM identities WHERE tenant_id = $1 AND id = $2 FOR UPDATE")
             .bind(tenant.get()).bind(claim.sender_identity_id.get()).execute(&mut *conn).await?;
         let (state, success, code, retry, rate_limited) = match outcome {

@@ -156,10 +156,20 @@ pub async fn run_fanout_once(
     for event_id in &event_ids {
         let tenants = list_all_active_tenants(pool).await?;
         tenant_count += tenants.len();
+        let mut fanout_complete = true;
         for tenant in tenants {
-            fanout_canonical_event(pool, tenant, *event_id).await?;
+            if let Err(error) = fanout_canonical_event(pool, tenant, *event_id).await {
+                if matches!(&error, sqlx::Error::Protocol(message) if message == tgm_db::lifecycle::INACTIVE)
+                {
+                    fanout_complete = false;
+                } else {
+                    return Err(error.into());
+                }
+            }
         }
-        mark_canonical_event_fanned_out(pool, *event_id).await?;
+        if fanout_complete {
+            mark_canonical_event_fanned_out(pool, *event_id).await?;
+        }
     }
 
     Ok(FanoutRunOutcome {
@@ -314,9 +324,21 @@ pub async fn run_rule_once(
     let tenant_count = tenants.len();
     let mut event_count = 0;
     for tenant in tenants {
-        let event_ids = list_unprocessed_tenant_event_ids(pool, tenant, event_batch_size).await?;
+        let event_ids = match list_unprocessed_tenant_event_ids(pool, tenant, event_batch_size)
+            .await
+        {
+            Ok(event_ids) => event_ids,
+            Err(error) if matches!(&error, sqlx::Error::Protocol(message) if message == tgm_db::lifecycle::INACTIVE) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         for event_id in event_ids {
             match process_tenant_event(pool, tenant, event_id).await {
+                Err(AppError::Forbidden) if !tgm_db::lifecycle::is_active(pool, tenant).await? => {
+                    break;
+                }
                 Err(AppError::NotFound)
                     if load_tenant_event(pool, tenant, event_id).await?.is_none() => {}
                 result => {

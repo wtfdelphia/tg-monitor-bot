@@ -153,12 +153,14 @@ async fn wait_for_worker_disconnect(pool: &PgPool, application_name: &str) -> Re
 
 async fn seed_event(
     pool: &PgPool,
+    tenant: TenantId,
     receiver_identity_id: IdentityId,
     message_id: i64,
 ) -> Result<CanonicalEventWrite> {
     Ok(insert_canonical_event(
         pool,
         &CanonicalEventInput {
+            receiver_tenant_id: Some(tenant),
             adapter: CanonicalAdapter::MtProto,
             receiver_identity_id,
             tg_chat_id: -1001,
@@ -231,7 +233,7 @@ async fn fanout_process_recovers_partial_work_after_hard_kill(admin: PgPool) -> 
     .execute(&admin)
     .await?;
 
-    let event = seed_event(&app, identity, 1).await?;
+    let event = seed_event(&app, tenant, identity, 1).await?;
     let mut checkpoint_blocker = admin.begin().await?;
     sqlx::query("SELECT id FROM canonical_events WHERE id = $1 FOR NO KEY UPDATE")
         .bind(event.id)
@@ -252,11 +254,11 @@ async fn fanout_process_recovers_partial_work_after_hard_kill(admin: PgPool) -> 
         event_progress(&app, other_tenant, event.id).await?,
         (true, 0)
     );
-    let replay = seed_event(&app, identity, 1).await?;
+    let replay = seed_event(&app, tenant, identity, 1).await?;
     assert_eq!(replay.id, event.id);
     assert!(!replay.inserted);
 
-    let next_event = seed_event(&app, identity, 2).await?;
+    let next_event = seed_event(&app, tenant, identity, 2).await?;
     wait_for_progress(&app, tenant, next_event.id, &mut restarted_worker, true).await?;
     assert_eq!(event_progress(&app, tenant, event.id).await?, (true, 1));
     assert_eq!(
@@ -467,7 +469,7 @@ async fn rule_process_rolls_back_uncommitted_tasks_and_recovers_after_hard_kill(
         rule_ids.push(rule.id);
     }
 
-    let event = seed_event(&app, identity, 1).await?;
+    let event = seed_event(&app, tenant, identity, 1).await?;
     let tenant_event = fanout_canonical_event(&app, tenant, event.id)
         .await?
         .context("来源订阅应生成租户事件")?;
@@ -505,7 +507,7 @@ async fn rule_process_rolls_back_uncommitted_tasks_and_recovers_after_hard_kill(
     assert_rule_task_snapshot(&app, tenant, tenant_event.id, &rule_ids).await?;
     restarted_worker.kill_and_wait()?;
     wait_for_worker_disconnect(&app, "tgm-rule-restart-regression").await?;
-    let replay = seed_event(&app, identity, 1).await?;
+    let replay = seed_event(&app, tenant, identity, 1).await?;
     assert_eq!(replay.id, event.id);
     assert!(!replay.inserted);
     let replay_projection = fanout_canonical_event(&app, tenant, replay.id)
@@ -514,7 +516,7 @@ async fn rule_process_rolls_back_uncommitted_tasks_and_recovers_after_hard_kill(
     assert_eq!(replay_projection.id, tenant_event.id);
     assert!(!replay_projection.inserted);
 
-    let next_event = seed_event(&app, identity, 2).await?;
+    let next_event = seed_event(&app, tenant, identity, 2).await?;
     let next_projection = fanout_canonical_event(&app, tenant, next_event.id)
         .await?
         .context("新消息应生成租户事件")?;

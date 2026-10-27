@@ -32,6 +32,7 @@ pub struct BotGatewayState {
     pub auth_pool: PgPool,
     pub secret_token: String,
     pub receiver_identity_id: IdentityId,
+    pub receiver_tenant_id: Option<TenantId>,
 }
 
 pub fn router(state: BotGatewayState) -> Router {
@@ -92,6 +93,7 @@ async fn webhook_ingest(
         };
     let media = message.media();
     let event = CanonicalEventInput {
+        receiver_tenant_id: state.receiver_tenant_id,
         adapter: CanonicalAdapter::Bot,
         receiver_identity_id: state.receiver_identity_id,
         tg_chat_id: message.chat.id,
@@ -342,11 +344,26 @@ pub async fn serve(
     listener: tokio::net::TcpListener,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), std::io::Error> {
+    let receiver_tenant_id = std::env::var("TGM_DATA_BOT_TENANT_ID").ok();
+    let receiver_tenant_id = match receiver_tenant_id {
+        Some(raw) => {
+            let id = raw.parse::<i64>().map_err(std::io::Error::other)?;
+            Some(
+                sqlx::query_scalar::<_, TenantId>("SELECT id FROM tenants WHERE id=$1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(std::io::Error::other)?,
+            )
+        }
+        None => None,
+    };
     let app = router(BotGatewayState {
         pool,
         auth_pool,
         secret_token,
         receiver_identity_id,
+        receiver_tenant_id,
     });
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
@@ -399,6 +416,7 @@ pub async fn authorize_callback(
     let tenant = auth.tenant_id();
     let resource_exists = tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            tgm_db::lifecycle::require_active(conn, tenant).await?;
             let exists = match reference.resource {
                 CallbackResource::Identity => {
                     sqlx::query_scalar::<_, bool>(

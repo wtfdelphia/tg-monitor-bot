@@ -168,6 +168,7 @@ async fn enqueue(setup: &Setup, chat: i64, message_id: i64, caption: &str, size:
     let canonical = insert_canonical_event(
         &setup.app,
         &CanonicalEventInput {
+            receiver_tenant_id: Some(setup.tenant),
             adapter: CanonicalAdapter::MtProto,
             receiver_identity_id: setup.receiver,
             tg_chat_id: chat,
@@ -410,7 +411,12 @@ async fn relay_album(
     assert_eq!(tasks.len(), 1, "整组只生成一个任务");
     let task = tasks[0];
     let store = support::media_store("tgm-live-album").await;
-    let transport = TelegramDeliveryTransport::new(Arc::clone(&live.bot), store.clone());
+    let transport = TelegramDeliveryTransport::new(
+        Arc::clone(&live.bot),
+        store.clone(),
+        setup.app.clone(),
+        setup.tenant,
+    );
     assert_eq!(
         run_delivery_once(&setup.app, setup.tenant, setup.sender, &transport)
             .await
@@ -418,9 +424,10 @@ async fn relay_album(
         DeliveryRunOutcome::Deferred { task_id: task }
     );
     let guard = LeaseGuard {
+        tenant_id: Some(setup.tenant),
         identity_id: setup.receiver,
         worker_id: "album-live".to_owned(),
-        fencing_token: acquire_lease(&setup.app, setup.receiver, "album-live")
+        fencing_token: acquire_lease(&setup.app, Some(setup.tenant), setup.receiver, "album-live")
             .await
             .expect("抢租约失败")
             .expect("租约不可用"),
@@ -429,6 +436,7 @@ async fn relay_album(
         assert!(
             tgm_db::repo::renew_lease(
                 &setup.app,
+                Some(setup.tenant),
                 setup.receiver,
                 &guard.worker_id,
                 guard.fencing_token
@@ -774,12 +782,18 @@ async fn live_media_relay_end_to_end(admin: PgPool) {
 
     let store = support::media_store("tgm-live-relay").await;
     let setup = setup(admin, chat, username).await;
-    let transport = TelegramDeliveryTransport::new(Arc::clone(&bot), store.clone());
-    let fencing_token = acquire_lease(&setup.app, setup.receiver, "relay-live")
+    let transport = TelegramDeliveryTransport::new(
+        Arc::clone(&bot),
+        store.clone(),
+        setup.app.clone(),
+        setup.tenant,
+    );
+    let fencing_token = acquire_lease(&setup.app, Some(setup.tenant), setup.receiver, "relay-live")
         .await
         .expect("抢租约失败")
         .expect("租约应可获取");
     let guard = LeaseGuard {
+        tenant_id: Some(setup.tenant),
         identity_id: setup.receiver,
         worker_id: "relay-live".to_owned(),
         fencing_token,

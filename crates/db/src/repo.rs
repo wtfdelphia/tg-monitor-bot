@@ -10,7 +10,7 @@
 
 use tgm_core::ids::{IdentityId, TenantId};
 
-use crate::tenant::tenant_tx;
+use crate::tenant::{tenant_tx, tenant_write_tx};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -71,6 +71,7 @@ impl CanonicalEventType {
 
 #[derive(Debug, Clone)]
 pub struct CanonicalEventInput {
+    pub receiver_tenant_id: Option<TenantId>,
     pub adapter: CanonicalAdapter,
     pub receiver_identity_id: IdentityId,
     pub tg_chat_id: i64,
@@ -1335,7 +1336,7 @@ pub async fn update_identity(
     let display_name = input.display_name.flatten();
     let actor_user_id = input.actor_user_id;
     let source = input.source;
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             let before = sqlx::query_as::<_, IdentityWriteRecord>(
                 r#"
@@ -1417,7 +1418,7 @@ pub async fn reset_identity_status(
         Invalid(String),
         Updated(IdentityRecord),
     }
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             let before = sqlx::query_as::<_, IdentityWriteRecord>(
                 r#"
@@ -1499,7 +1500,7 @@ pub async fn delete_identity(
         Blocked(String),
         Deleted,
     }
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             let before = sqlx::query_as::<_, IdentityWriteRecord>(
                 r#"
@@ -1599,7 +1600,7 @@ pub async fn create_source_subscription(
     tenant: TenantId,
     input: SourceSubscriptionCreateInput,
 ) -> Result<SourceSubscriptionRecord, tgm_core::error::AppError> {
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             let identity_exists = sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM identities WHERE id = $1 AND tenant_id = $2)",
@@ -1652,7 +1653,7 @@ pub async fn update_source_subscription(
     }
 
     if input.enabled == Some(true) {
-        let authorized = tenant_tx(pool, tenant, |conn| {
+        let authorized = tenant_write_tx(pool, tenant, |conn| {
             Box::pin(async move {
                 sqlx::query_scalar::<_, Option<i64>>(
                     "SELECT authorized_by FROM source_subscriptions WHERE tenant_id = $1 AND id = $2",
@@ -1673,7 +1674,7 @@ pub async fn update_source_subscription(
         }
     }
 
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             if let Some(identity_id) = input.receiver_identity_id {
                 let identity_exists = sqlx::query_scalar::<_, bool>(
@@ -1796,7 +1797,7 @@ pub async fn create_target_channel(
     tenant: TenantId,
     input: TargetChannelCreateInput,
 ) -> Result<TargetChannelRecord, tgm_core::error::AppError> {
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             if let Err(error) =
                 check_sender_identity(conn, tenant, input.sender_identity_id.get()).await?
@@ -1853,7 +1854,7 @@ pub async fn update_target_channel(
             "至少提供一个目标频道字段".to_owned(),
         ));
     }
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             if let Some(sender_identity_id) = input.sender_identity_id
                 && let Err(error) = check_sender_identity(conn, tenant, sender_identity_id).await?
@@ -1915,7 +1916,7 @@ pub async fn delete_target_channel(
     tenant: TenantId,
     target_id: i64,
 ) -> Result<bool, tgm_core::error::AppError> {
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             Ok(sqlx::query_scalar::<_, i64>(
                 "UPDATE target_channels SET enabled = FALSE, updated_at = clock_timestamp() WHERE tenant_id = $1 AND id = $2 RETURNING id",
@@ -2084,7 +2085,7 @@ pub async fn create_keyword(
 ) -> Result<KeywordRecord, tgm_core::error::AppError> {
     let word = input.word.clone();
     let match_type = input.match_type.clone();
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             sqlx::query_as::<_, KeywordRecord>(
                 r#"
@@ -2149,7 +2150,7 @@ pub async fn import_keywords(
         .map(|input| (input.word.clone(), input.match_type.clone()))
         .collect();
     let conflict_rule = rule_template.clone();
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             let mut keywords = Vec::with_capacity(inputs.len());
             let mut rule_ids = Vec::with_capacity(if rule_template.is_some() {
@@ -2248,7 +2249,7 @@ pub async fn update_keyword(
         .ok_or(tgm_core::error::AppError::NotFound)?;
     let next_word = input.word.clone().unwrap_or(current.word);
     let next_match_type = input.match_type.clone().unwrap_or(current.match_type);
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             sqlx::query_as::<_, KeywordRecord>(
                 r#"
@@ -2311,7 +2312,7 @@ pub async fn delete_keyword(
     tenant: TenantId,
     keyword_id: i64,
 ) -> Result<(bool, Vec<i64>), tgm_core::error::AppError> {
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             let referenced_rule_ids = sqlx::query_scalar::<_, i64>(
                 "SELECT id FROM rules WHERE tenant_id = $1 AND keyword_id = $2 ORDER BY id",
@@ -2590,7 +2591,7 @@ pub async fn create_rule(
 ) -> Result<RuleWrite, tgm_core::error::AppError> {
     validate_rule_inputs(&input.conditions, &input.replacements)?;
     let conflict_key = ConflictKey::from_create(&input);
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move { insert_rule_tx(&mut *conn, tenant, &input).await })
     })
     .await;
@@ -2613,7 +2614,7 @@ pub async fn copy_rule(
     source_rule_id: i64,
     target_ref: i64,
 ) -> Result<RuleWrite, tgm_core::error::AppError> {
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             let Some(source) = sqlx::query_as::<_, CopyRuleSource>(
                 r#"
@@ -2773,7 +2774,7 @@ pub async fn update_rule(
 ) -> Result<RuleWrite, tgm_core::error::AppError> {
     validate_rule_inputs(&input.conditions, &input.replacements)?;
     let conflict_key = ConflictKey::from_update(&input);
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             let Some(existing) = sqlx::query_as::<_, ExistingRule>(
                 r#"
@@ -2914,7 +2915,7 @@ pub async fn copy_rule_replacements(
         ));
     }
 
-    let result = tenant_tx(pool, tenant, |conn| {
+    let result = tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             let mut lock_ids = to_rules.clone();
             lock_ids.push(from_rule);
@@ -3056,7 +3057,7 @@ pub async fn delete_rule(
     tenant: TenantId,
     rule_id: i64,
 ) -> Result<bool, tgm_core::error::AppError> {
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             Ok(sqlx::query_scalar::<_, i64>(
                 "DELETE FROM rules WHERE tenant_id = $1 AND id = $2 RETURNING id",
@@ -3604,6 +3605,41 @@ pub async fn mark_canonical_event_fanned_out(
     canonical_event_id: i64,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    let tenants: Vec<TenantId> = sqlx::query_scalar(
+        "SELECT id FROM tenants WHERE status IN ('active', 'suspended') ORDER BY id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for tenant in tenants {
+        crate::lifecycle::lock(&mut tx, tenant, false).await?;
+        sqlx::query("SELECT set_config('app.tenant_id',$1,true)")
+            .bind(tenant.get().to_string())
+            .execute(&mut *tx)
+            .await?;
+        let pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1
+                  FROM source_subscriptions subscription
+                  JOIN canonical_events event
+                    ON event.id = $1
+                   AND subscription.tg_chat_id = event.tg_chat_id
+                   AND subscription.receiver_identity_id = event.receiver_identity_id
+                 WHERE subscription.enabled
+                   AND NOT EXISTS(
+                       SELECT 1 FROM tenant_events projection
+                        WHERE projection.tenant_id = subscription.tenant_id
+                          AND projection.canonical_event_id = event.id
+                   )
+            )",
+        )
+        .bind(canonical_event_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if pending {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+    }
     if let Some(identity) = sqlx::query_scalar::<_, i64>(
         "SELECT receiver_identity_id FROM canonical_events WHERE id = $1",
     )
@@ -3631,7 +3667,7 @@ pub async fn list_unprocessed_tenant_event_ids(
     tenant: TenantId,
     limit: i64,
 ) -> Result<Vec<i64>, sqlx::Error> {
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             sqlx::query_scalar::<_, i64>(
                 "SELECT id
@@ -3654,7 +3690,7 @@ pub async fn load_enabled_rules(
     pool: &PgPool,
     tenant: TenantId,
 ) -> Result<Vec<(RuleRecord, Vec<RuleConditionRecord>)>, sqlx::Error> {
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             let rules = sqlx::query_as::<_, RuleRecord>(
                 r#"
@@ -3743,7 +3779,7 @@ pub async fn enqueue_delivery_tasks(
 ) -> Result<Vec<DeliveryTaskWrite>, EnqueueError> {
     let matched_keywords = matched_keywords.to_vec();
     let tasks = tasks.to_vec();
-    crate::tenant::tenant_tx_with_error(pool, tenant, |conn| {
+    crate::tenant::tenant_write_tx_with_error(pool, tenant, |conn| {
         Box::pin(async move {
             crate::tenant_retention::lock_rule_versions(conn, tenant).await?;
             crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
@@ -3950,7 +3986,7 @@ pub async fn claim_due_delivery_task(
     tenant: TenantId,
     sender_identity_id: IdentityId,
 ) -> Result<Option<DeliveryTaskRecord>, sqlx::Error> {
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             sqlx::query_as::<_, DeliveryTaskRecord>(
@@ -4004,7 +4040,7 @@ pub async fn list_delivery_sender_candidates(
     pool: &PgPool,
     tenant: TenantId,
 ) -> Result<Vec<IdentityId>, sqlx::Error> {
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             sqlx::query_scalar::<_, IdentityId>(
                 "SELECT i.id
@@ -4038,7 +4074,7 @@ pub async fn mark_bot_sender_unauthorized(
     tenant: TenantId,
     identity: IdentityId,
 ) -> Result<bool, sqlx::Error> {
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             let before = sqlx::query_scalar::<_, String>(
                 "UPDATE identities AS i
@@ -4091,7 +4127,7 @@ pub async fn recover_stale_delivery_tasks(
     sender_identity_id: IdentityId,
     stale_after_seconds: i64,
 ) -> Result<u64, sqlx::Error> {
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             let updated = sqlx::query(
@@ -4281,7 +4317,7 @@ pub async fn retry_delivery_task(
     tenant: TenantId,
     task_id: i64,
 ) -> Result<bool, sqlx::Error> {
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             let updated = sqlx::query(
@@ -4398,6 +4434,7 @@ pub async fn complete_delivery_task(
 ) -> Result<bool, sqlx::Error> {
     tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            crate::lifecycle::lock(conn, tenant, false).await?;
             crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             let attempt = sqlx::query_scalar::<_, i32>(
                 r#"
@@ -4446,8 +4483,23 @@ pub async fn record_delivery_failure(
     failure: DeliveryTaskFailureInput,
 ) -> Result<Option<DeliveryTaskFailureWrite>, sqlx::Error> {
     tenant_tx(pool, tenant, |conn| {
-        let status = failure.status.as_str();
         Box::pin(async move {
+            let active = crate::lifecycle::active(conn, tenant).await?;
+            let uncertain = !active
+                && matches!(
+                    failure.error_code.as_str(),
+                    "TELEGRAM_CLIENT_ERROR"
+                        | "MESSAGE_NOT_RETURNED"
+                        | "RANDOM_ID_DUPLICATE"
+                        | "PARTIAL_SENT"
+                );
+            let status = if uncertain {
+                "SENDING"
+            } else if active {
+                failure.status.as_str()
+            } else {
+                "CANCELLED"
+            };
             crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             let updated = sqlx::query_as::<_, DeliveryTaskFailureWrite>(
                 r#"
@@ -4457,7 +4509,7 @@ pub async fn record_delivery_failure(
                        next_retry_at = $5,
                        last_error_code = $6,
                        completed_at = CASE
-                           WHEN $3 = 'DEAD' THEN clock_timestamp()
+                           WHEN $3 IN ('DEAD','CANCELLED') THEN clock_timestamp()
                            ELSE completed_at
                        END,
                        updated_at = clock_timestamp()
@@ -4471,7 +4523,7 @@ pub async fn record_delivery_failure(
             .bind(task_id)
             .bind(status)
             .bind(failure.attempt_count)
-            .bind(failure.next_retry_at)
+            .bind(if active { failure.next_retry_at } else { None })
             .bind(&failure.error_code)
             .fetch_optional(&mut *conn)
             .await?;
@@ -4883,12 +4935,14 @@ pub async fn defer_delivery_task(
 ) -> Result<bool, sqlx::Error> {
     tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            let active = crate::lifecycle::active(conn, tenant).await?;
             crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             let updated = sqlx::query(
                 r#"
                 UPDATE delivery_tasks
-                   SET status = 'PENDING',
-                       next_retry_at = clock_timestamp() + make_interval(secs => $3),
+                   SET status = CASE WHEN $4 THEN 'PENDING' ELSE 'CANCELLED' END,
+                       next_retry_at = CASE WHEN $4 THEN clock_timestamp() + make_interval(secs => $3) ELSE NULL END,
+                       completed_at = CASE WHEN $4 THEN completed_at ELSE clock_timestamp() END,
                        updated_at = clock_timestamp()
                  WHERE tenant_id = $1
                    AND id = $2
@@ -4898,6 +4952,7 @@ pub async fn defer_delivery_task(
             .bind(tenant.get())
             .bind(task_id)
             .bind(delay_seconds as f64)
+            .bind(active)
             .execute(&mut *conn)
             .await?
             .rows_affected();
@@ -4963,7 +5018,9 @@ pub async fn insert_canonical_event_leased(
         tx.rollback().await?;
         return Ok(None);
     }
-    let written = insert_canonical_event_in(&mut tx, event).await?;
+    let mut event = event.clone();
+    event.receiver_tenant_id = lease.tenant_id;
+    let written = insert_canonical_event_in(&mut tx, &event).await?;
     tx.commit().await?;
     Ok(Some(written))
 }
@@ -4972,6 +5029,15 @@ async fn insert_canonical_event_in(
     conn: &mut sqlx::PgConnection,
     event: &CanonicalEventInput,
 ) -> Result<CanonicalEventWrite, sqlx::Error> {
+    if !crate::lifecycle::identity_active(
+        conn,
+        event.receiver_identity_id,
+        event.receiver_tenant_id,
+    )
+    .await?
+    {
+        return Err(sqlx::Error::Protocol(crate::lifecycle::INACTIVE.to_owned()));
+    }
     crate::shared_retention::lock_writer(conn, event.receiver_identity_id.get()).await?;
     if let Some(group) = &event.media_group_id {
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -5072,7 +5138,7 @@ pub async fn fanout_canonical_event(
     tenant: TenantId,
     canonical_event_id: i64,
 ) -> Result<Option<TenantEventWrite>, sqlx::Error> {
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             if let Some(identity) = sqlx::query_scalar::<_, i64>(
@@ -5134,6 +5200,7 @@ pub async fn fanout_canonical_event(
 /// 一次租约持有：写入前用它校验调用方仍是持有者。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseGuard {
+    pub tenant_id: Option<TenantId>,
     pub identity_id: IdentityId,
     pub worker_id: String,
     pub fencing_token: i64,
@@ -5144,6 +5211,9 @@ pub async fn lease_is_held(
     conn: &mut sqlx::PgConnection,
     lease: &LeaseGuard,
 ) -> Result<bool, sqlx::Error> {
+    if !crate::lifecycle::identity_active(conn, lease.identity_id, lease.tenant_id).await? {
+        return Ok(false);
+    }
     let held = sqlx::query_scalar::<_, i32>(
         "SELECT 1
            FROM account_leases
@@ -5169,7 +5239,7 @@ pub async fn list_mtproto_worker_candidates(
     pool: &PgPool,
     tenant: TenantId,
 ) -> Result<Vec<(IdentityId, i32)>, sqlx::Error> {
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             sqlx::query_as::<_, (IdentityId, i32)>(
                 "SELECT i.id, s.api_id
@@ -5200,7 +5270,7 @@ pub async fn set_leased_identity_status(
     status: &'static str,
 ) -> Result<bool, sqlx::Error> {
     let lease = lease.clone();
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             if !lease_is_held(&mut *conn, &lease).await? {
                 return Ok(false);
@@ -5288,7 +5358,7 @@ pub async fn mark_leased_identity_lost(
     lost: LostAuthorization,
 ) -> Result<bool, sqlx::Error> {
     let lease = lease.clone();
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             if !lease_is_held(&mut *conn, &lease).await? {
                 return Ok(false);
@@ -5355,7 +5425,7 @@ pub async fn list_due_tenant_notifications(
     tenant: TenantId,
     limit: i64,
 ) -> Result<Vec<DueTenantNotification>, sqlx::Error> {
-    tenant_tx(pool, tenant, |conn| {
+    tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             sqlx::query_as::<_, DueTenantNotification>(
                 "SELECT n.id, n.kind, n.identity_id, t.owner_user_id, n.attempt_count
@@ -5401,6 +5471,11 @@ pub async fn record_tenant_notification(
 ) -> Result<bool, sqlx::Error> {
     tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            let active = crate::lifecycle::active(conn, tenant).await?;
+            let outcome = match outcome {
+                TenantNotificationOutcome::Retry { error_code, .. } if !active => TenantNotificationOutcome::Dead { error_code },
+                outcome => outcome,
+            };
             if sqlx::query_scalar::<_, i64>(
                 "SELECT id FROM tenant_notifications WHERE tenant_id = $1 AND id = $2 AND status = 'PENDING' FOR UPDATE",
             )
@@ -5471,10 +5546,14 @@ pub async fn record_tenant_notification(
 /// worker 持有时返回 `None`，不等待也不报错。
 pub async fn acquire_lease(
     pool: &PgPool,
+    tenant: Option<TenantId>,
     identity_id: IdentityId,
     worker_id: &str,
 ) -> Result<Option<i64>, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    if !crate::lifecycle::identity_active(&mut tx, identity_id, tenant).await? {
+        return Ok(None);
+    }
     let inserted = sqlx::query_scalar::<_, i64>(
         r#"
         INSERT INTO account_leases
@@ -5542,11 +5621,15 @@ pub async fn acquire_lease(
 /// 复活。返回 `false` 表示当前 worker 已失去租约，调用方不得重试续租。
 pub async fn renew_lease(
     pool: &PgPool,
+    tenant: Option<TenantId>,
     identity_id: IdentityId,
     worker_id: &str,
     fencing_token: i64,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    if !crate::lifecycle::identity_active(&mut tx, identity_id, tenant).await? {
+        return Ok(false);
+    }
     let existing = sqlx::query_as::<_, (String, i64, DateTime<Utc>)>(
         "SELECT worker_id, fencing_token, expires_at
            FROM account_leases

@@ -21,7 +21,7 @@ use tgm_core::auth::AuthContext;
 use tgm_core::error::AppError;
 use tgm_core::ids::IdentityId;
 use tgm_core::secret::Secret;
-use tgm_db::tenant::tenant_tx;
+use tgm_db::tenant::tenant_write_tx as tenant_tx;
 use thiserror::Error;
 
 use crate::bot_gateway::{list_member_contexts, verify_webhook_secret};
@@ -543,6 +543,12 @@ async fn webhook(
     let Some(auth) = contexts.next() else {
         return StatusCode::NO_CONTENT;
     };
+    if !tgm_db::lifecycle::is_active(state.app_pool(), auth.tenant_id())
+        .await
+        .unwrap_or(false)
+    {
+        return StatusCode::NO_CONTENT;
+    }
     if contexts.next().is_some() {
         tracing::warn!(
             actor_user_id,

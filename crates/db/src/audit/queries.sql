@@ -940,6 +940,127 @@ WITH cleaner AS (
          AND pg_get_expr(p.polwithcheck, p.polrelid) LIKE '%system_logs%'
          AND pg_get_expr(p.polwithcheck, p.polrelid) LIKE '%5000%')
 ) SELECT reason::text FROM violations ORDER BY reason;
+-- name: C14 租户生命周期角色必须存在且权限收敛
+WITH cleaner AS (
+  SELECT * FROM pg_roles WHERE rolname = 'tenant_lifecycle'
+), allowed_columns(tbl, col, privilege) AS (
+  VALUES ('tenants', 'id', 'SELECT'),
+         ('tenants', 'status', 'SELECT'),
+         ('tenants', 'suspended_at', 'SELECT'),
+         ('tenants', 'status', 'UPDATE'),
+         ('tenants', 'suspended_at', 'UPDATE'),
+         ('tenants', 'updated_at', 'UPDATE'),
+         ('identities', 'id', 'SELECT'),
+         ('identities', 'tenant_id', 'SELECT'),
+         ('account_leases', 'identity_id', 'SELECT'),
+         ('account_leases', 'expires_at', 'SELECT'),
+         ('account_leases', 'expires_at', 'UPDATE'),
+         ('delivery_tasks', 'id', 'SELECT'),
+         ('delivery_tasks', 'tenant_id', 'SELECT'),
+         ('delivery_tasks', 'status', 'SELECT'),
+         ('delivery_tasks', 'status', 'UPDATE'),
+         ('delivery_tasks', 'next_retry_at', 'UPDATE'),
+         ('delivery_tasks', 'completed_at', 'UPDATE'),
+         ('delivery_tasks', 'updated_at', 'UPDATE'),
+         ('audit_logs', 'tenant_id', 'INSERT'),
+         ('audit_logs', 'action', 'INSERT'),
+         ('audit_logs', 'resource', 'INSERT'),
+         ('audit_logs', 'resource_id', 'INSERT'),
+         ('audit_logs', 'before', 'INSERT'),
+         ('audit_logs', 'after', 'INSERT'),
+         ('audit_logs', 'source', 'INSERT'),
+         ('system_logs', 'tenant_id', 'INSERT'),
+         ('system_logs', 'level', 'INSERT'),
+         ('system_logs', 'module', 'INSERT'),
+         ('system_logs', 'event', 'INSERT'),
+         ('system_logs', 'context', 'INSERT')
+), violations AS (
+  SELECT 'tenant_lifecycle 缺失或属性不符' AS reason
+   WHERE NOT EXISTS (SELECT 1 FROM cleaner WHERE rolcanlogin AND NOT
+          (rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication))
+  UNION ALL
+  SELECT 'tenant_lifecycle 不得参与角色成员关系'
+    FROM cleaner r WHERE EXISTS (SELECT 1 FROM pg_auth_members WHERE member = r.oid OR roleid = r.oid)
+  UNION ALL
+  SELECT 'tenant_lifecycle 不得拥有表、schema 或函数'
+    FROM cleaner r WHERE EXISTS (SELECT 1 FROM pg_class WHERE relowner = r.oid)
+       OR EXISTS (SELECT 1 FROM pg_namespace WHERE nspowner = r.oid)
+       OR EXISTS (SELECT 1 FROM pg_proc WHERE proowner = r.oid)
+  UNION ALL
+  SELECT 'tenant_lifecycle 不得在用户 schema 建对象'
+    FROM cleaner r JOIN pg_namespace n ON n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+   WHERE has_schema_privilege(r.oid, n.oid, 'CREATE')
+  UNION ALL
+  SELECT '表权限不符: ' || n.nspname || '.' || c.relname || ':' || privilege
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER'), ('MAINTAIN')) p(privilege)
+   WHERE c.relkind IN ('r','p','v','m','f') AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND (CASE WHEN privilege = 'MAINTAIN' AND current_setting('server_version_num')::int < 170000
+               THEN false ELSE has_table_privilege(r.oid, c.oid, privilege) END) <>
+       false
+  UNION ALL
+  SELECT '表权限不得转授: ' || n.nspname || '.' || c.relname
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   CROSS JOIN LATERAL aclexplode(c.relacl) acl
+   WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND acl.grantee = r.oid AND acl.is_grantable
+  UNION ALL
+  SELECT '列权限不符: ' || n.nspname || '.' || c.relname || '.' || a.attname || ':' || p.privilege
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+   CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')) p(privilege)
+   WHERE c.relkind IN ('r','p','v','m','f') AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND has_column_privilege(r.oid, c.oid, a.attnum, p.privilege) <>
+       EXISTS (SELECT 1 FROM allowed_columns allow WHERE n.nspname = 'public' AND allow.tbl = c.relname AND allow.col = a.attname AND allow.privilege = p.privilege)
+  UNION ALL
+  SELECT '列权限不得转授: ' || n.nspname || '.' || c.relname || '.' || a.attname
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+   CROSS JOIN LATERAL aclexplode(a.attacl) acl
+   WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND acl.grantee = r.oid AND acl.is_grantable
+  UNION ALL
+  SELECT '序列权限不符: ' || n.nspname || '.' || c.relname || ':' || privilege
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   CROSS JOIN (VALUES ('USAGE'), ('SELECT'), ('UPDATE')) p(privilege)
+   WHERE c.relkind = 'S' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND has_sequence_privilege(r.oid, c.oid, privilege) <>
+       (n.nspname = 'public' AND c.relname IN ('system_logs_id_seq','audit_logs_id_seq') AND privilege = 'USAGE')
+  UNION ALL
+  SELECT '必要列缺失: ' || allow.tbl || '.' || allow.col FROM allowed_columns allow
+   WHERE NOT EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = allow.tbl
+       AND a.attname = allow.col AND a.attnum > 0 AND NOT a.attisdropped)
+  UNION ALL
+  SELECT '序列权限不得转授: ' || n.nspname || '.' || c.relname
+    FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   CROSS JOIN LATERAL aclexplode(c.relacl) acl
+   WHERE c.relkind = 'S' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+     AND acl.grantee = r.oid AND acl.is_grantable
+  UNION ALL
+  SELECT 'app_user 不得修改租户状态或暂停时间'
+   WHERE has_table_privilege('app_user','tenants','UPDATE')
+      OR has_column_privilege('app_user','tenants','status','UPDATE')
+      OR has_column_privilege('app_user','tenants','suspended_at','UPDATE')
+  UNION ALL
+  SELECT '生命周期策略缺失或角色不符: ' || expected.name
+    FROM cleaner r CROSS JOIN (VALUES ('identities','lifecycle_identity_keys','r'),
+      ('delivery_tasks','lifecycle_task_keys','r'),('delivery_tasks','lifecycle_task_cancel','w'),
+      ('audit_logs','lifecycle_audit','a'),('system_logs','lifecycle_log','a')) expected(tbl,name,command)
+   WHERE NOT EXISTS (SELECT 1 FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid
+      JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=expected.tbl
+      AND p.polname=expected.name AND p.polcmd::text=expected.command AND p.polpermissive
+      AND p.polroles=ARRAY[r.oid]::oid[]
+      AND coalesce(pg_get_expr(p.polqual,p.polrelid),pg_get_expr(p.polwithcheck,p.polrelid)) LIKE '%app.tenant_id%')
+  UNION ALL
+  SELECT '租户暂停一致性约束或触发器缺失'
+   WHERE NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='tenants'::regclass
+       AND conname='tenant_suspension_consistent' AND convalidated)
+      OR NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='tenants'::regclass
+       AND tgname='tenant_suspension_time' AND tgenabled='O')
+      OR NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='account_leases'::regclass
+       AND tgname='lifecycle_lease_expiry' AND tgenabled='O')
+) SELECT reason::text FROM violations ORDER BY reason;
 -- name: C9 租户清理角色必须存在且权限收敛
 WITH cleaner AS (
   SELECT * FROM pg_roles WHERE rolname = 'tenant_cleanup'

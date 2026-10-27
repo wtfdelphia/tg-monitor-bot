@@ -52,7 +52,7 @@ pub enum AppError {
     // `transparent` 是**刻意**的：它让 Display 转发出底层错误全文，
     // 那是给日志看的。对外的文案走 public_message()，见该方法的注释。
     #[error(transparent)]
-    Db(#[from] sqlx::Error),
+    Db(sqlx::Error),
 
     /// 兜底的 500。**偏离 eng/00 §三 的草图**：那里写的是
     /// `Other(#[from] anyhow::Error)`，但同一节的纪律 1 规定
@@ -70,6 +70,16 @@ pub enum AppError {
     /// `Into<Box<dyn Error + Send + Sync>>`），只是得自己写出来。
     #[error(transparent)]
     Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl From<sqlx::Error> for AppError {
+    fn from(error: sqlx::Error) -> Self {
+        if matches!(&error,sqlx::Error::Protocol(message) if message=="tgm: tenant is not active") {
+            Self::Forbidden
+        } else {
+            Self::Db(error)
+        }
+    }
 }
 
 impl AppError {

@@ -364,6 +364,13 @@ pub async fn run_relay_once(
     opener: &dyn MediaOpener,
     store: &MediaStore,
 ) -> Result<RelayOutcome, sqlx::Error> {
+    let _admission = match lease.tenant_id {
+        Some(tenant) => match tgm_db::lifecycle::WorkerGuard::acquire(pool, tenant).await? {
+            Some(guard) => Some(guard),
+            None => return Ok(RelayOutcome::Idle),
+        },
+        None => None,
+    };
     let Some(job) = claim_media_relay_job(pool, lease).await? else {
         return Ok(RelayOutcome::Idle);
     };

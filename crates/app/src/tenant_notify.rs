@@ -109,6 +109,9 @@ pub async fn deliver_tenant(
         attempt_count,
     } in due
     {
+        let Some(_admission) = tgm_db::lifecycle::WorkerGuard::acquire(pool, tenant).await? else {
+            break;
+        };
         let text = notification_text(&kind, identity_id.get());
         let outcome = classify(
             bot_api.send_status_message(owner_user_id, &text).await,

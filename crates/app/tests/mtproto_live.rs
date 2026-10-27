@@ -238,9 +238,14 @@ async fn live_t6_revoked_session_marks_identity_unauthorized(admin: PgPool) {
     .await
     .expect("读审计失败");
     assert_eq!(audits, 1);
-    let next = acquire_lease(&seeded.app, seeded.identity, "qr-t6-next")
-        .await
-        .expect("抢租约失败");
+    let next = acquire_lease(
+        &seeded.app,
+        Some(seeded.tenant),
+        seeded.identity,
+        "qr-t6-next",
+    )
+    .await
+    .expect("抢租约失败");
     assert!(next.is_some(), "失效后租约必须立即可接管");
     let candidates = tgm_db::repo::list_mtproto_worker_candidates(&seeded.app, seeded.tenant)
         .await
@@ -319,9 +324,14 @@ async fn live_r1_revoked_while_online(admin: PgPool) {
     .await
     .expect("读审计失败");
     assert_eq!(audits, 1);
-    let next = acquire_lease(&seeded.app, seeded.identity, "wp2-r1-next")
-        .await
-        .expect("抢租约失败");
+    let next = acquire_lease(
+        &seeded.app,
+        Some(seeded.tenant),
+        seeded.identity,
+        "wp2-r1-next",
+    )
+    .await
+    .expect("抢租约失败");
     assert!(next.is_some(), "失效后租约必须立即可接管");
     println!(
         "[R1] exit={exit:?} online_until_detected={online_for:?} status=unauthorized audits={audits} lease_takeover=ok"

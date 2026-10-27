@@ -43,7 +43,7 @@ async fn setup(
     tgm_db::tenant_retention::check_connection(&cleanup).await?;
     sqlx::raw_sql(
         "INSERT INTO tenants (name,owner_user_id,plan,status) VALUES
-        ('short-free',99001,'free','suspended'),('short-pro',99002,'pro','deleted');
+        ('short-free',99001,'free','active'),('short-pro',99002,'pro','deleted');
         INSERT INTO identities (kind) VALUES ('mtproto');",
     )
     .execute(admin.raw())
@@ -62,6 +62,21 @@ async fn setup(
     .execute(admin.raw())
     .await?;
     Ok((app, cleanup, admin, tenants[0], tenants[1], identity))
+}
+
+async fn activate_tenant(
+    admin: &support::AdminOnlyPool,
+    tenant: TenantId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE tenants
+            SET status='active', suspended_at=NULL, updated_at=clock_timestamp()
+          WHERE id=$1",
+    )
+    .bind(tenant)
+    .execute(admin.raw())
+    .await?;
+    Ok(())
 }
 
 async fn seed_event(
@@ -126,6 +141,7 @@ async fn processed_projection_expires_before_plan_without_harming_other_tenant(
     injected: PgPool,
 ) -> TestResult {
     let (app, cleanup, admin, free, pro, identity) = setup(injected).await?;
+    activate_tenant(&admin, pro).await?;
     let event = seed_event(admin.raw(), identity, 1, "2 days").await?;
     let first = projection(&app, free, event).await?;
     let second = projection(&app, pro, event).await?;
@@ -221,6 +237,7 @@ async fn all_task_states_unprocessed_matched_and_unfanned_are_protected(
             .await?;
     }
     let other = seed_event(admin.raw(), identity, 20, "2 days").await?;
+    activate_tenant(&admin, pro).await?;
     let other_projection = projection(&app, pro, other).await?;
     repo::mark_canonical_event_fanned_out(&app, other).await?;
     process_unmatched(&app, pro, other_projection).await?;
@@ -342,6 +359,7 @@ async fn cleanup_first_blocks_late_fanout_and_enqueue_then_preserves_completion(
 #[sqlx::test(migrations = "../../migrations-test")]
 async fn writers_first_skip_cleanup_and_partial_fanout_can_resume(injected: PgPool) -> TestResult {
     let (app, cleanup, admin, free, pro, identity) = setup(injected).await?;
+    activate_tenant(&admin, pro).await?;
     let event = seed_event(admin.raw(), identity, 1, "2 days").await?;
     let tenant_event = projection(&app, free, event).await?;
     process_unmatched(&app, free, tenant_event).await?;
@@ -425,6 +443,7 @@ async fn group_member_and_downloading_references_outlive_projection_cleanup(
     injected: PgPool,
 ) -> TestResult {
     let (app, cleanup, admin, free, pro, identity) = setup(injected).await?;
+    activate_tenant(&admin, pro).await?;
     let group = seed_event(admin.raw(), identity, 1, "2 days").await?;
     let member = seed_event(admin.raw(), identity, 2, "2 days").await?;
     sqlx::query("UPDATE canonical_events SET event_type='MEDIA_GROUP_COMPLETED',media_group_id='short-album' WHERE id=$1")
@@ -535,6 +554,7 @@ async fn matched_other_tenant_keeps_global_match_and_plan_retention(
     injected: PgPool,
 ) -> TestResult {
     let (app, cleanup, admin, free, pro, identity) = setup(injected).await?;
+    activate_tenant(&admin, pro).await?;
     let event = seed_event(admin.raw(), identity, 1, "2 days").await?;
     let first = projection(&app, free, event).await?;
     let second = projection(&app, pro, event).await?;

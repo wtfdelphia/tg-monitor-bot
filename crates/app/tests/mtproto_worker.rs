@@ -51,12 +51,18 @@ async fn set_api_id(admin: &support::AdminOnlyPool, identity: IdentityId, api_id
         .expect("写入 api_id 失败");
 }
 
-async fn take_lease(app: &PgPool, identity: IdentityId, worker: &str) -> LeaseGuard {
-    let fencing_token = acquire_lease(app, identity, worker)
+async fn take_lease(
+    app: &PgPool,
+    tenant: TenantId,
+    identity: IdentityId,
+    worker: &str,
+) -> LeaseGuard {
+    let fencing_token = acquire_lease(app, Some(tenant), identity, worker)
         .await
         .expect("抢租约失败")
         .expect("租约应可获取");
     LeaseGuard {
+        tenant_id: Some(tenant),
         identity_id: identity,
         worker_id: worker.to_owned(),
         fencing_token,
@@ -106,7 +112,7 @@ async fn stale_fencing_token_cannot_write_events(admin: PgPool) {
     let tenant = support::seed_tenant(&admin, "mtw-a", 9101).await;
     let identity = seed_mtproto(&admin, tenant, "offline").await;
 
-    let zombie = take_lease(&app, identity, "worker-a").await;
+    let zombie = take_lease(&app, tenant, identity, "worker-a").await;
     let event = canonical_event(identity, &incoming(1), 0).expect("构造事件失败");
     let first = insert_canonical_event_leased(&app, &zombie, &event)
         .await
@@ -115,7 +121,7 @@ async fn stale_fencing_token_cannot_write_events(admin: PgPool) {
     assert!(first.inserted);
 
     expire_lease(&admin, identity).await;
-    let successor = take_lease(&app, identity, "worker-b").await;
+    let successor = take_lease(&app, tenant, identity, "worker-b").await;
     assert!(
         successor.fencing_token > zombie.fencing_token,
         "接管必须递增 token"
@@ -150,7 +156,7 @@ async fn redelivered_message_is_deduplicated_but_new_edit_is_kept(admin: PgPool)
     let (app, admin) = support::pools(admin).await;
     let tenant = support::seed_tenant(&admin, "mtw-b", 9102).await;
     let identity = seed_mtproto(&admin, tenant, "offline").await;
-    let lease = take_lease(&app, identity, "worker-a").await;
+    let lease = take_lease(&app, tenant, identity, "worker-a").await;
 
     let created = canonical_event(identity, &incoming(5), 0).expect("构造事件失败");
     let first = insert_canonical_event_leased(&app, &lease, &created)
@@ -185,12 +191,12 @@ async fn stale_worker_cannot_overwrite_session(admin: PgPool) {
     let identity = seed_mtproto(&admin, tenant, "offline").await;
     let kek = kek();
 
-    let zombie = take_lease(&app, identity, "worker-a").await;
+    let zombie = take_lease(&app, tenant, identity, "worker-a").await;
     store_identity_secret_leased(&app, &kek, tenant, &zombie, &Secret::new(b"old".to_vec()))
         .await
         .expect("持有者应能落库");
     expire_lease(&admin, identity).await;
-    let successor = take_lease(&app, identity, "worker-b").await;
+    let successor = take_lease(&app, tenant, identity, "worker-b").await;
     store_identity_secret_leased(
         &app,
         &kek,
@@ -218,7 +224,7 @@ async fn unauthorized_releases_lease_audits_and_is_not_reverted(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     let tenant = support::seed_tenant(&admin, "mtw-d", 9104).await;
     let identity = seed_mtproto(&admin, tenant, "offline").await;
-    let lease = take_lease(&app, identity, "worker-a").await;
+    let lease = take_lease(&app, tenant, identity, "worker-a").await;
     assert!(
         set_leased_identity_status(&app, tenant, &lease, "online")
             .await
@@ -244,7 +250,7 @@ async fn unauthorized_releases_lease_audits_and_is_not_reverted(admin: PgPool) {
     assert_eq!(audit.1, serde_json::json!({ "status": "online" }));
 
     // 释放后立即可接管，且 token 递增（spec/08 §五 第 1 条）。
-    let next = take_lease(&app, identity, "worker-b").await;
+    let next = take_lease(&app, tenant, identity, "worker-b").await;
     assert!(next.fencing_token > lease.fencing_token);
     // 新持有者也不能把 unauthorized 改回 online：只有重新授权能退出这个状态。
     assert!(
@@ -260,9 +266,9 @@ async fn stale_worker_cannot_mark_unauthorized_or_change_status(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     let tenant = support::seed_tenant(&admin, "mtw-e", 9105).await;
     let identity = seed_mtproto(&admin, tenant, "offline").await;
-    let zombie = take_lease(&app, identity, "worker-a").await;
+    let zombie = take_lease(&app, tenant, identity, "worker-a").await;
     expire_lease(&admin, identity).await;
-    let _successor = take_lease(&app, identity, "worker-b").await;
+    let _successor = take_lease(&app, tenant, identity, "worker-b").await;
 
     assert!(
         !mark_leased_identity_unauthorized(&app, tenant, &zombie)
@@ -340,7 +346,7 @@ async fn identity_without_session_exits_and_releases_lease(admin: PgPool) {
     .expect("运行失败");
     assert_eq!(exit, IdentityExit::NoSession);
     // 主动释放后另一个 worker 立刻能接管，不用等 30s。
-    let next = take_lease(&app, identity, "worker-b").await;
+    let next = take_lease(&app, tenant, identity, "worker-b").await;
     assert_eq!(next.fencing_token, 2);
 
     let busy = run_identity(

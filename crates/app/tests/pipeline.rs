@@ -181,6 +181,7 @@ async fn pipeline_fanout_rule_match_and_delivery_outbox_are_idempotent(admin: Pg
     .expect("创建测试规则快照失败");
 
     let canonical = CanonicalEventInput {
+        receiver_tenant_id: Some(tenant),
         adapter: CanonicalAdapter::MtProto,
         receiver_identity_id: receiver_identity,
         tg_chat_id: -1001,
@@ -521,6 +522,7 @@ async fn rule_worker_processes_pending_events_and_stops_cleanly(admin: PgPool) {
     let canonical = tgm_db::repo::insert_canonical_event(
         &app,
         &CanonicalEventInput {
+            receiver_tenant_id: Some(tenant),
             adapter: CanonicalAdapter::MtProto,
             receiver_identity_id: receiver_identity,
             tg_chat_id: -1009,
@@ -613,6 +615,7 @@ async fn fanout_worker_marks_events_and_stops_cleanly(admin: PgPool) {
     let canonical = tgm_db::repo::insert_canonical_event(
         &app,
         &CanonicalEventInput {
+            receiver_tenant_id: Some(tenant),
             adapter: CanonicalAdapter::MtProto,
             receiver_identity_id: receiver_identity,
             tg_chat_id: -1010,
@@ -684,4 +687,80 @@ async fn fanout_worker_marks_events_and_stops_cleanly(admin: PgPool) {
         .expect("等待扇出 worker 退出失败")
         .expect("扇出 worker 返回错误");
     assert_eq!(outcome, FanoutWorkerExit::Shutdown);
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn fanout_does_not_mark_shared_event_done_while_tenant_is_suspended(
+    injected: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let app = app_pool(&injected).await;
+    let operator = PgPoolOptions::new()
+        .connect_with(
+            app.connect_options()
+                .as_ref()
+                .clone()
+                .username("tenant_lifecycle")
+                .password("tlpw"),
+        )
+        .await?;
+    let active_tenant = seed_tenant(&injected).await;
+    let suspended_tenant = sqlx::query_scalar::<_, TenantId>(
+        "INSERT INTO tenants (name, owner_user_id) VALUES ('pipeline-suspended', 2002) RETURNING id",
+    )
+    .fetch_one(&injected)
+    .await?;
+    let shared_identity: IdentityId = sqlx::query_scalar(
+        "INSERT INTO identities (kind, status) VALUES ('mtproto', 'offline') RETURNING id",
+    )
+    .fetch_one(&injected)
+    .await?;
+    for (tenant, chat_id) in [(active_tenant, -1020_i64), (suspended_tenant, -1020_i64)] {
+        sqlx::query(
+            "INSERT INTO source_subscriptions
+                (tenant_id, tg_chat_id, receiver_identity_id, enabled)
+             VALUES ($1, $2, $3, TRUE)",
+        )
+        .bind(tenant)
+        .bind(chat_id)
+        .bind(shared_identity)
+        .execute(&injected)
+        .await?;
+    }
+    let event: i64 = sqlx::query_scalar(
+        "INSERT INTO canonical_events
+            (adapter, receiver_identity_id, tg_chat_id, tg_message_id, message_date)
+         VALUES ('mtproto', $1, -1020, 200, now())
+         RETURNING id",
+    )
+    .bind(shared_identity)
+    .fetch_one(&injected)
+    .await?;
+
+    tgm_db::lifecycle::transition(&operator, suspended_tenant.get(), true).await?;
+    assert_eq!(run_fanout_once(&app, 10).await?.event_count, 1);
+    assert!(
+        !sqlx::query_scalar::<_, bool>("SELECT fanned_out FROM canonical_events WHERE id = $1",)
+            .bind(event)
+            .fetch_one(&injected)
+            .await?
+    );
+    tgm_db::lifecycle::transition(&operator, suspended_tenant.get(), false).await?;
+    assert_eq!(run_fanout_once(&app, 10).await?.event_count, 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM tenant_events WHERE tenant_id = $1 AND canonical_event_id = $2",
+        )
+        .bind(suspended_tenant)
+        .bind(event)
+        .fetch_one(&injected)
+        .await?,
+        1
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT fanned_out FROM canonical_events WHERE id = $1",)
+            .bind(event)
+            .fetch_one(&injected)
+            .await?
+    );
+    Ok(())
 }

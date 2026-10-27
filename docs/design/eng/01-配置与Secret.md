@@ -43,6 +43,7 @@ KEK 的两种实现怎么共存。
 | `TGM_PROFILE` | 全部 | `production` / `development`，决定 §四 的严格程度 |
 | `RUST_LOG` | 全部 | 默认 `info,sqlx=warn`，见 §4.5 |
 | `TGM_DB_URL_APP` | 全部常驻角色 | `app_user` 的连接串，经 PgBouncer |
+| `TGM_DB_URL_EXECUTION` | control-plane / mtproto-worker / delivery | `app_user` 直连 PG，仅执行在线标记，不得走 transaction pooling；生产必填，开发未配置时复用直连业务参数。与业务池必须指向同一数据库，不能用 owner 或清理角色 |
 | `TGM_DB_URL_AUTH` | control-plane / bot-gateway | `auth_lookup` 的独立池（`../spec/05-安全与租户隔离.md` §3.7） |
 | `TGM_DB_URL_OPS` | control-plane | `platform_ops`，只供 `admin_tx`（`00-工程约定.md` §4.2） |
 | `TGM_DB_URL_OWNER` | 仅 `tgm migrate` | 持有 `tgm_owner` 的角色。`tgm_owner` 自身 `NOLOGIN`，本地为 `postgres`。**常驻进程不得持有** |
@@ -51,6 +52,7 @@ KEK 的两种实现怎么共存。
 | `TGM_DB_URL_SHARED_CLEANUP` | 仅 `tgm cleanup-shared` | 必须直接以 `shared_cleanup` 登录，独立进程和环境文件；仅配 `TGM_PROFILE`、此连接串及可选 `RUST_LOG`。拒绝其他已登记凭据和 `DATABASE_URL`；普通服务及其他清理进程不得持有 |
 | `TGM_DB_URL_MEDIA_CLEANUP` | 仅 fanout 的媒体清理 | 必须直接以 `media_cleanup` 登录，独立连接池；普通 fanout 查询仍使用 `TGM_DB_URL_APP`，不得把媒体清理权限回退给 `app_user` |
 | `TGM_DB_URL_PLATFORM_CLEANUP` | 仅 `tgm cleanup-platform` | 必须直接以 `platform_cleanup` 登录，独立进程和环境文件；仅允许 profile、此连接串及可选日志配置，拒绝其他已登记凭据与 `DATABASE_URL`；普通服务和其他清理命令不得持有 |
+| `TGM_DB_URL_TENANT_LIFECYCLE` | 仅 `tgm tenant-lifecycle` | 独立 `tenant_lifecycle` 登录，环境只含 profile、此连接串及可选日志配置，拒绝其他已登记凭据及 `DATABASE_URL`；不得交给普通服务和清理进程 |
 | `TGM_REDIS_URL` | 全部常驻角色 | 仅唤醒信号，无正确性依赖 |
 | `TGM_S3_ENDPOINT` / `TGM_S3_BUCKET` | delivery / mtproto / fanout | MinIO 或 S3。fanout 用它跑对象清理（WP-5-delivery-media 片 3 批准记录第 6 条） |
 | `TGM_S3_ACCESS_KEY_ID` / `TGM_S3_SECRET_ACCESS_KEY` | delivery / mtproto / fanout | 对象存储的独立静态凭据，只能由 Secret 注入。**不走 AWS 默认凭据链**：默认链承载 KMS 身份，共用会让 KMS 角色顺带拿到桶权限（WP-5-delivery-media 片 2 批准记录） |

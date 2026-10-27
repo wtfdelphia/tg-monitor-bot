@@ -37,17 +37,17 @@ async fn lease_acquire_takeover_and_stale_worker_are_guarded(admin: PgPool) {
     support::assert_role(&app, "app_user").await;
     let identity_id = seed_identity(&admin).await;
 
-    let first = acquire_lease(&app, identity_id, "worker-a")
+    let first = acquire_lease(&app, None, identity_id, "worker-a")
         .await
         .expect("首次获取租约失败");
     assert_eq!(first, Some(1));
 
-    let same_worker = acquire_lease(&app, identity_id, "worker-a")
+    let same_worker = acquire_lease(&app, None, identity_id, "worker-a")
         .await
         .expect("同 worker 重复获取租约失败");
     assert_eq!(same_worker, Some(1), "同 worker 获取不应递增 token");
 
-    let other = acquire_lease(&app, identity_id, "worker-b")
+    let other = acquire_lease(&app, None, identity_id, "worker-b")
         .await
         .expect("他人获取租约查询失败");
     assert_eq!(other, None, "有效租约不应被其他 worker 抢走");
@@ -57,17 +57,17 @@ async fn lease_acquire_takeover_and_stale_worker_are_guarded(admin: PgPool) {
         .await
         .expect("使租约过期失败");
 
-    let takeover = acquire_lease(&app, identity_id, "worker-b")
+    let takeover = acquire_lease(&app, None, identity_id, "worker-b")
         .await
         .expect("过期租约抢占失败");
     assert_eq!(takeover, Some(2));
 
-    let stale_renew = renew_lease(&app, identity_id, "worker-a", 1)
+    let stale_renew = renew_lease(&app, None, identity_id, "worker-a", 1)
         .await
         .expect("旧 worker 续租查询失败");
     assert!(!stale_renew, "旧 worker 不得续租已被抢占的身份");
 
-    let current_renew = renew_lease(&app, identity_id, "worker-b", 2)
+    let current_renew = renew_lease(&app, None, identity_id, "worker-b", 2)
         .await
         .expect("当前 worker 续租失败");
     assert!(current_renew);
@@ -79,7 +79,7 @@ async fn lease_renew_keeps_token_and_moves_deadlines(admin: PgPool) {
     support::assert_role(&app, "app_user").await;
     let identity_id = seed_identity(&admin).await;
 
-    let token = acquire_lease(&app, identity_id, "worker-a")
+    let token = acquire_lease(&app, None, identity_id, "worker-a")
         .await
         .expect("获取租约查询失败")
         .expect("首次获取租约没有 token");
@@ -91,14 +91,14 @@ async fn lease_renew_keeps_token_and_moves_deadlines(admin: PgPool) {
         .expect("等待数据库时钟推进失败");
 
     assert!(
-        renew_lease(&app, identity_id, "worker-a", token)
+        renew_lease(&app, None, identity_id, "worker-a", token)
             .await
             .expect("续租查询失败")
     );
     let after = lease_times(&app, identity_id).await;
 
     assert_eq!(
-        acquire_lease(&app, identity_id, "worker-a")
+        acquire_lease(&app, None, identity_id, "worker-a")
             .await
             .expect("续租后读取 token 失败"),
         Some(token),
@@ -131,7 +131,7 @@ async fn expired_lease_race_has_exactly_one_winner_and_release_preserves_monoton
 
     let identity_id = seed_identity(&admin).await;
     assert_eq!(
-        acquire_lease(&app_a, identity_id, "seed-worker")
+        acquire_lease(&app_a, None, identity_id, "seed-worker")
             .await
             .expect("建立初始租约失败"),
         Some(1)
@@ -142,8 +142,8 @@ async fn expired_lease_race_has_exactly_one_winner_and_release_preserves_monoton
         .expect("使并发测试租约过期失败");
 
     let (left, right) = tokio::join!(
-        acquire_lease(&app_a, identity_id, "worker-a"),
-        acquire_lease(&app_b, identity_id, "worker-b")
+        acquire_lease(&app_a, None, identity_id, "worker-a"),
+        acquire_lease(&app_b, None, identity_id, "worker-b")
     );
     let results = [
         left.expect("worker-a 抢占查询失败"),
@@ -167,7 +167,7 @@ async fn expired_lease_race_has_exactly_one_winner_and_release_preserves_monoton
             .expect("释放租约查询失败")
     );
     assert_eq!(
-        acquire_lease(&app_a, identity_id, "worker-c")
+        acquire_lease(&app_a, None, identity_id, "worker-c")
             .await
             .expect("释放后重新获取租约失败"),
         Some(3),
@@ -184,7 +184,7 @@ async fn lease_expiry_is_rechecked_after_row_lock_wait(admin: PgPool) {
     let identity_id = seed_identity(&admin).await;
 
     assert_eq!(
-        acquire_lease(&app, identity_id, "worker-a")
+        acquire_lease(&app, None, identity_id, "worker-a")
             .await
             .expect("建立续租测试租约失败"),
         Some(1)
@@ -206,7 +206,9 @@ async fn lease_expiry_is_rechecked_after_row_lock_wait(admin: PgPool) {
 
     let renew_pool = app.clone();
     let renew_task =
-        tokio::spawn(async move { renew_lease(&renew_pool, identity_id, "worker-a", 1).await });
+        tokio::spawn(
+            async move { renew_lease(&renew_pool, None, identity_id, "worker-a", 1).await },
+        );
     tokio::time::sleep(Duration::from_millis(150)).await;
     blocker.commit().await.expect("释放租约行锁失败");
 
@@ -219,7 +221,7 @@ async fn lease_expiry_is_rechecked_after_row_lock_wait(admin: PgPool) {
     );
 
     assert_eq!(
-        acquire_lease(&app, identity_id, "worker-b")
+        acquire_lease(&app, None, identity_id, "worker-b")
             .await
             .expect("过期租约接管失败"),
         Some(2)
@@ -241,7 +243,9 @@ async fn lease_expiry_is_rechecked_after_row_lock_wait(admin: PgPool) {
 
     let acquire_pool = app.clone();
     let acquire_task =
-        tokio::spawn(async move { acquire_lease(&acquire_pool, identity_id, "worker-c").await });
+        tokio::spawn(
+            async move { acquire_lease(&acquire_pool, None, identity_id, "worker-c").await },
+        );
     tokio::time::sleep(Duration::from_millis(150)).await;
     blocker.commit().await.expect("释放第二次租约行锁失败");
 

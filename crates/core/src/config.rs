@@ -191,13 +191,16 @@ fn allowed(role: Role) -> Vec<&'static str> {
     match role {
         Role::ControlPlane => {
             v.push("TGM_LISTEN_ADDR");
+            v.push("TGM_DB_URL_EXECUTION");
             v.extend_from_slice(&["TGM_KMS_KEY_ARN", "TGM_LOCAL_KEK"]);
         }
         Role::BotGateway => {
             v.push("TGM_BOT_GATEWAY_LISTEN_ADDR");
+            v.push("TGM_DATA_BOT_TENANT_ID");
             v.extend_from_slice(&["TGM_KMS_KEY_ARN", "TGM_LOCAL_KEK"]);
         }
         Role::MtprotoWorker | Role::Delivery => {
+            v.push("TGM_DB_URL_EXECUTION");
             v.extend_from_slice(&["TGM_KMS_KEY_ARN", "TGM_LOCAL_KEK", "TGM_S3_REGION"]);
         }
         Role::Fanout => v.push("TGM_S3_REGION"),
@@ -301,6 +304,14 @@ pub fn check(
         if !present.contains(&name) {
             problems.push(ConfigProblem::Missing(name));
         }
+    }
+    if matches!(
+        role,
+        Role::ControlPlane | Role::MtprotoWorker | Role::Delivery
+    ) && raw_profile == Some("production")
+        && !present.contains(&"TGM_DB_URL_EXECUTION")
+    {
+        problems.push(ConfigProblem::Missing("TGM_DB_URL_EXECUTION"));
     }
 
     let ok = allowed(role);
@@ -422,6 +433,19 @@ pub fn check_platform_cleanup(
     )
 }
 
+pub fn check_tenant_lifecycle(
+    raw_profile: Option<&str>,
+    present: &[&str],
+    rust_log: Option<&str>,
+) -> Vec<ConfigProblem> {
+    check_cleanup(
+        raw_profile,
+        present,
+        rust_log,
+        "TGM_DB_URL_TENANT_LIFECYCLE",
+    )
+}
+
 fn check_cleanup(
     raw_profile: Option<&str>,
     present: &[&str],
@@ -493,6 +517,8 @@ fn known_names() -> &'static [&'static str] {
         "TGM_DB_URL_SHARED_CLEANUP",
         "TGM_DB_URL_MEDIA_CLEANUP",
         "TGM_DB_URL_PLATFORM_CLEANUP",
+        "TGM_DB_URL_TENANT_LIFECYCLE",
+        "TGM_DB_URL_EXECUTION",
         "TGM_REDIS_URL",
         "TGM_S3_ENDPOINT",
         "TGM_S3_BUCKET",
@@ -534,6 +560,7 @@ fn known_names() -> &'static [&'static str] {
         "TGM_LISTEN_ADDR",
         "TGM_DATA_BOT_SECRET_TOKEN",
         "TGM_DATA_BOT_IDENTITY_ID",
+        "TGM_DATA_BOT_TENANT_ID",
         "TGM_BOT_GATEWAY_LISTEN_ADDR",
         "TGM_PLATFORM_API_ID",
         "TGM_PLATFORM_API_HASH",
@@ -544,6 +571,40 @@ fn known_names() -> &'static [&'static str] {
 // 同 kek.rs：测试里的 expect/unwrap 就是断言本身。
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn tenant_lifecycle_has_no_other_credentials() {
+        let present = ["TGM_PROFILE", "TGM_DB_URL_TENANT_LIFECYCLE"];
+        assert!(super::check_tenant_lifecycle(Some("development"), &present, None).is_empty());
+        for name in super::known_names().iter().copied().chain(["DATABASE_URL"]) {
+            if ["TGM_PROFILE", "TGM_DB_URL_TENANT_LIFECYCLE", "RUST_LOG"].contains(&name) {
+                continue;
+            }
+            assert!(
+                super::check_tenant_lifecycle(
+                    Some("development"),
+                    &[present[0], present[1], name],
+                    None
+                )
+                .contains(&super::ConfigProblem::Unexpected(name))
+            );
+        }
+        for role in [
+            super::Role::ControlPlane,
+            super::Role::BotGateway,
+            super::Role::MtprotoWorker,
+            super::Role::Fanout,
+            super::Role::Rule,
+            super::Role::Delivery,
+        ] {
+            let mut names = minimal(role);
+            names.push("TGM_DB_URL_TENANT_LIFECYCLE");
+            assert!(
+                super::check(role, Some("development"), &names, None).contains(
+                    &super::ConfigProblem::Unexpected("TGM_DB_URL_TENANT_LIFECYCLE")
+                )
+            );
+        }
+    }
     use super::{
         COMMON, ConfigProblem, Role, check, check_auth_cleanup, check_kek_backend,
         check_platform_cleanup, check_shared_cleanup, check_tenant_cleanup, extra_required,
