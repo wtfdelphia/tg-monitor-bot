@@ -456,7 +456,16 @@ async fn serve_fanout(
 ) -> anyhow::Result<()> {
     let app_url = std::env::var("TGM_DB_URL_APP")
         .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_APP —— 启动期校验本应先拦住"))?;
+    let cleanup_url = std::env::var("TGM_DB_URL_MEDIA_CLEANUP")
+        .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_MEDIA_CLEANUP —— 启动期校验本应先拦住"))?;
     let pool = sqlx::PgPool::connect(&app_url).await?;
+    let cleanup_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&cleanup_url)
+        .await?;
+    tgm_db::media_cleanup::check_connection(&cleanup_pool)
+        .await
+        .map_err(|error| anyhow::anyhow!("媒体清理数据库连接校验失败：{error}"))?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let signal_task = tokio::spawn(async move {
         signal.await;
@@ -466,7 +475,7 @@ async fn serve_fanout(
         pool,
         tgm_app::pipeline::FanoutWorkerConfig::default(),
     )
-    .with_media_cleanup(media_store().await?);
+    .with_media_cleanup(media_store().await?, cleanup_pool);
     let result = worker.run(shutdown_rx).await;
     signal_task.abort();
     result?;

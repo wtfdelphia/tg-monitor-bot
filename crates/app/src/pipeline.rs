@@ -53,6 +53,7 @@ pub struct FanoutWorker {
     pool: PgPool,
     config: FanoutWorkerConfig,
     media_store: Option<crate::media_relay::MediaStore>,
+    media_cleanup_pool: Option<PgPool>,
 }
 
 impl FanoutWorker {
@@ -61,12 +62,18 @@ impl FanoutWorker {
             pool,
             config,
             media_store: None,
+            media_cleanup_pool: None,
         }
     }
 
     /// 带上对象存储：每 `cleanup_interval` 跑一轮媒体对象清理。
-    pub fn with_media_cleanup(mut self, store: crate::media_relay::MediaStore) -> Self {
+    pub fn with_media_cleanup(
+        mut self,
+        store: crate::media_relay::MediaStore,
+        cleanup_pool: PgPool,
+    ) -> Self {
         self.media_store = Some(store);
+        self.media_cleanup_pool = Some(cleanup_pool);
         self
     }
 
@@ -81,13 +88,13 @@ impl FanoutWorker {
             if *shutdown.borrow() {
                 return Ok(FanoutWorkerExit::Shutdown);
             }
-            if let Some(store) = &self.media_store
+            if let (Some(store), Some(cleanup_pool)) = (&self.media_store, &self.media_cleanup_pool)
                 && tokio::time::Instant::now() >= next_cleanup
             {
                 next_cleanup = tokio::time::Instant::now() + self.config.cleanup_interval;
                 // 清理失败不影响扇出：记日志，下一个间隔再试。
                 match crate::media_cleanup::run_cleanup_once(
-                    &self.pool,
+                    cleanup_pool,
                     store,
                     crate::media_cleanup::default_staging_max_age(),
                 )

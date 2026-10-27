@@ -167,6 +167,7 @@ fn extra_required(role: Role) -> &'static [&'static str] {
         // fanout 跑媒体对象清理（WP-5-delivery-media 片 3 批准记录第 6 条），要桶的读删权限；
         // 不碰凭据，所以没有 KEK。
         Role::Fanout => &[
+            "TGM_DB_URL_MEDIA_CLEANUP",
             "TGM_S3_ENDPOINT",
             "TGM_S3_BUCKET",
             "TGM_S3_ACCESS_KEY_ID",
@@ -477,6 +478,7 @@ fn known_names() -> &'static [&'static str] {
         "TGM_DB_URL_AUTH_CLEANUP",
         "TGM_DB_URL_TENANT_CLEANUP",
         "TGM_DB_URL_SHARED_CLEANUP",
+        "TGM_DB_URL_MEDIA_CLEANUP",
         "TGM_REDIS_URL",
         "TGM_S3_ENDPOINT",
         "TGM_S3_BUCKET",
@@ -812,6 +814,31 @@ mod tests {
                     ConfigProblem::Unexpected("TGM_S3_REGION"),
                 ],
                 "{role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_cleanup_database_url_is_fanout_only() {
+        let mut env = minimal(Role::Fanout);
+        assert!(env.contains(&"TGM_DB_URL_MEDIA_CLEANUP"));
+        env.retain(|name| *name != "TGM_DB_URL_MEDIA_CLEANUP");
+        assert_eq!(
+            check(Role::Fanout, Some("development"), &env, None),
+            vec![ConfigProblem::Missing("TGM_DB_URL_MEDIA_CLEANUP")]
+        );
+        for role in [
+            Role::ControlPlane,
+            Role::BotGateway,
+            Role::MtprotoWorker,
+            Role::Rule,
+            Role::Delivery,
+        ] {
+            let mut role_env = minimal(role);
+            role_env.push("TGM_DB_URL_MEDIA_CLEANUP");
+            assert_eq!(
+                check(role, Some("development"), &role_env, None),
+                vec![ConfigProblem::Unexpected("TGM_DB_URL_MEDIA_CLEANUP")]
             );
         }
     }

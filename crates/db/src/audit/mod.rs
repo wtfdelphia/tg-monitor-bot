@@ -132,7 +132,7 @@ mod tests {
         let parsed = parse(QUERIES);
         let expected = [
             "A0", "MAIN", "A1", "A2a", "A2b", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "C1", "C4",
-            "C2", "C6", "C7", "C5", "C8", "C9", "C10", "C11",
+            "C2", "C6", "C7", "C5", "C8", "C12", "C9", "C10", "C11",
         ];
         assert_eq!(
             parsed

@@ -44,6 +44,21 @@ pub async fn auth_pool(admin: &AdminOnlyPool) -> PgPool {
         .expect("连接 auth_lookup 测试池失败")
 }
 
+pub async fn media_cleanup_pool(admin: &AdminOnlyPool) -> PgPool {
+    let database: String = sqlx::query("SELECT current_database()")
+        .fetch_one(admin.raw())
+        .await
+        .expect("读取媒体清理测试数据库名失败")
+        .get(0);
+    PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&format!(
+            "postgres://media_cleanup:mcpw@127.0.0.1:55432/{database}"
+        ))
+        .await
+        .expect("连接 media_cleanup 测试池失败")
+}
+
 pub async fn seed_tenant(
     admin: &AdminOnlyPool,
     name: &str,

@@ -1,6 +1,6 @@
 //! 媒体对象清理（docs/plan/proposals/WP-5-delivery-media.md 片 3 B 部分）的 L2 判据。
 //!
-//! PG 以受限角色 app_user 连接，对象存储是 compose 的 MinIO。每个用例用独立的桶，
+//! PG 以受限角色 media_cleanup 连接，对象存储是 compose 的 MinIO。每个用例用独立的桶，
 //! 避免并行测试互相清掉对方的 `staging/` 对象。
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -33,14 +33,20 @@ async fn exists(store: &MediaStore, key: &str) -> bool {
     store.get_stream(key).await.is_ok()
 }
 
-async fn app_pool(admin: PgPool) -> (PgPool, support::AdminOnlyPool) {
+async fn app_pool(admin: PgPool) -> (PgPool, PgPool, support::AdminOnlyPool) {
     let (app, admin) = support::pools(admin).await;
+    let cleanup = support::media_cleanup_pool(&admin).await;
     let user: String = sqlx::query_scalar("SELECT current_user")
         .fetch_one(&app)
         .await
         .expect("读取测试角色失败");
-    assert_eq!(user, "app_user", "清理测试必须以受限角色连接");
-    (app, admin)
+    assert_eq!(user, "app_user", "测试写入池必须以受限角色连接");
+    let cleanup_user: String = sqlx::query_scalar("SELECT current_user")
+        .fetch_one(&cleanup)
+        .await
+        .expect("读取媒体清理测试角色失败");
+    assert_eq!(cleanup_user, "media_cleanup", "清理必须以专用受限角色连接");
+    (app, cleanup, admin)
 }
 
 /// 插一条档案。`expires` 是相对现在的秒数（负数 = 已过期），`age_days` 是 first_seen_at 的年龄。
@@ -79,14 +85,14 @@ async fn archive_key(app: &PgPool, id: i64) -> Option<Option<String>> {
 /// 过期对象被删、key 置空；未过期的不动；没有对象的档案不碰对象存储。
 #[sqlx::test(migrations = "../../migrations-test")]
 async fn expired_objects_are_deleted_then_cleared(admin: PgPool) {
-    let (app, _admin) = app_pool(admin).await;
+    let (app, cleanup, admin) = app_pool(admin).await;
     let store = support::media_store("tgm-test-cleanup-expire").await;
     put(&store, "objects/expired").await;
     put(&store, "objects/live").await;
     let expired = archive(&app, "h-expired", Some("objects/expired"), Some(-60), 1).await;
     let live = archive(&app, "h-live", Some("objects/live"), Some(3600), 1).await;
 
-    let outcome = run_cleanup_once(&app, &store, Duration::from_secs(3600))
+    let outcome = run_cleanup_once(&cleanup, &store, Duration::from_secs(3600))
         .await
         .expect("清理失败");
     assert_eq!(outcome.objects_deleted, 1);
@@ -102,8 +108,25 @@ async fn expired_objects_are_deleted_then_cleared(admin: PgPool) {
         archive_key(&app, live).await,
         Some(Some("objects/live".to_owned()))
     );
+    let logs: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT context->>'table', (context->>'rows')::bigint
+           FROM system_logs
+          WHERE module = 'media_retention' AND event = 'cleanup.done'
+          ORDER BY id",
+    )
+    .fetch_all(admin.raw())
+    .await
+    .expect("读取媒体清理日志失败");
+    assert_eq!(
+        logs,
+        vec![
+            ("media_archive.object".to_owned(), 1),
+            ("media_archive".to_owned(), 0),
+            ("staging".to_owned(), 0),
+        ]
+    );
 
-    let again = run_cleanup_once(&app, &store, Duration::from_secs(3600))
+    let again = run_cleanup_once(&cleanup, &store, Duration::from_secs(3600))
         .await
         .expect("重复清理失败");
     assert_eq!(again.objects_deleted, 0, "第二轮应当没有可清的");
@@ -113,7 +136,7 @@ async fn expired_objects_are_deleted_then_cleared(admin: PgPool) {
 /// 置空必须带上旧 key 作条件，不得把新 key 一起清掉。
 #[sqlx::test(migrations = "../../migrations-test")]
 async fn clearing_does_not_overwrite_a_replaced_key(admin: PgPool) {
-    let (app, _admin) = app_pool(admin).await;
+    let (app, _cleanup, _admin) = app_pool(admin).await;
     let id = archive(&app, "h-race", Some("objects/old"), Some(-60), 1).await;
     sqlx::query(
         "UPDATE media_archive SET object_key = 'objects/new',
@@ -137,7 +160,7 @@ async fn clearing_does_not_overwrite_a_replaced_key(admin: PgPool) {
 /// 180 天前、无对象、无 job 引用的档案删掉；仍被 job 引用的、仍挂着对象的、还在保留期内的不删。
 #[sqlx::test(migrations = "../../migrations-test")]
 async fn stale_archives_are_deleted_unless_referenced(admin: PgPool) {
-    let (app, admin) = app_pool(admin).await;
+    let (app, cleanup, admin) = app_pool(admin).await;
     let store = support::media_store("tgm-test-cleanup-archive").await;
     let stale = archive(&app, "h-stale", None, None, 181).await;
     let recent = archive(&app, "h-recent", None, None, 179).await;
@@ -171,7 +194,7 @@ async fn stale_archives_are_deleted_unless_referenced(admin: PgPool) {
     .await
     .expect("创建 job 失败");
 
-    let outcome = run_cleanup_once(&app, &store, Duration::from_secs(3600))
+    let outcome = run_cleanup_once(&cleanup, &store, Duration::from_secs(3600))
         .await
         .expect("清理失败");
     assert_eq!(outcome.archives_deleted, 1);
@@ -193,7 +216,7 @@ async fn stale_archives_are_deleted_unless_referenced(admin: PgPool) {
 /// MinIO 的修改时间按秒取整，年龄判定留足余量：孤儿比阈值老 4 秒，新对象比阈值新 5 秒以上。
 #[sqlx::test(migrations = "../../migrations-test")]
 async fn staging_orphans_are_deleted_by_age(admin: PgPool) {
-    let (app, _admin) = app_pool(admin).await;
+    let (_app, cleanup, _admin) = app_pool(admin).await;
     let store = support::media_store("tgm-test-cleanup-staging").await;
     let run = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -207,7 +230,7 @@ async fn staging_orphans_are_deleted_by_age(admin: PgPool) {
     tokio::time::sleep(Duration::from_secs(10)).await;
     put(&store, &fresh).await;
 
-    let outcome = run_cleanup_once(&app, &store, Duration::from_secs(5))
+    let outcome = run_cleanup_once(&cleanup, &store, Duration::from_secs(5))
         .await
         .expect("清理失败");
     assert!(outcome.staging_deleted >= 1);
@@ -222,7 +245,7 @@ async fn staging_orphans_are_deleted_by_age(admin: PgPool) {
 /// 对象存储不可用：删对象失败时档案保持原样，下一轮还能找到它。
 #[sqlx::test(migrations = "../../migrations-test")]
 async fn failed_object_delete_keeps_the_archive(admin: PgPool) {
-    let (app, _admin) = app_pool(admin).await;
+    let (app, cleanup, _admin) = app_pool(admin).await;
     let broken = MediaStore::new(&tgm_app::media_relay::S3Config {
         endpoint: "http://127.0.0.1:59000".to_owned(),
         bucket: "tgm-test-cleanup-missing-bucket".to_owned(),
@@ -231,7 +254,7 @@ async fn failed_object_delete_keeps_the_archive(admin: PgPool) {
         secret_access_key: tgm_core::secret::Secret::new("wrong-secret".to_owned()),
     });
     let id = archive(&app, "h-broken", Some("objects/x"), Some(-60), 1).await;
-    let result = run_cleanup_once(&app, &broken, Duration::from_secs(3600)).await;
+    let result = run_cleanup_once(&cleanup, &broken, Duration::from_secs(3600)).await;
     assert_eq!(
         archive_key(&app, id).await,
         Some(Some("objects/x".to_owned())),
@@ -239,4 +262,52 @@ async fn failed_object_delete_keeps_the_archive(admin: PgPool) {
     );
     // 第三步列 staging 也会失败，整轮返回错误；第一步的失败按条计数，不中断。
     assert!(result.is_err(), "对象存储不可用时整轮应报错");
+}
+
+/// 平台日志写入失败时，档案 key 与数据库删除必须回滚，下一轮可以重试。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn cleanup_log_failure_rolls_back_database_changes(admin: PgPool) {
+    let (app, cleanup, admin) = app_pool(admin).await;
+    let store = support::media_store("tgm-test-cleanup-log-failure").await;
+    put(&store, "objects/log-failure").await;
+    let id = archive(
+        &app,
+        "h-log-failure",
+        Some("objects/log-failure"),
+        Some(-60),
+        1,
+    )
+    .await;
+
+    sqlx::raw_sql(
+        "SET ROLE tgm_owner;
+         REVOKE INSERT (tenant_id, level, module, event, context)
+           ON system_logs FROM media_cleanup;
+         RESET ROLE;",
+    )
+    .execute(admin.raw())
+    .await
+    .expect("撤销媒体日志权限失败");
+
+    let result = run_cleanup_once(&cleanup, &store, Duration::from_secs(3600)).await;
+    assert!(result.is_err(), "日志写入失败必须让本轮失败");
+    assert!(
+        !exists(&store, "objects/log-failure").await,
+        "对象删除仍先发生"
+    );
+    assert_eq!(
+        archive_key(&app, id).await,
+        Some(Some("objects/log-failure".to_owned())),
+        "日志失败时数据库置空必须回滚"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM system_logs
+              WHERE module = 'media_retention' AND event = 'cleanup.done'",
+        )
+        .fetch_one(admin.raw())
+        .await
+        .expect("读取清理日志失败"),
+        0
+    );
 }

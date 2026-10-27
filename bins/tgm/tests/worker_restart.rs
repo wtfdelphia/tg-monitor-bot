@@ -40,14 +40,24 @@ impl WorkerProcess {
         role: &str,
         extra_env: &[(&str, &str)],
     ) -> Result<Self> {
-        let child = Command::new(env!("CARGO_BIN_EXE_tgm"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tgm"));
+        command
             .args(["serve", "--role", role])
             .env_clear()
             .env("TGM_PROFILE", "development")
             .env("TGM_DB_URL_APP", database_url)
             .env("TGM_REDIS_URL", "redis://127.0.0.1:56379")
             .env("RUST_LOG", "info,sqlx=warn")
-            .envs(extra_env.iter().copied())
+            .envs(extra_env.iter().copied());
+        if role == "fanout" {
+            let cleanup_url = database_url.replacen(
+                "postgres://app_user:apw@",
+                "postgres://media_cleanup:mcpw@",
+                1,
+            );
+            command.env("TGM_DB_URL_MEDIA_CLEANUP", cleanup_url);
+        }
+        let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

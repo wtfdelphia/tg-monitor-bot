@@ -9,3 +9,4 @@
 "app_user" "apw"
 "auth_lookup" "lpw"
 "platform_ops" "ppw"
+"media_cleanup" "mcpw"
