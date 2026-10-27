@@ -75,6 +75,16 @@ impl TelegramBotApiClient {
         chat_id: i64,
         bot_id: i64,
     ) -> Result<Option<ProbeSuccess>, TelegramBotApiError> {
+        self.probe_target_admitted(chat_id, bot_id, None).await
+    }
+
+    async fn probe_target_admitted(
+        &self,
+        chat_id: i64,
+        bot_id: i64,
+        lifecycle: Option<(&PgPool, TenantId)>,
+    ) -> Result<Option<ProbeSuccess>, TelegramBotApiError> {
+        let _first = probe_admission(lifecycle).await?;
         let chat = self
             .request("getChat", &serde_json::json!({"chat_id": chat_id}))
             .await?
@@ -84,6 +94,7 @@ impl TelegramBotApiClient {
         if chat.id != chat_id || !matches!(chat.kind.as_str(), "channel" | "group" | "supergroup") {
             return Ok(None);
         }
+        let _second = probe_admission(lifecycle).await?;
         let member = self
             .request(
                 "getChatMember",
@@ -94,6 +105,19 @@ impl TelegramBotApiClient {
         let member = serde_json::from_value(member).map_err(TelegramBotApiError::Response)?;
         Ok(evaluate(chat, member, chat_id, bot_id))
     }
+}
+
+async fn probe_admission(
+    lifecycle: Option<(&PgPool, TenantId)>,
+) -> Result<Option<tgm_db::lifecycle::WorkerGuard>, TelegramBotApiError> {
+    let Some((pool, tenant)) = lifecycle else {
+        return Ok(None);
+    };
+    tgm_db::lifecycle::WorkerGuard::acquire(pool, tenant)
+        .await
+        .map_err(|_| TelegramBotApiError::Api("tenant admission unavailable".to_owned()))?
+        .map(Some)
+        .ok_or_else(|| TelegramBotApiError::Api("tenant inactive".to_owned()))
 }
 
 fn failure(code: &'static str) -> ProbeOutcome {
@@ -143,7 +167,10 @@ pub async fn execute(
         Ok(client) => client,
         Err(_) => return failure("CLIENT_UNAVAILABLE"),
     };
-    match client.probe_target(claim.tg_chat_id, bot_id).await {
+    match client
+        .probe_target_admitted(claim.tg_chat_id, bot_id, Some((pool, tenant)))
+        .await
+    {
         Ok(Some(result)) => ProbeOutcome::Success(result),
         Ok(None) => failure("UNSUPPORTED_RESPONSE"),
         Err(TelegramBotApiError::Rejected {

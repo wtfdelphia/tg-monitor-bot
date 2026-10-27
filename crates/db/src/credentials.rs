@@ -26,7 +26,7 @@ use tgm_core::kek::{Kek, KekContext, KekError};
 use tgm_core::secret::Secret;
 
 use crate::repo::{LeaseGuard, lease_is_held};
-use crate::tenant::tenant_tx;
+use crate::tenant::tenant_write_tx as tenant_tx;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
@@ -136,6 +136,9 @@ async fn store_secret(
     plaintext: &Secret<Vec<u8>>,
     lease: Option<LeaseGuard>,
 ) -> Result<(), CredentialError> {
+    let _execution = crate::lifecycle::WorkerGuard::acquire(pool, tenant)
+        .await?
+        .ok_or_else(|| sqlx::Error::Protocol(crate::lifecycle::INACTIVE.to_owned()))?;
     // 先确认身份归属再调 KEK：对不存在的身份写入不该产生一次 KMS 调用。
     let owned = tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
@@ -198,6 +201,9 @@ pub async fn create_bot_identity(
     input: NewBotIdentity,
     token: &Secret<Vec<u8>>,
 ) -> Result<IdentityId, CredentialError> {
+    let _execution = crate::lifecycle::WorkerGuard::acquire(pool, tenant)
+        .await?
+        .ok_or_else(|| sqlx::Error::Protocol(crate::lifecycle::INACTIVE.to_owned()))?;
     let tg_user_id = input.tg_user_id;
     let (identity_id, exists) = tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
@@ -299,6 +305,9 @@ pub async fn load_identity_secret(
     tenant: TenantId,
     identity: IdentityId,
 ) -> Result<Option<Secret<Vec<u8>>>, CredentialError> {
+    let _execution = crate::lifecycle::WorkerGuard::acquire(pool, tenant)
+        .await?
+        .ok_or_else(|| sqlx::Error::Protocol(crate::lifecycle::INACTIVE.to_owned()))?;
     let row = tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
             sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Vec<u8>, String)>(
@@ -342,6 +351,9 @@ pub async fn load_bot_credentials(
     tenant: TenantId,
     identity: IdentityId,
 ) -> Result<Option<BotCredentials>, CredentialError> {
+    let _execution = crate::lifecycle::WorkerGuard::acquire(pool, tenant)
+        .await?
+        .ok_or_else(|| sqlx::Error::Protocol(crate::lifecycle::INACTIVE.to_owned()))?;
     type Row = (
         Vec<u8>,
         Vec<u8>,
@@ -427,6 +439,9 @@ pub async fn store_bot_session(
     credentials: &BotCredentials,
     session: &Secret<Vec<u8>>,
 ) -> Result<bool, CredentialError> {
+    let _execution = crate::lifecycle::WorkerGuard::acquire(pool, tenant)
+        .await?
+        .ok_or_else(|| sqlx::Error::Protocol(crate::lifecycle::INACTIVE.to_owned()))?;
     let dek = kek
         .unwrap(
             &credentials.dek_ciphertext,
@@ -508,6 +523,9 @@ pub async fn create_mtproto_identity(
     input: NewMtprotoIdentity,
     session: &Secret<Vec<u8>>,
 ) -> Result<IdentityId, CredentialError> {
+    let _execution = crate::lifecycle::WorkerGuard::acquire(pool, tenant)
+        .await?
+        .ok_or_else(|| sqlx::Error::Protocol(crate::lifecycle::INACTIVE.to_owned()))?;
     let tg_user_id = input.tg_user_id;
     let (identity_id, exists) = tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
@@ -587,6 +605,9 @@ pub async fn reauthorize_mtproto_identity(
     input: NewMtprotoIdentity,
     session: &Secret<Vec<u8>>,
 ) -> Result<String, CredentialError> {
+    let _execution = crate::lifecycle::WorkerGuard::acquire(pool, tenant)
+        .await?
+        .ok_or_else(|| sqlx::Error::Protocol(crate::lifecycle::INACTIVE.to_owned()))?;
     let tg_user_id = input.tg_user_id;
     let current = tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {

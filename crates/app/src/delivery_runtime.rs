@@ -143,6 +143,9 @@ async fn resume_from_stored(
         clear_bot_session(pool, tenant, identity).await?;
         return Ok(Resume::SignIn);
     };
+    let Some(_admission) = tgm_db::lifecycle::WorkerGuard::acquire(pool, tenant).await? else {
+        return Err(sqlx::Error::Protocol(tgm_db::lifecycle::INACTIVE.to_owned()).into());
+    };
     match TelegramClient::resume_bot_sender(client_config, stored).await {
         Ok((client, bot_id)) if bot_id == expected_bot_id => Ok(Resume::Connected(client)),
         Ok((client, _)) => {
@@ -175,6 +178,9 @@ pub async fn run_sender(
     config: DeliveryRuntimeConfig,
     shutdown: watch::Receiver<bool>,
 ) -> Result<SenderExit, DeliverySenderError> {
+    let Some(_worker) = tgm_db::lifecycle::WorkerGuard::acquire(pool, tenant).await? else {
+        return Ok(SenderExit::Shutdown);
+    };
     let Some(credentials) = load_bot_credentials(pool, kek, tenant, identity).await? else {
         return Ok(SenderExit::NoToken);
     };
@@ -199,6 +205,10 @@ pub async fn run_sender(
     let (client, resumed_session) = match resumed {
         Resume::Connected(client) => (client, true),
         Resume::SignIn => {
+            let Some(_admission) = tgm_db::lifecycle::WorkerGuard::acquire(pool, tenant).await?
+            else {
+                return Ok(SenderExit::Shutdown);
+            };
             let connected = tokio::select! {
                 connected = TelegramClient::connect_bot_sender(client_config, &app.api_hash, &token) => connected,
                 _ = wait_for_shutdown(&mut login_shutdown) => return Ok(SenderExit::Shutdown),
@@ -239,6 +249,10 @@ pub async fn run_sender(
     };
     drop(token);
     drop(credentials);
+    if !tgm_db::lifecycle::is_active(pool, tenant).await? {
+        let _ = client.shutdown().await;
+        return Ok(SenderExit::Shutdown);
+    }
     // 两种结局用不同消息而非字段区分：pretty 格式把字段打在下一行，长跑按行计数。
     if resumed_session {
         tracing::info!(
@@ -261,6 +275,8 @@ pub async fn run_sender(
         Arc::new(TelegramDeliveryTransport::new(
             Arc::clone(&client),
             app.media_store.clone(),
+            pool.clone(),
+            tenant,
         )),
         config.worker,
     );
@@ -390,7 +406,15 @@ impl DeliveryRuntime {
         shutdown: &watch::Receiver<bool>,
     ) -> Result<(), sqlx::Error> {
         for tenant in list_all_active_tenants(&self.pool).await? {
-            for identity in list_delivery_sender_candidates(&self.pool, tenant).await? {
+            let identities = match list_delivery_sender_candidates(&self.pool, tenant).await {
+                Ok(identities) => identities,
+                Err(error) if matches!(&error, sqlx::Error::Protocol(message) if message == tgm_db::lifecycle::INACTIVE) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for identity in identities {
                 if running.contains_key(&identity) || cooldown.contains_key(&identity) {
                     continue;
                 }

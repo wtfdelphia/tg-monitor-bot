@@ -41,3 +41,30 @@ where
     tx.commit().await?;
     Ok(out)
 }
+
+pub async fn tenant_write_tx<F, T>(pool: &PgPool, tenant: TenantId, f: F) -> Result<T, sqlx::Error>
+where
+    F: for<'a> FnOnce(&'a mut PgConnection) -> BoxFut<'a, T> + Send,
+{
+    tenant_write_tx_with_error(pool, tenant, f).await
+}
+
+pub async fn tenant_write_tx_with_error<F, T, E>(
+    pool: &PgPool,
+    tenant: TenantId,
+    f: F,
+) -> Result<T, E>
+where
+    F: for<'a> FnOnce(&'a mut PgConnection) -> BoxFut<'a, T, E> + Send,
+    E: From<sqlx::Error>,
+{
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.get().to_string())
+        .execute(&mut *transaction)
+        .await?;
+    crate::lifecycle::require_active(&mut transaction, tenant).await?;
+    let result = f(&mut transaction).await?;
+    transaction.commit().await?;
+    Ok(result)
+}

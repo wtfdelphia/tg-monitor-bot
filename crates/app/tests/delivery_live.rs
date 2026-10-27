@@ -254,7 +254,12 @@ async fn live_delivery_child() {
     drop(token);
     let directory = PathBuf::from(required("TGM_LIVE_CHILD_DIR"));
     let transport = GateTransport {
-        inner: TelegramDeliveryTransport::new(Arc::new(client), app.media_store.clone()),
+        inner: TelegramDeliveryTransport::new(
+            Arc::new(client),
+            app.media_store.clone(),
+            pool.clone(),
+            tenant,
+        ),
         directory,
         phase: required("TGM_LIVE_CHILD_PHASE"),
     };

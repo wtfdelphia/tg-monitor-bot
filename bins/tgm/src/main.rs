@@ -40,10 +40,26 @@ enum Command {
     },
     CleanupShared,
     CleanupPlatform,
+    TenantLifecycle {
+        #[command(subcommand)]
+        action: LifecycleAction,
+    },
     /// 导出 OpenAPI 契约；`--check` 则与仓库内的 openapi.json 比对
     Openapi {
         #[arg(long)]
         check: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum LifecycleAction {
+    Suspend {
+        #[arg(long)]
+        tenant_id: i64,
+    },
+    Resume {
+        #[arg(long)]
+        tenant_id: i64,
     },
 }
 
@@ -687,6 +703,16 @@ async fn preflight(role: &Role) -> anyhow::Result<tgm_core::profile::Profile> {
     let pool = sqlx::PgPool::connect(&url).await?;
     let version = tgm_db::preflight::check_version(&pool).await;
     let db_role = tgm_db::preflight::check_runtime_role(&pool).await;
+    if matches!(
+        core_role,
+        CoreRole::ControlPlane | CoreRole::MtprotoWorker | CoreRole::Delivery
+    ) && std::env::var("TGM_DB_URL_EXECUTION").is_ok()
+    {
+        let tenant: tgm_core::ids::TenantId = sqlx::query_scalar("SELECT 0::bigint")
+            .fetch_one(&pool)
+            .await?;
+        tgm_db::lifecycle::WorkerGuard::acquire(&pool, tenant).await?;
+    }
     pool.close().await;
     let version = version?;
     // 这一行是事后唯一能回答「那次运行到底用的哪个角色」的证据。
@@ -844,6 +870,46 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         });
     }
+    if let Command::TenantLifecycle { action } = cmd {
+        let present = present_env_names();
+        let names: Vec<&str> = present.iter().map(String::as_str).collect();
+        if !tgm_core::config::check_tenant_lifecycle(
+            std::env::var("TGM_PROFILE").ok().as_deref(),
+            &names,
+            std::env::var("RUST_LOG").ok().as_deref(),
+        )
+        .is_empty()
+        {
+            anyhow::bail!("租户生命周期配置错误，拒绝执行");
+        }
+        let (id, suspend) = match action {
+            LifecycleAction::Suspend { tenant_id } => (tenant_id, true),
+            LifecycleAction::Resume { tenant_id } => (tenant_id, false),
+        };
+        if id <= 0 {
+            anyhow::bail!("租户编号必须为正整数");
+        }
+        return tokio::runtime::Runtime::new()?.block_on(async {
+            let url = std::env::var("TGM_DB_URL_TENANT_LIFECYCLE")
+                .map_err(|_| anyhow::anyhow!("缺少租户生命周期连接配置"))?;
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .map_err(|_| anyhow::anyhow!("租户生命周期数据库连接失败"))?;
+            let result =
+                tgm_app::lifecycle::run(&pool, id, suspend, tgm_app::shutdown_signal()).await;
+            pool.close().await;
+            match result {
+                Ok(rows) => println!("tgm: 租户生命周期完成：cancelled={rows}"),
+                Err(tgm_db::lifecycle::LifecycleError::Draining) => {
+                    anyhow::bail!("租户仍可能暂停但排空未完成，需核对在途结果后重跑")
+                }
+                Err(_) => anyhow::bail!("租户生命周期失败，未提交批次已回滚；需核对租户状态"),
+            }
+            Ok(())
+        });
+    }
     if let Command::CleanupPlatform = cmd {
         let present = present_env_names();
         let names: Vec<&str> = present.iter().map(String::as_str).collect();
@@ -945,6 +1011,7 @@ fn main() -> anyhow::Result<()> {
         Command::CleanupTenant { .. } => unreachable!("已在上面处理"),
         Command::CleanupShared => unreachable!("已在上面处理"),
         Command::CleanupPlatform => unreachable!("已在上面处理"),
+        Command::TenantLifecycle { .. } => unreachable!("已在上面处理"),
         Command::Openapi { check } => {
             openapi(check)?;
         }

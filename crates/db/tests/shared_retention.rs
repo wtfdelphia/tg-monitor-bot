@@ -548,10 +548,11 @@ async fn cleanup_first_prevents_late_fanout_and_late_relay_completion(
         .bind(identity)
         .fetch_one(admin.raw())
         .await?;
-    let token = repo::acquire_lease(&app, identity, "shared-test")
+    let token = repo::acquire_lease(&app, None, identity, "shared-test")
         .await?
         .ok_or("租约失败")?;
     let lease = repo::LeaseGuard {
+        tenant_id: None,
         identity_id: identity,
         worker_id: "shared-test".to_owned(),
         fencing_token: token,

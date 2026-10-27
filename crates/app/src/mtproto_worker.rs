@@ -107,6 +107,7 @@ pub fn canonical_event(
         (incoming.text.clone(), None)
     };
     Ok(CanonicalEventInput {
+        receiver_tenant_id: None,
         adapter: CanonicalAdapter::MtProto,
         receiver_identity_id: receiver,
         tg_chat_id: incoming.tg_chat_id,
@@ -156,10 +157,14 @@ pub async fn run_identity(
         identity,
         api_id,
     } = target;
-    let Some(fencing_token) = acquire_lease(pool, identity, worker_id).await? else {
+    let Some(_worker) = tgm_db::lifecycle::WorkerGuard::acquire(pool, tenant).await? else {
+        return Ok(IdentityExit::LeaseLost);
+    };
+    let Some(fencing_token) = acquire_lease(pool, Some(tenant), identity, worker_id).await? else {
         return Ok(IdentityExit::LeaseBusy);
     };
     let lease = LeaseGuard {
+        tenant_id: Some(tenant),
         identity_id: identity,
         worker_id: worker_id.to_owned(),
         fencing_token,
@@ -239,15 +244,19 @@ async fn run_leased(
         let interval = config.renew_interval;
         tokio::spawn(async move { relay_loop(&pool, &lease, &reader, &store, interval).await })
     });
-    let exit = loop {
+    let mut lifecycle_check = tokio::time::interval(Duration::from_secs(1));
+    let exit = async { loop {
         tokio::select! {
+            _ = lifecycle_check.tick() => {
+                if !tgm_db::lifecycle::is_active(pool, tenant).await? { break Ok(IdentityExit::LeaseLost); }
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break Ok(IdentityExit::Shutdown);
                 }
             }
             _ = renew.tick() => {
-                match renew_lease(pool, lease.identity_id, &lease.worker_id, lease.fencing_token).await {
+                match renew_lease(pool, Some(tenant), lease.identity_id, &lease.worker_id, lease.fencing_token).await {
                     Ok(true) => {}
                     // 续租失败不套重试：重试只会拉长双连接窗口（spec/08 §4.3）。
                     Ok(false) => break Ok(IdentityExit::LeaseLost),
@@ -268,6 +277,9 @@ async fn run_leased(
                 }
             }
             _ = auth_check.tick() => {
+                let Some(_admission) = tgm_db::lifecycle::WorkerGuard::acquire(pool, tenant).await? else {
+                    break Ok(IdentityExit::Shutdown);
+                };
                 match client.check_authorized().await {
                     Ok(()) => {}
                     Err(error) if error.is_unauthorized() || error.is_banned() => {
@@ -287,7 +299,8 @@ async fn run_leased(
                         } else {
                             0
                         };
-                        let event = canonical_event(lease.identity_id, &incoming, edit_version)?;
+                        let mut event = canonical_event(lease.identity_id, &incoming, edit_version)?;
+                        event.receiver_tenant_id = Some(tenant);
                         if insert_canonical_event_leased(pool, lease, &event).await?.is_none() {
                             break Ok(IdentityExit::LeaseLost);
                         }
@@ -299,7 +312,7 @@ async fn run_leased(
                 }
             }
         }
-    };
+    }}.await;
 
     if let Some(task) = relay_task {
         task.abort();
@@ -455,7 +468,15 @@ impl MtprotoWorker {
         shutdown: &watch::Receiver<bool>,
     ) -> Result<(), sqlx::Error> {
         for tenant in list_all_active_tenants(&self.pool).await? {
-            for (identity, api_id) in list_mtproto_worker_candidates(&self.pool, tenant).await? {
+            let identities = match list_mtproto_worker_candidates(&self.pool, tenant).await {
+                Ok(identities) => identities,
+                Err(error) if matches!(&error, sqlx::Error::Protocol(message) if message == tgm_db::lifecycle::INACTIVE) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for (identity, api_id) in identities {
                 if running.contains_key(&identity) || cooldown.contains_key(&identity) {
                     continue;
                 }

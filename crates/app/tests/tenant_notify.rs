@@ -34,12 +34,13 @@ async fn seed(admin: &support::AdminOnlyPool, tenant: TenantId, kind: &str) -> I
     .expect("创建身份失败")
 }
 
-async fn lease(app: &PgPool, identity: IdentityId, worker: &str) -> LeaseGuard {
-    let fencing_token = acquire_lease(app, identity, worker)
+async fn lease(app: &PgPool, tenant: TenantId, identity: IdentityId, worker: &str) -> LeaseGuard {
+    let fencing_token = acquire_lease(app, Some(tenant), identity, worker)
         .await
         .expect("抢租约失败")
         .expect("租约应可获取");
     LeaseGuard {
+        tenant_id: Some(tenant),
         identity_id: identity,
         worker_id: worker.to_owned(),
         fencing_token,
@@ -174,7 +175,7 @@ async fn pending_notification_survives_process_kill_before_response(admin: PgPoo
     let database_url = format!("postgres://app_user:apw@127.0.0.1:55432/{database}");
     let tenant = support::seed_tenant(&admin, "tn-restart", 7109).await;
     let identity = seed(&admin, tenant, "mtproto").await;
-    let holder = lease(&app, identity, "worker-restart").await;
+    let holder = lease(&app, tenant, identity, "worker-restart").await;
     assert!(
         mark_leased_identity_unauthorized(&app, tenant, &holder)
             .await
@@ -278,12 +279,12 @@ async fn lost_authorization_enqueues_exactly_one_in_same_transaction(admin: PgPo
     let (app, admin) = support::pools(admin).await;
     let tenant = support::seed_tenant(&admin, "tn-a", 7101).await;
     let identity = seed(&admin, tenant, "mtproto").await;
-    let zombie = lease(&app, identity, "worker-a").await;
+    let zombie = lease(&app, tenant, identity, "worker-a").await;
     sqlx::query("UPDATE account_leases SET expires_at = clock_timestamp() - interval '1 second'")
         .execute(admin.raw())
         .await
         .expect("让租约过期失败");
-    let holder = lease(&app, identity, "worker-b").await;
+    let holder = lease(&app, tenant, identity, "worker-b").await;
 
     assert!(
         !mark_leased_identity_unauthorized(&app, tenant, &zombie)
@@ -314,7 +315,7 @@ async fn banned_marks_status_audit_and_notification(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     let tenant = support::seed_tenant(&admin, "tn-b", 7102).await;
     let identity = seed(&admin, tenant, "mtproto").await;
-    let holder = lease(&app, identity, "worker-a").await;
+    let holder = lease(&app, tenant, identity, "worker-a").await;
 
     assert!(
         mark_leased_identity_lost(&app, tenant, &holder, LostAuthorization::Banned)
@@ -334,7 +335,7 @@ async fn banned_marks_status_audit_and_notification(admin: PgPool) {
     assert_eq!((status.as_str(), audits), ("banned", 1));
     assert_eq!(rows(&admin, identity).await[0].0, "identity.banned");
     assert!(
-        acquire_lease(&app, identity, "worker-b")
+        acquire_lease(&app, Some(tenant), identity, "worker-b")
             .await
             .expect("抢租约失败")
             .is_some(),
@@ -367,7 +368,7 @@ async fn delivery_sends_to_owner_once(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     let tenant = support::seed_tenant(&admin, "tn-d", 7104).await;
     let identity = seed(&admin, tenant, "mtproto").await;
-    let holder = lease(&app, identity, "worker-a").await;
+    let holder = lease(&app, tenant, identity, "worker-a").await;
     mark_leased_identity_unauthorized(&app, tenant, &holder)
         .await
         .expect("标记失败");
@@ -391,7 +392,7 @@ async fn forbidden_is_dead_and_not_retried(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     let tenant = support::seed_tenant(&admin, "tn-e", 7105).await;
     let identity = seed(&admin, tenant, "mtproto").await;
-    let holder = lease(&app, identity, "worker-a").await;
+    let holder = lease(&app, tenant, identity, "worker-a").await;
     mark_leased_identity_unauthorized(&app, tenant, &holder)
         .await
         .expect("标记失败");
@@ -425,7 +426,7 @@ async fn rate_limited_backs_off_then_dead(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     let tenant = support::seed_tenant(&admin, "tn-f", 7106).await;
     let identity = seed(&admin, tenant, "mtproto").await;
-    let holder = lease(&app, identity, "worker-a").await;
+    let holder = lease(&app, tenant, identity, "worker-a").await;
     mark_leased_identity_unauthorized(&app, tenant, &holder)
         .await
         .expect("标记失败");
@@ -470,7 +471,7 @@ async fn notifications_are_tenant_isolated(admin: PgPool) {
     let tenant_a = support::seed_tenant(&admin, "tn-g", 7107).await;
     let tenant_b = support::seed_tenant(&admin, "tn-h", 7108).await;
     let identity = seed(&admin, tenant_a, "mtproto").await;
-    let holder = lease(&app, identity, "worker-a").await;
+    let holder = lease(&app, tenant_a, identity, "worker-a").await;
     mark_leased_identity_unauthorized(&app, tenant_a, &holder)
         .await
         .expect("标记失败");

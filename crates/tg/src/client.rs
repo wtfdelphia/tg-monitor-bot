@@ -89,6 +89,13 @@ pub struct TelegramClient {
     runner_task: tokio::task::JoinHandle<()>,
 }
 
+impl Drop for TelegramClient {
+    fn drop(&mut self) {
+        self.handle.quit();
+        self.runner_task.abort();
+    }
+}
+
 impl TelegramClient {
     pub async fn connect(config: TelegramClientConfig) -> Result<Self, TelegramClientError> {
         Self::connect_with_session(config, StoredSession::default()).await
@@ -626,13 +633,13 @@ impl TelegramClient {
             .map_err(TelegramClientError::Snapshot)
     }
 
-    pub async fn shutdown(self) -> Result<(), TelegramClientError> {
+    pub async fn shutdown(mut self) -> Result<(), TelegramClientError> {
         let sync_result = match &self.updates {
             Some(updates) => updates.sync_update_state().await,
             None => Ok(()),
         };
         self.handle.quit();
-        let runner_result = self.runner_task.await;
+        let runner_result = (&mut self.runner_task).await;
 
         if let Err(error) = sync_result {
             return Err(TelegramClientError::SessionSync(error));

@@ -28,6 +28,7 @@ struct World {
     app: PgPool,
     admin: support::AdminOnlyPool,
     receiver: IdentityId,
+    owner: TenantId,
 }
 
 struct TenantSetup {
@@ -55,6 +56,7 @@ async fn world(admin: PgPool) -> World {
         app,
         admin,
         receiver,
+        owner,
     }
 }
 
@@ -126,6 +128,7 @@ async fn media_event(world: &World, message_id: i64, caption: &str, file_size: O
     insert_canonical_event(
         &world.app,
         &CanonicalEventInput {
+            receiver_tenant_id: Some(world.owner),
             adapter: CanonicalAdapter::MtProto,
             receiver_identity_id: world.receiver,
             tg_chat_id: CHAT,
@@ -195,11 +198,12 @@ async fn task_state(
 }
 
 async fn lease(world: &World, worker: &str) -> LeaseGuard {
-    let fencing_token = acquire_lease(&world.app, world.receiver, worker)
+    let fencing_token = acquire_lease(&world.app, Some(world.owner), world.receiver, worker)
         .await
         .expect("抢租约失败")
         .expect("租约应可获取");
     LeaseGuard {
+        tenant_id: Some(world.owner),
         identity_id: world.receiver,
         worker_id: worker.to_owned(),
         fencing_token,
@@ -600,6 +604,7 @@ async fn delivery_times_out_and_stale_lease_cannot_claim(admin: PgPool) {
     let task = route(&world, &pro, canonical).await;
 
     let stale = LeaseGuard {
+        tenant_id: Some(world.owner),
         identity_id: world.receiver,
         worker_id: "nobody".to_owned(),
         fencing_token: 99,

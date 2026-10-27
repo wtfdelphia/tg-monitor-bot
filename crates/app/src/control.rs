@@ -1444,7 +1444,18 @@ async fn authenticate_request(
     mut request: axum::http::Request<Body>,
     next: Next,
 ) -> Response {
-    if request.extensions().get::<AuthContext>().is_some() {
+    if let Some(auth) = request.extensions().get::<AuthContext>().copied() {
+        if let Err(error) = check_tenant_request(
+            &state.pool,
+            auth,
+            request.uri().path().to_owned(),
+            unsafe_method(request.method()),
+        )
+        .await
+        {
+            close_logins(state.qr_logins.remove_tenant(auth.tenant_id().get()));
+            return ApiError::from(error).into_response();
+        }
         return next.run(request).await;
     }
 
@@ -1495,7 +1506,37 @@ async fn authenticate_request(
         AuthContext::new(session.tenant_id, session.user_id, role, AuthSource::Web)
             .with_web_session_id(session_id),
     );
+    if let Some(auth) = request.extensions().get::<AuthContext>().copied()
+        && let Err(error) = check_tenant_request(
+            &state.pool,
+            auth,
+            request.uri().path().to_owned(),
+            unsafe_method(request.method()),
+        )
+        .await
+    {
+        close_logins(state.qr_logins.remove_tenant(auth.tenant_id().get()));
+        return ApiError::from(error).into_response();
+    }
     next.run(request).await
+}
+
+async fn check_tenant_request(
+    pool: &PgPool,
+    auth: AuthContext,
+    path: String,
+    unsafe_request: bool,
+) -> Result<(), AppError> {
+    if path == "/auth/logout" || path == "/auth/sessions" || path.starts_with("/auth/sessions/") {
+        return Ok(());
+    }
+    if !tgm_db::lifecycle::readable(pool, auth.tenant_id()).await? {
+        return Err(AppError::Forbidden);
+    }
+    if unsafe_request && !tgm_db::lifecycle::is_active(pool, auth.tenant_id()).await? {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
@@ -1960,7 +2001,12 @@ async fn create_bot_identity(
             AppError::internal(std::io::Error::other("control-plane 未配置凭据录入 KEK")).into(),
         );
     };
-
+    let Some(_execution) = tgm_db::lifecycle::WorkerGuard::acquire(&state.pool, auth.tenant_id())
+        .await
+        .map_err(AppError::from)?
+    else {
+        return Err(AppError::Forbidden.into());
+    };
     let client =
         crate::bot_console::TelegramBotApiClient::new(Arc::clone(&token), &intake.bot_api_base_url)
             .map_err(AppError::internal)?;
@@ -1995,7 +2041,7 @@ async fn create_bot_identity(
         tgm_db::credentials::CredentialError::BotAlreadyRegistered => {
             AppError::ConditionInvalid("该 Bot 已接入".to_owned())
         }
-        tgm_db::credentials::CredentialError::Db(error) => AppError::Db(error),
+        tgm_db::credentials::CredentialError::Db(error) => AppError::from(error),
         other => AppError::internal(other),
     })?;
     Ok((
@@ -2038,6 +2084,7 @@ pub const CUSTODY_CONSENT_TEXT_VERSION: &str = "custody-v0";
 /// 登录中的一条 MTProto 连接。进入终态时 `driver` 被取走并关闭。
 pub struct QrLoginEntry {
     driver: Option<tgm_tg::qr_login::QrLoginDriver>,
+    execution: Option<tgm_db::lifecycle::WorkerGuard>,
     api_id: i32,
     identity_id: Option<tgm_core::ids::IdentityId>,
 }
@@ -2045,10 +2092,12 @@ pub struct QrLoginEntry {
 fn close_logins(entries: Vec<Arc<tokio::sync::Mutex<QrLoginEntry>>>) {
     for entry in entries {
         tokio::spawn(async move {
-            let driver = entry.lock().await.driver.take();
+            let mut entry = entry.lock().await;
+            let driver = entry.driver.take();
             if let Some(driver) = driver {
                 driver.close().await;
             }
+            entry.execution.take();
         });
     }
 }
@@ -2159,6 +2208,12 @@ async fn start_qr_login(
     };
 
     let tenant = auth.tenant_id();
+    let Some(_execution) = tgm_db::lifecycle::WorkerGuard::acquire(&state.pool, tenant)
+        .await
+        .map_err(AppError::from)?
+    else {
+        return Err(AppError::Forbidden.into());
+    };
     let latest = tgm_db::credentials::latest_custody_consent(&state.pool, tenant)
         .await
         .map_err(AppError::from)?;
@@ -2193,6 +2248,7 @@ async fn start_qr_login(
             now,
             QrLoginEntry {
                 driver: None,
+                execution: Some(_execution),
                 api_id: input.api_id,
                 identity_id,
             },
@@ -2257,6 +2313,7 @@ async fn persist_qr_login(
     login_id: &str,
     entry: &mut QrLoginEntry,
 ) -> Result<QrLoginStatusResponse, ApiError> {
+    let _execution = entry.execution.take();
     let Some(driver) = entry.driver.take() else {
         return Err(AppError::NotFound.into());
     };
@@ -2331,7 +2388,9 @@ async fn persist_qr_login(
                 tgm_db::credentials::CredentialError::IdentityNotFound => {
                     Err(AppError::NotFound.into())
                 }
-                tgm_db::credentials::CredentialError::Db(error) => Err(AppError::Db(error).into()),
+                tgm_db::credentials::CredentialError::Db(error) => {
+                    Err(AppError::from(error).into())
+                }
                 other => Err(AppError::internal(other).into()),
             }
         }
@@ -2394,6 +2453,17 @@ async fn poll_qr_login(
         Err(status) => return Ok(Json(status)),
     };
     let mut guard = entry.lock().await;
+    let Some(_execution) = tgm_db::lifecycle::WorkerGuard::acquire(&state.pool, auth.tenant_id())
+        .await
+        .map_err(AppError::from)?
+    else {
+        state.qr_logins.remove(&login_id);
+        if let Some(driver) = guard.driver.take() {
+            driver.close().await;
+        }
+        guard.execution.take();
+        return Err(AppError::Forbidden.into());
+    };
     let polled = match guard.driver.as_mut() {
         Some(driver) => driver.poll(Utc::now().timestamp()).await,
         None => return Err(AppError::NotFound.into()),
@@ -2454,6 +2524,17 @@ async fn submit_qr_login_password(
         Err(status) => return Ok(Json(status)),
     };
     let mut guard = entry.lock().await;
+    let Some(_execution) = tgm_db::lifecycle::WorkerGuard::acquire(&state.pool, auth.tenant_id())
+        .await
+        .map_err(AppError::from)?
+    else {
+        state.qr_logins.remove(&input.login_id);
+        if let Some(driver) = guard.driver.take() {
+            driver.close().await;
+        }
+        guard.execution.take();
+        return Err(AppError::Forbidden.into());
+    };
     let checked = match guard.driver.as_mut() {
         Some(driver) => driver.submit_password(&password).await,
         None => return Err(AppError::NotFound.into()),
@@ -5211,18 +5292,45 @@ pub async fn serve_with_auth_and_bot_and_oidc(
     listener: TcpListener,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), std::io::Error> {
-    let app = router(
-        ControlPlaneState::with_auth_pool_and_bot_and_oidc(
-            pool,
-            auth_pool,
-            bot_console_config,
-            oidc_config,
-        )
-        .with_credential_intake(credential_intake),
-    );
-    axum::serve(listener, app)
+    let state = ControlPlaneState::with_auth_pool_and_bot_and_oidc(
+        pool,
+        auth_pool,
+        bot_console_config,
+        oidc_config,
+    )
+    .with_credential_intake(credential_intake);
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let monitor_state = state.clone();
+    let monitor = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                changed = stopped.changed() => { let _ = changed; break; }
+                _ = interval.tick() => {}
+            }
+            for id in monitor_state.qr_logins.tenants() {
+                let active = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM tenants WHERE id=$1 AND status='active')",
+                )
+                .bind(id)
+                .fetch_one(&monitor_state.pool)
+                .await;
+                if matches!(active, Ok(false)) {
+                    close_logins(monitor_state.qr_logins.remove_tenant(id));
+                }
+            }
+        }
+    });
+    let app = router(state.clone());
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
-        .await
+        .await;
+    let _ = stop.send(true);
+    let _ = monitor.await;
+    for id in state.qr_logins.tenants() {
+        close_logins(state.qr_logins.remove_tenant(id));
+    }
+    result
 }
 
 #[cfg(test)]

@@ -162,11 +162,30 @@ pub trait DeliveryTransport: Send + Sync {
 pub struct TelegramDeliveryTransport {
     client: Arc<TelegramClient>,
     store: MediaStore,
+    pool: PgPool,
+    tenant: tgm_core::ids::TenantId,
 }
 
 impl TelegramDeliveryTransport {
-    pub fn new(client: Arc<TelegramClient>, store: MediaStore) -> Self {
-        Self { client, store }
+    pub fn new(
+        client: Arc<TelegramClient>,
+        store: MediaStore,
+        pool: PgPool,
+        tenant: tgm_core::ids::TenantId,
+    ) -> Self {
+        Self {
+            client,
+            store,
+            pool,
+            tenant,
+        }
+    }
+
+    async fn admit(&self) -> Result<tgm_db::lifecycle::WorkerGuard, DeliverySendError> {
+        tgm_db::lifecycle::WorkerGuard::acquire(&self.pool, self.tenant)
+            .await
+            .map_err(|_| send_error("ADMISSION_UNAVAILABLE", "无法核实租户状态"))?
+            .ok_or_else(|| send_error("TENANT_INACTIVE", "租户已暂停"))
     }
 
     async fn deliver_media_group(
@@ -188,6 +207,7 @@ impl TelegramDeliveryTransport {
             .collect();
         let mut uploaded = Vec::with_capacity(payload.media_group.len());
         for media in &payload.media_group {
+            let _admission = self.admit().await?;
             let (mut reader, size) = self
                 .store
                 .get_stream(&media.object_key)
@@ -214,12 +234,17 @@ impl TelegramDeliveryTransport {
         } else {
             ""
         };
+        let _admission = self.admit().await?;
         let message_ids = self
             .client
             .send_media_group(payload.target_tg_chat_id, &random_ids, uploaded, caption)
             .await
             .map_err(tg_send_error)?;
         if plan == CaptionPlan::Split {
+            let _admission = self
+                .admit()
+                .await
+                .map_err(|_| send_error("PARTIAL_SENT", "媒体已发送，剩余文字未获准入"))?;
             self.client
                 .copy_text(
                     payload.target_tg_chat_id,
@@ -247,6 +272,7 @@ impl TelegramDeliveryTransport {
                 "说明超过文本消息上限，不截断",
             ));
         }
+        let _admission = self.admit().await?;
         let (mut reader, size) = self
             .store
             .get_stream(&media.object_key)
@@ -274,6 +300,10 @@ impl TelegramDeliveryTransport {
             .await
             .map_err(tg_send_error)?;
         if plan == CaptionPlan::Split {
+            let _admission = self
+                .admit()
+                .await
+                .map_err(|_| send_error("PARTIAL_SENT", "媒体已发送，剩余文字未获准入"))?;
             self.client
                 .copy_text(
                     payload.target_tg_chat_id,
@@ -290,6 +320,7 @@ impl TelegramDeliveryTransport {
 #[async_trait::async_trait]
 impl DeliveryTransport for TelegramDeliveryTransport {
     async fn deliver(&self, payload: DeliveryPayload) -> Result<i64, DeliverySendError> {
+        let _admission = self.admit().await?;
         if !payload.media_group.is_empty() {
             return self.deliver_media_group(&payload).await;
         }
@@ -362,6 +393,12 @@ pub enum DeliveryRunOutcome {
     Deferred {
         task_id: i64,
     },
+    Uncertain {
+        task_id: i64,
+    },
+    Cancelled {
+        task_id: i64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,6 +453,9 @@ impl<T: DeliveryTransport + ?Sized> DeliveryWorker<T> {
             if *shutdown.borrow() {
                 return Ok(DeliveryWorkerExit::Shutdown);
             }
+            if !tgm_db::lifecycle::is_active(&self.pool, self.tenant).await? {
+                return Ok(DeliveryWorkerExit::Shutdown);
+            }
 
             let outcome = match run_delivery_once(
                 &self.pool,
@@ -459,6 +499,8 @@ impl<T: DeliveryTransport + ?Sized> DeliveryWorker<T> {
                 }
                 DeliveryRunOutcome::Done { .. }
                 | DeliveryRunOutcome::Failed { .. }
+                | DeliveryRunOutcome::Uncertain { .. }
+                | DeliveryRunOutcome::Cancelled { .. }
                 | DeliveryRunOutcome::Deferred { .. } => {}
             }
         }
@@ -746,7 +788,12 @@ pub async fn run_delivery_once<T: DeliveryTransport + ?Sized>(
     }
 
     let started = std::time::Instant::now();
-    match transport.deliver(payload).await {
+    let admission = tgm_db::lifecycle::WorkerGuard::acquire(pool, tenant).await?;
+    let sent = match admission {
+        Some(_admission) => transport.deliver(payload).await,
+        None => Err(send_error("TENANT_INACTIVE", "租户已暂停，未执行发送")),
+    };
+    match sent {
         Ok(telegram_message_id) => {
             let latency_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
             if !complete_delivery_task(pool, tenant, task.id, telegram_message_id, Some(latency_ms))
@@ -772,7 +819,7 @@ pub async fn run_delivery_once<T: DeliveryTransport + ?Sized>(
                 DeliveryDecisionStatus::Pending => DeliveryTaskFailureStatus::Pending,
                 DeliveryDecisionStatus::Dead => DeliveryTaskFailureStatus::Dead,
             };
-            record_delivery_failure(
+            let written = record_delivery_failure(
                 pool,
                 tenant,
                 task.id,
@@ -788,6 +835,18 @@ pub async fn run_delivery_once<T: DeliveryTransport + ?Sized>(
                 },
             )
             .await?;
+            if written
+                .as_ref()
+                .is_some_and(|record| record.status == "SENDING")
+            {
+                return Ok(DeliveryRunOutcome::Uncertain { task_id: task.id });
+            }
+            if written
+                .as_ref()
+                .is_some_and(|record| record.status == "CANCELLED")
+            {
+                return Ok(DeliveryRunOutcome::Cancelled { task_id: task.id });
+            }
             Ok(DeliveryRunOutcome::Failed {
                 task_id: task.id,
                 status: decision.status,

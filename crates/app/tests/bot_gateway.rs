@@ -25,6 +25,7 @@ async fn webhook_requires_secret_header(admin: PgPool) {
         auth_pool: admin.clone(),
         secret_token: "gateway-secret".to_owned(),
         receiver_identity_id,
+        receiver_tenant_id: None,
     });
 
     let missing = app
@@ -68,6 +69,7 @@ async fn webhook_ingests_channel_post_and_deduplicates_update_id(admin: PgPool) 
         auth_pool,
         secret_token: "gateway-secret".to_owned(),
         receiver_identity_id,
+        receiver_tenant_id: Some(tenant),
     });
     let update = r#"{
         "update_id": 73001,
@@ -131,6 +133,17 @@ async fn callback_lookup_binds_resource_id_to_the_authenticated_tenant(admin: Pg
         .expect_err("跨租户身份 callback 未被隐藏");
     assert_eq!(error.code(), "NOT_FOUND");
     assert_eq!(error.http_status(), 404);
+
+    sqlx::query("UPDATE tenants SET status='deleted' WHERE id=$1")
+        .bind(tenant_a.get())
+        .execute(admin.raw())
+        .await
+        .expect("标记租户删除失败");
+    let error = authorize_callback(&app, auth, &format!("identity:{}", identity_a.get()))
+        .await
+        .expect_err("deleted 租户 callback 未被拒绝");
+    assert_eq!(error.code(), "FORBIDDEN");
+    assert_eq!(error.http_status(), 403);
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]

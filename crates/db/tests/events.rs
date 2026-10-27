@@ -20,6 +20,7 @@ async fn seed_identity(admin: &support::AdminOnlyPool) -> IdentityId {
 
 fn event(identity_id: IdentityId) -> CanonicalEventInput {
     CanonicalEventInput {
+        receiver_tenant_id: None,
         adapter: CanonicalAdapter::MtProto,
         receiver_identity_id: identity_id,
         tg_chat_id: -1001,
@@ -47,6 +48,7 @@ fn event(identity_id: IdentityId) -> CanonicalEventInput {
 
 fn bot_event(identity_id: IdentityId, message_id: i64, update_id: i64) -> CanonicalEventInput {
     CanonicalEventInput {
+        receiver_tenant_id: None,
         adapter: CanonicalAdapter::Bot,
         receiver_identity_id: identity_id,
         tg_chat_id: -1002,
