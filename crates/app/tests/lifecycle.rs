@@ -120,24 +120,26 @@ async fn existing_cookie_and_cached_bot_context_respect_tenant_state(
             .status(),
         StatusCode::OK
     );
-    sqlx::query("UPDATE tenants SET status='deleted' WHERE id=$1")
-        .bind(tenant.get())
-        .execute(admin.raw())
-        .await?;
+    lifecycle::transition(&operator, tenant.get(), true).await?;
+    lifecycle::logical_delete(&operator, tenant.get()).await?;
+    assert!(matches!(
+        tgm_app::bot_gateway::list_member_contexts(&support::auth_pool(&admin).await, 97201).await,
+        Err(tgm_core::error::AppError::NotInvited)
+    ));
     assert_eq!(
         application
             .clone()
             .oneshot(request("GET", "/api/v1/keywords")?)
             .await?
             .status(),
-        StatusCode::FORBIDDEN
+        StatusCode::UNAUTHORIZED
     );
     assert_eq!(
         application
             .oneshot(request("POST", "/auth/logout")?)
             .await?
             .status(),
-        StatusCode::NO_CONTENT
+        StatusCode::UNAUTHORIZED
     );
     Ok(())
 }

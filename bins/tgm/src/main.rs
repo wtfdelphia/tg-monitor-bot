@@ -61,6 +61,10 @@ enum LifecycleAction {
         #[arg(long)]
         tenant_id: i64,
     },
+    Delete {
+        #[arg(long)]
+        tenant_id: i64,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -882,9 +886,10 @@ fn main() -> anyhow::Result<()> {
         {
             anyhow::bail!("租户生命周期配置错误，拒绝执行");
         }
-        let (id, suspend) = match action {
-            LifecycleAction::Suspend { tenant_id } => (tenant_id, true),
-            LifecycleAction::Resume { tenant_id } => (tenant_id, false),
+        let (id, operation) = match action {
+            LifecycleAction::Suspend { tenant_id } => (tenant_id, "suspend"),
+            LifecycleAction::Resume { tenant_id } => (tenant_id, "resume"),
+            LifecycleAction::Delete { tenant_id } => (tenant_id, "delete"),
         };
         if id <= 0 {
             anyhow::bail!("租户编号必须为正整数");
@@ -897,10 +902,25 @@ fn main() -> anyhow::Result<()> {
                 .connect(&url)
                 .await
                 .map_err(|_| anyhow::anyhow!("租户生命周期数据库连接失败"))?;
-            let result =
-                tgm_app::lifecycle::run(&pool, id, suspend, tgm_app::shutdown_signal()).await;
+            let result = match operation {
+                "delete" => tgm_app::lifecycle::delete(&pool, id, tgm_app::shutdown_signal())
+                    .await
+                    .map(|()| 0),
+                _ => {
+                    tgm_app::lifecycle::run(
+                        &pool,
+                        id,
+                        operation == "suspend",
+                        tgm_app::shutdown_signal(),
+                    )
+                    .await
+                }
+            };
             pool.close().await;
             match result {
+                Ok(_) if operation == "delete" => {
+                    println!("tgm: 租户逻辑注销完成")
+                }
                 Ok(rows) => println!("tgm: 租户生命周期完成：cancelled={rows}"),
                 Err(tgm_db::lifecycle::LifecycleError::Draining) => {
                     anyhow::bail!("租户仍可能暂停但排空未完成，需核对在途结果后重跑")

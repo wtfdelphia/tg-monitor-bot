@@ -213,6 +213,8 @@ async fn transitions_time_permissions_and_fencing(injected: PgPool) -> TestResul
         "SELECT secret_ciphertext FROM identity_secrets",
         "SELECT text FROM canonical_events",
         "SELECT id FROM web_sessions",
+        "SELECT id FROM login_sessions",
+        "SELECT tg_user_id FROM bot_console_sessions",
         "DELETE FROM tenants",
         "UPDATE tenant_consents SET text_version='forged'",
     ] {
@@ -453,5 +455,388 @@ async fn cancellation_log_failure_rolls_back_and_target_isolation_holds(
         .await?,
         1
     );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn logical_delete_retires_credentials_sessions_and_is_idempotent(
+    injected: PgPool,
+) -> TestResult {
+    let (app, operator, admin, tenant, identity) = setup(injected).await?;
+    let other: TenantId = sqlx::query_scalar(
+        "INSERT INTO tenants(name,owner_user_id) VALUES('logical-other',97102) RETURNING id",
+    )
+    .fetch_one(admin.raw())
+    .await?;
+    let other_identity: IdentityId = sqlx::query_scalar(
+        "INSERT INTO identities(kind,tenant_id,status) VALUES('bot',$1,'online') RETURNING id",
+    )
+    .bind(other.get())
+    .fetch_one(admin.raw())
+    .await?;
+    let shared_identity: IdentityId = sqlx::query_scalar(
+        "INSERT INTO identities(kind,tenant_id,status) VALUES('bot',NULL,'online') RETURNING id",
+    )
+    .fetch_one(admin.raw())
+    .await?;
+    for (tenant_id, identity_id) in [(tenant, identity), (other, other_identity)] {
+        sqlx::query(
+            "INSERT INTO credential_keys(tenant_id,dek_ciphertext,kek_id)
+             VALUES($1,decode('aa','hex'),'test')",
+        )
+        .bind(tenant_id.get())
+        .execute(admin.raw())
+        .await?;
+        sqlx::query(
+            "INSERT INTO identity_secrets
+                (identity_id,secret_ciphertext,nonce,dek_ciphertext,kek_id)
+             VALUES($1,decode('bb','hex'),decode('cc','hex'),decode('dd','hex'),'test')",
+        )
+        .bind(identity_id.get())
+        .execute(admin.raw())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO identity_secrets
+            (identity_id,secret_ciphertext,nonce,dek_ciphertext,kek_id)
+         VALUES($1,decode('ee','hex'),decode('ff','hex'),decode('11','hex'),'test')",
+    )
+    .bind(shared_identity.get())
+    .execute(admin.raw())
+    .await?;
+    for tenant_id in [tenant, other] {
+        let user_id = tenant_id.get() + 10000;
+        sqlx::query("INSERT INTO tenant_members(tenant_id,user_id) VALUES($1,$2)")
+            .bind(tenant_id.get())
+            .bind(user_id)
+            .execute(admin.raw())
+            .await?;
+        sqlx::query(
+            "INSERT INTO web_sessions(tenant_id,id,user_id,csrf_token,expires_at)
+             VALUES($1,$2,$3,$4,now()+interval '1 hour')",
+        )
+        .bind(tenant_id.get())
+        .bind([tenant_id.get() as u8; 32].as_slice())
+        .bind(user_id)
+        .bind([tenant_id.get() as u8 + 1; 32].as_slice())
+        .execute(admin.raw())
+        .await?;
+        sqlx::query("INSERT INTO bot_console_sessions(tg_user_id,tenant_id) VALUES($1,$2)")
+            .bind(user_id)
+            .bind(tenant_id.get())
+            .execute(admin.raw())
+            .await?;
+        sqlx::query(
+            "INSERT INTO login_sessions(tenant_id,kind,state,expires_at)
+             VALUES($1,'qr','done',now()+interval '1 hour')",
+        )
+        .bind(tenant_id.get())
+        .execute(admin.raw())
+        .await?;
+    }
+    lifecycle::transition(&operator, tenant.get(), true).await?;
+    lifecycle::logical_delete(&operator, tenant.get()).await?;
+    let first_deleted_at: String =
+        sqlx::query_scalar("SELECT deleted_at::text FROM tenants WHERE id=$1")
+            .bind(tenant.get())
+            .fetch_one(admin.raw())
+            .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM tenants WHERE id=$1")
+            .bind(tenant.get())
+            .fetch_one(admin.raw())
+            .await?,
+        "deleted"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM identity_secrets WHERE identity_id=$1")
+            .bind(identity.get())
+            .fetch_one(admin.raw())
+            .await?,
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM credential_keys WHERE tenant_id=$1")
+            .bind(tenant.get())
+            .fetch_one(admin.raw())
+            .await?,
+        0
+    );
+    for (table, query) in [
+        (
+            "web_sessions",
+            "SELECT count(*) FROM web_sessions WHERE tenant_id=$1",
+        ),
+        (
+            "bot_console_sessions",
+            "SELECT count(*) FROM bot_console_sessions WHERE tenant_id=$1",
+        ),
+        (
+            "login_sessions",
+            "SELECT count(*) FROM login_sessions WHERE tenant_id=$1",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(query)
+            .bind(tenant.get())
+            .fetch_one(admin.raw())
+            .await?;
+        assert_eq!(count, 0, "{table} 未清零");
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM identities WHERE id=$1")
+            .bind(identity.get())
+            .fetch_one(admin.raw())
+            .await?,
+        "unauthorized"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM identity_secrets WHERE identity_id=$1")
+            .bind(shared_identity.get())
+            .fetch_one(admin.raw())
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM credential_keys WHERE tenant_id=$1")
+            .bind(other.get())
+            .fetch_one(admin.raw())
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM audit_logs WHERE tenant_id=$1 AND action='tenant.delete'",
+        )
+        .bind(tenant.get())
+        .fetch_one(admin.raw())
+        .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM system_logs WHERE tenant_id=$1 AND event='delete.done'",
+        )
+        .bind(tenant.get())
+        .fetch_one(admin.raw())
+        .await?,
+        1
+    );
+    lifecycle::logical_delete(&operator, tenant.get()).await?;
+    assert_eq!(
+        first_deleted_at,
+        sqlx::query_scalar::<_, String>("SELECT deleted_at::text FROM tenants WHERE id=$1")
+            .bind(tenant.get())
+            .fetch_one(admin.raw())
+            .await?
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM system_logs WHERE tenant_id=$1 AND event='delete.done'",
+        )
+        .bind(tenant.get())
+        .fetch_one(admin.raw())
+        .await?,
+        2
+    );
+    drop(app);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn logical_delete_rolls_back_incomplete_cleanup_and_log_failures(
+    injected: PgPool,
+) -> TestResult {
+    let (_app, operator, admin, tenant, identity) = setup(injected).await?;
+    sqlx::query(
+        "INSERT INTO identity_secrets(identity_id,secret_ciphertext,nonce,dek_ciphertext,kek_id)
+         VALUES($1,decode('aa','hex'),decode('bb','hex'),decode('cc','hex'),'test')",
+    )
+    .bind(identity.get())
+    .execute(admin.raw())
+    .await?;
+    lifecycle::transition(&operator, tenant.get(), true).await?;
+    sqlx::raw_sql(
+        "SET ROLE tgm_owner;
+         CREATE FUNCTION reject_lifecycle_cleanup() RETURNS trigger LANGUAGE plpgsql
+           AS $$ BEGIN RETURN NULL; END $$;
+         CREATE TRIGGER reject_lifecycle_cleanup BEFORE DELETE ON identity_secrets
+           FOR EACH ROW EXECUTE FUNCTION reject_lifecycle_cleanup();
+         RESET ROLE;",
+    )
+    .execute(admin.raw())
+    .await?;
+    assert!(matches!(
+        lifecycle::logical_delete(&operator, tenant.get()).await,
+        Err(LifecycleError::CredentialsRemain)
+    ));
+    sqlx::raw_sql(
+        "SET ROLE tgm_owner;
+         DROP TRIGGER reject_lifecycle_cleanup ON identity_secrets;
+         DROP FUNCTION reject_lifecycle_cleanup();
+         ALTER TABLE system_logs ADD CONSTRAINT reject_lifecycle_delete_log
+           CHECK(event <> 'delete.done');
+         RESET ROLE;",
+    )
+    .execute(admin.raw())
+    .await?;
+    assert!(
+        lifecycle::logical_delete(&operator, tenant.get())
+            .await
+            .is_err()
+    );
+    let state: (String, bool, String, i64, i64) = sqlx::query_as(
+        "SELECT tenant.status,tenant.deleted_at IS NULL,identity.status,
+                (SELECT count(*) FROM identity_secrets WHERE identity_id=$2),
+                (SELECT count(*) FROM audit_logs WHERE tenant_id=$1 AND action='tenant.delete')
+           FROM tenants tenant JOIN identities identity ON identity.tenant_id=tenant.id
+          WHERE tenant.id=$1 AND identity.id=$2",
+    )
+    .bind(tenant.get())
+    .bind(identity.get())
+    .fetch_one(admin.raw())
+    .await?;
+    assert_eq!(
+        state,
+        ("suspended".to_owned(), true, "offline".to_owned(), 1, 0)
+    );
+    sqlx::raw_sql(
+        "SET ROLE tgm_owner;
+         ALTER TABLE system_logs DROP CONSTRAINT reject_lifecycle_delete_log;
+         RESET ROLE;",
+    )
+    .execute(admin.raw())
+    .await?;
+    lifecycle::logical_delete(&operator, tenant.get()).await?;
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn logical_delete_serializes_with_resume_and_blocks_worker_admission(
+    injected: PgPool,
+) -> TestResult {
+    let (app, operator, admin, tenant, identity) = setup(injected).await?;
+    lifecycle::transition(&operator, tenant.get(), true).await?;
+    let mut deleting = operator.begin().await?;
+    lifecycle::lock(&mut deleting, tenant, true).await?;
+    sqlx::query("SELECT set_config('app.tenant_id',$1,true)")
+        .bind(tenant.get().to_string())
+        .execute(&mut *deleting)
+        .await?;
+    sqlx::query("UPDATE tenants SET status='deleted' WHERE id=$1")
+        .bind(tenant.get())
+        .execute(&mut *deleting)
+        .await?;
+    let resuming_pool = operator.clone();
+    let resuming =
+        tokio::spawn(
+            async move { lifecycle::transition(&resuming_pool, tenant.get(), false).await },
+        );
+    waiting(admin.raw(), "tenant_lifecycle").await?;
+    deleting.commit().await?;
+    assert!(matches!(resuming.await?, Err(LifecycleError::State)));
+    assert!(WorkerGuard::acquire(&app, tenant).await?.is_none());
+    assert!(
+        repo::acquire_lease(&app, Some(tenant), identity, "late")
+            .await?
+            .is_none()
+    );
+    assert!(
+        tenant_write_tx(&app, tenant, |_| Box::pin(async { Ok(()) }))
+            .await
+            .is_err()
+    );
+    lifecycle::logical_delete(&operator, tenant.get()).await?;
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn logical_delete_rejects_active_inflight_and_recovery_paths(injected: PgPool) -> TestResult {
+    let (app, operator, admin, tenant, identity) = setup(injected).await?;
+    sqlx::query(
+        "INSERT INTO identity_secrets(identity_id,secret_ciphertext,nonce,dek_ciphertext,kek_id)
+         VALUES($1,decode('aa','hex'),decode('bb','hex'),decode('cc','hex'),'test')",
+    )
+    .bind(identity.get())
+    .execute(admin.raw())
+    .await?;
+    let mut active_transaction = operator.begin().await?;
+    sqlx::query("SELECT set_config('app.tenant_id',$1,true)")
+        .bind(tenant.get().to_string())
+        .execute(&mut *active_transaction)
+        .await?;
+    assert!(
+        sqlx::query("DELETE FROM identity_secrets WHERE identity_id=$1")
+            .bind(identity.get())
+            .execute(&mut *active_transaction)
+            .await
+            .is_err()
+    );
+    active_transaction.rollback().await?;
+    sqlx::query(
+        "INSERT INTO credential_keys(tenant_id,dek_ciphertext,kek_id)
+         VALUES($1,decode('aa','hex'),'test')",
+    )
+    .bind(tenant.get())
+    .execute(admin.raw())
+    .await?;
+    let mut active_keys = operator.begin().await?;
+    sqlx::query("SELECT set_config('app.tenant_id',$1,true)")
+        .bind(tenant.get().to_string())
+        .execute(&mut *active_keys)
+        .await?;
+    assert_eq!(
+        sqlx::query("DELETE FROM credential_keys WHERE tenant_id=$1")
+            .bind(tenant.get())
+            .execute(&mut *active_keys)
+            .await?
+            .rows_affected(),
+        0
+    );
+    active_keys.rollback().await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM credential_keys WHERE tenant_id=$1")
+            .bind(tenant.get())
+            .fetch_one(admin.raw())
+            .await?,
+        1
+    );
+    assert!(matches!(
+        lifecycle::logical_delete(&operator, tenant.get()).await,
+        Err(LifecycleError::State)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM tenants WHERE id=$1")
+            .bind(tenant.get())
+            .fetch_one(admin.raw())
+            .await?,
+        "active"
+    );
+    lifecycle::transition(&operator, tenant.get(), true).await?;
+    task(admin.raw(), tenant, identity, "PENDING").await?;
+    assert!(matches!(
+        lifecycle::logical_delete(&operator, tenant.get()).await,
+        Err(LifecycleError::Draining)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM tenants WHERE id=$1")
+            .bind(tenant.get())
+            .fetch_one(admin.raw())
+            .await?,
+        "suspended"
+    );
+    sqlx::query("UPDATE delivery_tasks SET status='CANCELLED', completed_at=now()")
+        .execute(admin.raw())
+        .await?;
+    lifecycle::logical_delete(&operator, tenant.get()).await?;
+    assert!(matches!(
+        lifecycle::transition(&operator, tenant.get(), false).await,
+        Err(LifecycleError::State)
+    ));
+    assert!(
+        lifecycle::logical_delete(&operator, tenant.get())
+            .await
+            .is_ok()
+    );
+    drop(app);
     Ok(())
 }

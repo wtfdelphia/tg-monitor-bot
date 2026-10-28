@@ -50,3 +50,17 @@ pub async fn run(
         }
     }
 }
+
+pub async fn delete(
+    pool: &PgPool,
+    id: i64,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), LifecycleError> {
+    tgm_db::lifecycle::check_connection(pool).await?;
+    tokio::pin!(shutdown);
+    tokio::select! {
+        biased;
+        _ = &mut shutdown => Err(LifecycleError::Draining),
+        result = tgm_db::lifecycle::logical_delete(pool, id) => result.map(|_| ()),
+    }
+}

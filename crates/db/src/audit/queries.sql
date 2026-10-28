@@ -949,9 +949,15 @@ WITH cleaner AS (
          ('tenants', 'suspended_at', 'SELECT'),
          ('tenants', 'status', 'UPDATE'),
          ('tenants', 'suspended_at', 'UPDATE'),
+         ('tenants', 'deleted_at', 'SELECT'),
+         ('tenants', 'deleted_at', 'UPDATE'),
          ('tenants', 'updated_at', 'UPDATE'),
          ('identities', 'id', 'SELECT'),
          ('identities', 'tenant_id', 'SELECT'),
+         ('identities', 'status', 'SELECT'),
+         ('identities', 'status', 'UPDATE'),
+         ('identities', 'updated_at', 'UPDATE'),
+         ('identity_secrets', 'identity_id', 'SELECT'),
          ('account_leases', 'identity_id', 'SELECT'),
          ('account_leases', 'expires_at', 'SELECT'),
          ('account_leases', 'expires_at', 'UPDATE'),
@@ -962,6 +968,10 @@ WITH cleaner AS (
          ('delivery_tasks', 'next_retry_at', 'UPDATE'),
          ('delivery_tasks', 'completed_at', 'UPDATE'),
          ('delivery_tasks', 'updated_at', 'UPDATE'),
+         ('credential_keys', 'tenant_id', 'SELECT'),
+         ('web_sessions', 'tenant_id', 'SELECT'),
+         ('bot_console_sessions', 'tenant_id', 'SELECT'),
+         ('login_sessions', 'tenant_id', 'SELECT'),
          ('audit_logs', 'tenant_id', 'INSERT'),
          ('audit_logs', 'action', 'INSERT'),
          ('audit_logs', 'resource', 'INSERT'),
@@ -974,6 +984,12 @@ WITH cleaner AS (
          ('system_logs', 'module', 'INSERT'),
          ('system_logs', 'event', 'INSERT'),
          ('system_logs', 'context', 'INSERT')
+), allowed_tables(tbl, privilege) AS (
+  VALUES ('credential_keys', 'DELETE'),
+         ('identity_secrets', 'DELETE'),
+         ('web_sessions', 'DELETE'),
+         ('bot_console_sessions', 'DELETE'),
+         ('login_sessions', 'DELETE')
 ), violations AS (
   SELECT 'tenant_lifecycle 缺失或属性不符' AS reason
    WHERE NOT EXISTS (SELECT 1 FROM cleaner WHERE rolcanlogin AND NOT
@@ -995,9 +1011,13 @@ WITH cleaner AS (
     FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
    CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER'), ('MAINTAIN')) p(privilege)
    WHERE c.relkind IN ('r','p','v','m','f') AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
-     AND (CASE WHEN privilege = 'MAINTAIN' AND current_setting('server_version_num')::int < 170000
-               THEN false ELSE has_table_privilege(r.oid, c.oid, privilege) END) <>
-       false
+     AND (EXISTS (
+            SELECT 1
+              FROM aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) acl
+             WHERE acl.grantee = r.oid AND acl.privilege_type = p.privilege
+          )) <>
+       EXISTS (SELECT 1 FROM allowed_tables allow
+                WHERE allow.tbl = c.relname AND allow.privilege = p.privilege)
   UNION ALL
   SELECT '表权限不得转授: ' || n.nspname || '.' || c.relname
     FROM cleaner r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -1042,9 +1062,19 @@ WITH cleaner AS (
    WHERE has_table_privilege('app_user','tenants','UPDATE')
       OR has_column_privilege('app_user','tenants','status','UPDATE')
       OR has_column_privilege('app_user','tenants','suspended_at','UPDATE')
+      OR has_column_privilege('app_user','tenants','deleted_at','UPDATE')
   UNION ALL
   SELECT '生命周期策略缺失或角色不符: ' || expected.name
     FROM cleaner r CROSS JOIN (VALUES ('identities','lifecycle_identity_keys','r'),
+      ('identities','lifecycle_identity_revoke','w'),
+      ('credential_keys','lifecycle_credential_keys_read','r'),
+      ('credential_keys','lifecycle_credential_keys_delete','d'),
+      ('web_sessions','lifecycle_web_sessions_read','r'),
+      ('web_sessions','lifecycle_web_sessions_delete','d'),
+      ('bot_console_sessions','lifecycle_bot_sessions_read','r'),
+      ('bot_console_sessions','lifecycle_bot_sessions_delete','d'),
+      ('login_sessions','lifecycle_login_sessions_read','r'),
+      ('login_sessions','lifecycle_login_sessions_delete','d'),
       ('delivery_tasks','lifecycle_task_keys','r'),('delivery_tasks','lifecycle_task_cancel','w'),
       ('audit_logs','lifecycle_audit','a'),('system_logs','lifecycle_log','a')) expected(tbl,name,command)
    WHERE NOT EXISTS (SELECT 1 FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid
@@ -1053,9 +1083,23 @@ WITH cleaner AS (
       AND p.polroles=ARRAY[r.oid]::oid[]
       AND coalesce(pg_get_expr(p.polqual,p.polrelid),pg_get_expr(p.polwithcheck,p.polrelid)) LIKE '%app.tenant_id%')
   UNION ALL
-  SELECT '租户暂停一致性约束或触发器缺失'
+  SELECT '租户注销删除策略缺少 deleted 状态: ' || expected.name
+    FROM cleaner r CROSS JOIN (VALUES
+      ('credential_keys','lifecycle_credential_keys_delete'),
+      ('web_sessions','lifecycle_web_sessions_delete'),
+      ('bot_console_sessions','lifecycle_bot_sessions_delete'),
+      ('login_sessions','lifecycle_login_sessions_delete')) expected(tbl,name)
+   WHERE NOT EXISTS (
+     SELECT 1 FROM pg_policy policy JOIN pg_class relation ON relation.oid=policy.polrelid
+      JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+     WHERE namespace.nspname='public' AND relation.relname=expected.tbl AND policy.polname=expected.name
+       AND pg_get_expr(policy.polqual,policy.polrelid) LIKE '%deleted%'
+       AND pg_get_expr(policy.polqual,policy.polrelid) LIKE '%tenants%'
+   )
+  UNION ALL
+  SELECT '租户生命周期一致性约束或触发器缺失'
    WHERE NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='tenants'::regclass
-       AND conname='tenant_suspension_consistent' AND convalidated)
+       AND conname='tenant_lifecycle_consistent' AND convalidated)
       OR NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='tenants'::regclass
        AND tgname='tenant_suspension_time' AND tgenabled='O')
       OR NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='account_leases'::regclass

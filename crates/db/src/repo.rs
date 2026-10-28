@@ -849,10 +849,12 @@ pub async fn load_web_session(
         .await?;
 
     let session = sqlx::query_as::<_, (TenantId, i64)>(
-        "SELECT tenant_id, user_id
-           FROM web_sessions
-          WHERE id = $1
-            AND expires_at > now()",
+        "SELECT s.tenant_id, s.user_id
+           FROM web_sessions s
+          JOIN tenants t ON t.id = s.tenant_id
+          WHERE s.id = $1
+            AND t.status IN ('active', 'suspended')
+            AND s.expires_at > now()",
     )
     .bind(session_id)
     .fetch_optional(&mut *tx)
@@ -877,6 +879,10 @@ pub async fn load_web_session(
           WHERE s.id = $1
             AND s.tenant_id = $2
             AND s.user_id = $3
+            AND EXISTS (
+                SELECT 1 FROM tenants t
+                 WHERE t.id = s.tenant_id AND t.status IN ('active', 'suspended')
+            )
             AND s.expires_at > now()",
     )
     .bind(session_id)

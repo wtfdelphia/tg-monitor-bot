@@ -1,0 +1,1 @@
+../migrations/0042_tenant_logical_delete.sql
