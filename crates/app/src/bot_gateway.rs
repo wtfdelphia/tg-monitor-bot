@@ -380,9 +380,11 @@ pub async fn list_member_contexts(
         .execute(&mut *tx)
         .await?;
     let records = sqlx::query_as::<_, (TenantId, String)>(
-        "SELECT tenant_id, role
-           FROM tenant_members
-          WHERE user_id = $1
+        "SELECT m.tenant_id, m.role
+           FROM tenant_members m
+           JOIN tenants t ON t.id = m.tenant_id
+          WHERE m.user_id = $1
+            AND t.status IN ('active', 'suspended')
           ORDER BY tenant_id",
     )
     .bind(telegram_user_id)

@@ -2,7 +2,7 @@
 
 任务 id：`WP-8-tenant-logical-delete`。
 
-状态：2026-10-27，WP-8 首片“暂停、恢复与执行围栏”已由 PR #59 合入 `dev`；本提案申请第二片实施批准，尚未修改生产代码、迁移或数据库权限。
+状态：2026-10-28，WP-8 首片“暂停、恢复与执行围栏”已由 PR #59 合入 `dev`；第二片实现、专项测试和本地完整门禁已完成，待按一个提交推送并开向 `dev` 的 PR，PR CI 与合并仍未裁决。
 
 基线：`dev` 合并提交 `aab345b4808b8a07c51e49678553b6873b6b0e5e`。
 
@@ -112,10 +112,10 @@
 获批后在隔离工作树实施，按一个任务一个 commit；完成本地门禁后再申请提交、推送和 PR。
 PR 目标为 `dev`，不自动合并。PR CI 是最终裁决，CI 通过后仍需维护人明确批准合入。
 
-本提案不宣布 WP-8、G3/G4、生产部署或租户删除出口通过；只申请第二片“逻辑注销与凭据销毁”实现权限。
+本提案不宣布 WP-8、G3/G4、生产部署或租户删除出口通过；本片实施证据见 `../evidence/WP-8-租户逻辑注销与凭据销毁-2026-10-28.md`。
 
 [report]
 task: WP-8-tenant-logical-delete
-path: escalated
-gates: not-run
+path: ok
+gates: pass
 escalation: docs/plan/proposals/WP-8-tenant-logical-delete.md

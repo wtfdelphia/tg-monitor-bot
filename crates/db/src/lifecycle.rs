@@ -168,6 +168,8 @@ pub enum LifecycleError {
     State,
     #[error("租户仍有在途执行，未完成排空")]
     Draining,
+    #[error("租户凭据尚未全部销毁")]
+    CredentialsRemain,
     #[error("租户生命周期事务失败")]
     Database(#[from] sqlx::Error),
 }
@@ -237,6 +239,142 @@ pub async fn transition(pool: &PgPool, id: i64, suspend: bool) -> Result<TenantI
             .bind(id).bind(if suspend {"tenant.suspend"} else {"tenant.resume"})
             .bind(serde_json::json!({"status":status})).bind(serde_json::json!({"status":next})).execute(&mut *transaction).await?;
     }
+    transaction.commit().await?;
+    Ok(tenant)
+}
+
+pub async fn logical_delete(pool: &PgPool, id: i64) -> Result<TenantId, LifecycleError> {
+    let tenant = tenant(pool, id).await?;
+    let mut connection = pool.acquire().await?;
+    connection.close_on_drop();
+    let mut transaction = connection.begin().await?;
+    lock(&mut transaction, tenant, true).await?;
+    sqlx::query("SELECT set_config('app.tenant_id',$1,true)")
+        .bind(id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+
+    let status: String = sqlx::query_scalar("SELECT status FROM tenants WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *transaction)
+        .await?;
+    if status == "suspended" {
+        let pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM delivery_tasks
+                 WHERE tenant_id=$1 AND status IN ('PENDING','FAILED','SENDING')
+            )",
+        )
+        .bind(id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let leases: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM account_leases
+                 WHERE expires_at > statement_timestamp()
+                   AND identity_id IN (SELECT id FROM identities WHERE tenant_id=$1)
+            )",
+        )
+        .bind(id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if pending || leases || !workers_stopped(&mut transaction, tenant).await? {
+            return Err(LifecycleError::Draining);
+        }
+    } else if status != "deleted" {
+        return Err(LifecycleError::State);
+    }
+
+    if status == "suspended" {
+        sqlx::query(
+            "UPDATE tenants
+                SET status='deleted', suspended_at=NULL,
+                    deleted_at=clock_timestamp(), updated_at=clock_timestamp()
+              WHERE id=$1",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO audit_logs
+                (tenant_id, action, resource, resource_id, before, after, source)
+             VALUES ($1, 'tenant.delete', 'tenant', $1,
+                     '{\"status\":\"suspended\"}',
+                     '{\"status\":\"deleted\"}', 'system')",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+    }
+
+    let identities = sqlx::query(
+        "UPDATE identities
+            SET status='unauthorized', updated_at=clock_timestamp()
+          WHERE tenant_id=$1 AND status <> 'unauthorized'",
+    )
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    let identity_secrets = sqlx::query(
+        "DELETE FROM identity_secrets secrets USING identities identity
+          WHERE identity.id=secrets.identity_id AND identity.tenant_id=$1",
+    )
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    let credential_keys = sqlx::query("DELETE FROM credential_keys WHERE tenant_id=$1")
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+    let web_sessions = sqlx::query("DELETE FROM web_sessions WHERE tenant_id=$1")
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+    let bot_console_sessions = sqlx::query("DELETE FROM bot_console_sessions WHERE tenant_id=$1")
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+    let login_sessions = sqlx::query("DELETE FROM login_sessions WHERE tenant_id=$1")
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+    let remaining: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM identity_secrets secrets JOIN identities identity
+                        ON identity.id=secrets.identity_id WHERE identity.tenant_id=$1)
+             OR EXISTS(SELECT 1 FROM credential_keys WHERE tenant_id=$1)
+             OR EXISTS(SELECT 1 FROM web_sessions WHERE tenant_id=$1)
+             OR EXISTS(SELECT 1 FROM bot_console_sessions WHERE tenant_id=$1)
+             OR EXISTS(SELECT 1 FROM login_sessions WHERE tenant_id=$1)",
+    )
+    .bind(id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if remaining {
+        return Err(LifecycleError::CredentialsRemain);
+    }
+
+    sqlx::query(
+        "INSERT INTO system_logs(tenant_id, level, module, event, context)
+         VALUES ($1, 'INFO', 'tenant_lifecycle', 'delete.done', $2)",
+    )
+    .bind(id)
+    .bind(serde_json::json!({
+        "identities": identities,
+        "identity_secrets": identity_secrets,
+        "credential_keys": credential_keys,
+        "web_sessions": web_sessions,
+        "bot_console_sessions": bot_console_sessions,
+        "login_sessions": login_sessions,
+    }))
+    .execute(&mut *transaction)
+    .await?;
+
     transaction.commit().await?;
     Ok(tenant)
 }
