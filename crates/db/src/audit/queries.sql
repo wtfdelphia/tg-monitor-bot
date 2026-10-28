@@ -1352,5 +1352,60 @@ SELECT ('引用约束不符: ' || expected.tbl || '.' || expected.col)::text
      AND constraint_row.convalidated AND NOT constraint_row.condeferrable
  );
 
+-- name: C15 身份写入围栏必须完整且运行时写权限收敛
+WITH fence AS (
+  SELECT routine.* FROM pg_proc routine JOIN pg_namespace namespace ON namespace.oid = routine.pronamespace
+   WHERE namespace.nspname = 'public' AND routine.proname = 'identity_lifecycle_write_fence'
+), violations AS (
+  SELECT '身份围栏函数缺失、重载或定义漂移' AS reason
+   WHERE (SELECT count(*) FROM fence) <> 1 OR NOT EXISTS (
+     SELECT 1 FROM fence
+      WHERE pronargs = 0 AND prokind = 'f' AND prorettype = 'trigger'::regtype
+        AND prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
+        AND NOT prosecdef AND provolatile = 'v' AND proparallel = 'u'
+        AND NOT proisstrict AND NOT proleakproof AND proargdefaults IS NULL
+        AND proowner = (SELECT oid FROM pg_roles WHERE rolname = 'tgm_owner')
+        AND proconfig = ARRAY['search_path=pg_catalog, pg_temp']
+        AND encode(sha256(convert_to(prosrc, 'UTF8')), 'hex') = '089fbf3d985130cecdb9db1c934e5745a9da0b12f5ab7c2d3fcb5e523bee69b5'
+   )
+  UNION ALL
+  SELECT '身份围栏函数 EXECUTE 权限漂移'
+   WHERE NOT EXISTS (
+     SELECT 1 FROM fence, LATERAL aclexplode(coalesce(proacl, acldefault('f', proowner))) permission
+      WHERE permission.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'app_user')
+        AND permission.privilege_type = 'EXECUTE' AND NOT permission.is_grantable
+   ) OR EXISTS (
+     SELECT 1 FROM fence, LATERAL aclexplode(coalesce(proacl, acldefault('f', proowner))) permission
+      WHERE permission.grantee NOT IN (proowner, (SELECT oid FROM pg_roles WHERE rolname = 'app_user'))
+         OR permission.privilege_type <> 'EXECUTE'
+         OR (permission.grantee <> proowner AND permission.is_grantable)
+   )
+  UNION ALL
+  SELECT '身份围栏触发器缺失、禁用或事件定义漂移'
+   WHERE (SELECT count(*) FROM pg_trigger
+           WHERE tgrelid = 'public.identities'::regclass AND tgname = 'identity_lifecycle_write_fence'
+             AND NOT tgisinternal) <> 1 OR NOT EXISTS (
+     SELECT 1 FROM pg_trigger trigger_row JOIN fence ON fence.oid = trigger_row.tgfoid
+      WHERE trigger_row.tgrelid = 'public.identities'::regclass
+        AND trigger_row.tgname = 'identity_lifecycle_write_fence' AND NOT trigger_row.tgisinternal
+        AND trigger_row.tgenabled = 'O' AND trigger_row.tgtype = 23
+        AND trigger_row.tgnargs = 0 AND trigger_row.tgargs = ''::bytea
+        AND trigger_row.tgqual IS NULL AND trigger_row.tgconstraint = 0
+        AND cardinality(trigger_row.tgattr::smallint[]) = 1
+        AND trigger_row.tgattr[0] = (SELECT attnum FROM pg_attribute
+              WHERE attrelid = 'public.identities'::regclass AND attname = 'tenant_id')
+   )
+  UNION ALL
+  SELECT '未经批准的身份写入角色: ' || role.rolname
+    FROM pg_roles role
+   WHERE role.rolcanlogin AND NOT role.rolsuper
+     AND has_database_privilege(role.oid, current_database(), 'CONNECT')
+     AND NOT (role.rolname = 'tgm_test' AND role.oid =
+              (SELECT datdba FROM pg_database WHERE datname = current_database()))
+     AND ((has_any_column_privilege(role.oid, 'public.identities', 'INSERT') <> (role.rolname = 'app_user'))
+          OR has_column_privilege(role.oid, 'public.identities', 'tenant_id', 'UPDATE'))
+)
+SELECT reason::text FROM violations;
+
 -- C3（openapi.json 与代码一致）不在本文件里：它比对的是文件而不是数据库状态，
 -- 归 `tgm openapi --check` 这个独立子命令。见 eng/04 §三-5。

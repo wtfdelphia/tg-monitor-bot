@@ -40,6 +40,7 @@ declare -A BREAK=(
   [C12]="GRANT SELECT (file_name) ON media_archive TO media_cleanup;"
   [C13]="GRANT SELECT (context) ON system_logs TO platform_cleanup;"
   [C14]="GRANT SELECT (secret_ciphertext) ON identity_secrets TO tenant_lifecycle;"
+  [C15]="ALTER TABLE identities DISABLE TRIGGER identity_lifecycle_write_fence;"
   [A2a]="ALTER ROLE app_user BYPASSRLS;"
   [A2b]="ALTER TABLE keywords OWNER TO app_user;"
   # NOT VALID：不加的话新约束要校验现有行，而会话里没有 app.tenant_id，
@@ -98,6 +99,7 @@ declare -A UNDO=(
   [C12]="REVOKE SELECT (file_name) ON media_archive FROM media_cleanup;"
   [C13]="REVOKE SELECT (context) ON system_logs FROM platform_cleanup;"
   [C14]="REVOKE SELECT (secret_ciphertext) ON identity_secrets FROM tenant_lifecycle;"
+  [C15]="ALTER TABLE identities ENABLE TRIGGER identity_lifecycle_write_fence;"
   [A2a]="ALTER ROLE app_user NOBYPASSRLS;"
   # 改回 owner **不还原受赠权限**。实测：ALTER TABLE keywords OWNER TO app_user
   # 之后 relacl 里 app_user 那条受赠条目消失了（被并进 owner 条目），
@@ -139,9 +141,9 @@ declare -A AS_SUPER=([A2a]=1 [A2b]=1 [A8]=1 [C5]=1)
 # 预期的连带报红。这些不是断言的缺陷，是被破坏的那处配置真的同时违反了两条：
 #   A2b → A1  owner 隐含全部权限，含 TRUNCATE。所以「运行时角色成了 owner」
 #             必然同时触发 A1。两条断言从不同角度抓同一个事实，是冗余而非耦合
-declare -A ALSO=([A2b]="A1")
+declare -A ALSO=([A2b]="A1" [C2]="C15")
 
-ORDER=(MAIN A1 A2a A2b A3 A4 A5 A6 A7 A8 A9 C1 C4 C2 C6 C7 C5 C8 C9 C10 C11 C12 C13 C14)
+ORDER=(MAIN A1 A2a A2b A3 A4 A5 A6 A7 A8 A9 C1 C4 C2 C6 C7 C5 C8 C9 C10 C11 C12 C13 C14 C15)
 
 psql_do() {  # $1=sql  $2=1 表示以超级用户身份
   if [ "${2:-}" = "1" ]; then
@@ -241,6 +243,11 @@ WHERE nspname NOT LIKE 'pg\_%' AND nspname<>'information_schema';
 SELECT 'NSP|'||nspname||'|'||pg_get_userbyid(nspowner) FROM pg_namespace
 WHERE nspname NOT LIKE 'pg\_%' AND nspname<>'information_schema' ORDER BY 1;
 SELECT 'ETR|'||evtname||'|'||evtevent||'|'||evtenabled::text FROM pg_event_trigger ORDER BY 1;
+SELECT 'TRG|'||namespace.nspname||'.'||relation.relname||'|'||trigger_row.tgname||'|'||trigger_row.tgenabled::text
+       ||'|'||pg_get_triggerdef(trigger_row.oid)
+FROM pg_trigger trigger_row JOIN pg_class relation ON relation.oid=trigger_row.tgrelid
+JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+WHERE namespace.nspname='public' AND NOT trigger_row.tgisinternal ORDER BY 1;
 -- 物化视图要单独一段。它不在上面任何一段的视野里：TBL 的 relkind 只收 ('r','p')，
 -- IDX/POL/CON 三段都从基表出发。所以 C4 的破坏用例（CREATE MATERIALIZED VIEW）
 -- 撤销漏掉时，快照 diff 照样干净 —— 「撤销干净」这个结论会是空的。
@@ -273,7 +280,7 @@ SQL
   # 而「整段消失」正是要防的那个失效 —— 第一版 POL/CON/ETR 三段同时消失时，
   # 剩下的 ACL 段有 323 行，任何一个合理的总数下限都会放它过去
   local missing=""
-  for sec in TBL ACL COLACL SEQACL IDX POL CON ROL MBR FUN ETR MV NSP; do
+  for sec in TBL ACL COLACL SEQACL IDX POL CON ROL MBR FUN ETR TRG MV NSP; do
     grep -q "^$sec|" <<<"$out" || missing="$missing $sec"
   done
   if [ -n "$missing" ]; then
