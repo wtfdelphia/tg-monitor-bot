@@ -27,6 +27,10 @@ if ! command -v psql >/dev/null 2>&1; then
   [ -f "$HOME/opt/pgdg17/env.sh" ] && source "$HOME/opt/pgdg17/env.sh"
 fi
 command -v psql >/dev/null 2>&1 || { echo "✗ 找不到 psql"; exit 1; }
+DB_NAME="$(psql "$TGM_DB_URL_OWNER" -At -q -v ON_ERROR_STOP=1 -c 'SELECT current_database()')" || {
+  echo "✗ 无法读取审计数据库名"
+  exit 1
+}
 
 # 破坏用例。选择标准是「只碰一处」—— 碰得越少，第 2 条判据才越有意义。
 # 大部分落在 keywords 上：它是最普通的甲类表，没有任何破例，改它不会牵动别的断言。
@@ -41,6 +45,7 @@ declare -A BREAK=(
   [C13]="GRANT SELECT (context) ON system_logs TO platform_cleanup;"
   [C14]="GRANT SELECT (secret_ciphertext) ON identity_secrets TO tenant_lifecycle;"
   [C15]="ALTER TABLE identities DISABLE TRIGGER identity_lifecycle_write_fence;"
+  [C16]="GRANT UPDATE ON tenants TO tenant_purge_finalizer;"
   [A2a]="ALTER ROLE app_user BYPASSRLS;"
   [A2b]="ALTER TABLE keywords OWNER TO app_user;"
   # NOT VALID：不加的话新约束要校验现有行，而会话里没有 app.tenant_id，
@@ -86,7 +91,7 @@ declare -A BREAK=(
   # 这正是它能绕过 runtime_role 派生的原因。组带 BYPASSRLS，
   # 于是 probe_worker 实际上 RLS 全免，而 A2a 因为派生里没有它而保持绿。
   # 用 IN ROLE 一句建完，不额外发 GRANT：这两种写法在 pg_auth_members 里等价
-  [C5]="CREATE ROLE probe_g2 NOLOGIN BYPASSRLS; GRANT SELECT ON keywords TO probe_g2; CREATE ROLE probe_worker LOGIN PASSWORD 'wpw' IN ROLE probe_g2; GRANT CONNECT ON DATABASE tgm TO probe_worker;"
+  [C5]="CREATE ROLE probe_g2 NOLOGIN BYPASSRLS; GRANT SELECT ON keywords TO probe_g2; CREATE ROLE probe_worker LOGIN PASSWORD 'wpw' IN ROLE probe_g2; GRANT CONNECT ON DATABASE ${DB_NAME} TO probe_worker;"
 )
 
 declare -A UNDO=(
@@ -100,6 +105,7 @@ declare -A UNDO=(
   [C13]="REVOKE SELECT (context) ON system_logs FROM platform_cleanup;"
   [C14]="REVOKE SELECT (secret_ciphertext) ON identity_secrets FROM tenant_lifecycle;"
   [C15]="ALTER TABLE identities ENABLE TRIGGER identity_lifecycle_write_fence;"
+  [C16]="REVOKE UPDATE ON tenants FROM tenant_purge_finalizer;"
   [A2a]="ALTER ROLE app_user NOBYPASSRLS;"
   # 改回 owner **不还原受赠权限**。实测：ALTER TABLE keywords OWNER TO app_user
   # 之后 relacl 里 app_user 那条受赠条目消失了（被并进 owner 条目），
@@ -128,7 +134,7 @@ declare -A UNDO=(
   # DROP ROLE 要求该角色不再持有任何权限，所以先 REVOKE 表级授权 ——
   # 漏了就是 ERROR: role "probe_g2" cannot be dropped because some objects depend on it。
   # 成员关系随 DROP ROLE 自动消失，不用单独 REVOKE；MBR 段就是用来证实这一点的
-  [C5]="REVOKE CONNECT ON DATABASE tgm FROM probe_worker; DROP ROLE probe_worker; REVOKE SELECT ON keywords FROM probe_g2; DROP ROLE probe_g2;"
+  [C5]="REVOKE CONNECT ON DATABASE ${DB_NAME} FROM probe_worker; DROP ROLE probe_worker; REVOKE SELECT ON keywords FROM probe_g2; DROP ROLE probe_g2;"
 )
 
 # 需要超级用户而不是 tgm_owner 的三例：
@@ -141,9 +147,9 @@ declare -A AS_SUPER=([A2a]=1 [A2b]=1 [A8]=1 [C5]=1)
 # 预期的连带报红。这些不是断言的缺陷，是被破坏的那处配置真的同时违反了两条：
 #   A2b → A1  owner 隐含全部权限，含 TRUNCATE。所以「运行时角色成了 owner」
 #             必然同时触发 A1。两条断言从不同角度抓同一个事实，是冗余而非耦合
-declare -A ALSO=([A2b]="A1" [C2]="C15")
+declare -A ALSO=([A2b]="A1")
 
-ORDER=(MAIN A1 A2a A2b A3 A4 A5 A6 A7 A8 A9 C1 C4 C2 C6 C7 C5 C8 C9 C10 C11 C12 C13 C14 C15)
+ORDER=(MAIN A1 A2a A2b A3 A4 A5 A6 A7 A8 A9 C1 C4 C2 C6 C7 C5 C8 C9 C10 C11 C12 C13 C14 C15 C16)
 
 psql_do() {  # $1=sql  $2=1 表示以超级用户身份
   if [ "${2:-}" = "1" ]; then

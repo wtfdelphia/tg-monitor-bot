@@ -405,13 +405,15 @@ SELECT q::text FROM (
                 WHERE rw.ev_class = v.oid AND d.refclassid = 'pg_class'::regclass
                   AND d.refobjid IN (SELECT oid FROM tenant_tbl))
   UNION ALL
-  -- 函数不按表过滤：pg_depend 不记录函数体引用的表（实测 0 行），
-  -- 所以无法判断一个 SECURITY DEFINER 函数碰不碰带 tenant_id 的表。
-  -- 定案是「全面禁用」，按全库报出反而是正确形状
+  -- 函数不按表过滤：pg_depend 不记录函数体引用的表（实测 0 行）。
+  -- 唯一例外由 ADR-0040 明确批准，完整属性、owner、ACL 与正文由 C16 校验；
+  -- 其他 schema、重载和任何不同签名仍在这里报红。
   SELECT n.nspname || '.' || p.proname, 'security_definer_function' FROM pg_proc p
   JOIN pg_namespace n ON n.oid = p.pronamespace
-  WHERE n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
-    AND p.prosecdef
+    WHERE n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+      AND p.prosecdef
+      AND NOT (n.nspname = 'public' AND p.proname = 'tenant_purge_finalize'
+               AND p.proargtypes = '20'::oidvector)
 ) q;
 
 -- name: A9 双方都有 tenant_id NOT NULL 时外键必须含 tenant_id
@@ -639,7 +641,7 @@ SELECT q::text FROM (
 -- 这件事本身。派生的前提（权限都是直授的）从此由断言来维持，而不是靠假设。
 --
 -- 只检查能连接当前审计数据库的登录角色。tgm_test 是 SQLx 控制角色，
--- 故意被 REVOKE CONNECT ON DATABASE tgm 排除；它只为测试临时库使用
+-- 由 REVOKE CONNECT ON DATABASE tgm 排除；它只为测试临时库使用
 -- tgm_owner 的 SET ROLE 权限，不是生产库运行时角色。
 -- 豁免只有 postgres → tgm_owner 这一对，而不是豁免 postgres 整个角色。
 -- 它是 scripts/init/01-roles.sql:7 故意建的：tgm_owner 是 NOLOGIN，
@@ -1396,14 +1398,201 @@ WITH fence AS (
               WHERE attrelid = 'public.identities'::regclass AND attname = 'tenant_id')
    )
   UNION ALL
+  -- identities.tenant_id 的 UPDATE 归 C2 单独检查；这里不重复收敛，
+  -- 否则 C2 的针对性破坏会同时让 C15 报红，双遍无法定位断言归属。
   SELECT '未经批准的身份写入角色: ' || role.rolname
     FROM pg_roles role
    WHERE role.rolcanlogin AND NOT role.rolsuper
      AND has_database_privilege(role.oid, current_database(), 'CONNECT')
      AND NOT (role.rolname = 'tgm_test' AND role.oid =
               (SELECT datdba FROM pg_database WHERE datname = current_database()))
-     AND ((has_any_column_privilege(role.oid, 'public.identities', 'INSERT') <> (role.rolname = 'app_user'))
-          OR has_column_privilege(role.oid, 'public.identities', 'tenant_id', 'UPDATE'))
+     AND has_any_column_privilege(role.oid, 'public.identities', 'INSERT') <> (role.rolname = 'app_user')
+)
+SELECT reason::text FROM violations;
+
+-- name: C16 租户物理清理终结入口必须是唯一精确例外
+WITH purge AS (
+  SELECT p.*, n.nspname
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'public' AND p.proname = 'tenant_purge_finalize'
+),
+roles AS (
+  SELECT r.oid, r.rolname, r.rolcanlogin, r.rolsuper, r.rolbypassrls,
+         r.rolcreatedb, r.rolcreaterole, r.rolreplication
+    FROM pg_roles r
+   WHERE r.rolname IN ('tenant_purge', 'tenant_purge_finalizer')
+),
+expected_columns(tbl, col, privilege) AS (
+  VALUES
+    ('tenants','id','SELECT'), ('tenants','status','SELECT'), ('tenants','deleted_at','SELECT'),
+    ('identities','id','SELECT'), ('identities','tenant_id','SELECT'),
+    ('tenant_members','tenant_id','SELECT'), ('credential_keys','tenant_id','SELECT'),
+    ('source_subscriptions','tenant_id','SELECT'), ('source_subscriptions','receiver_identity_id','SELECT'),
+    ('target_channels','tenant_id','SELECT'), ('target_channels','sender_identity_id','SELECT'),
+    ('keywords','tenant_id','SELECT'), ('rules','tenant_id','SELECT'), ('rules','id','SELECT'),
+    ('rule_versions','tenant_id','SELECT'), ('rule_replacements','tenant_id','SELECT'),
+    ('tenant_events','tenant_id','SELECT'), ('tenant_events','canonical_event_id','SELECT'),
+    ('notify_dedup','tenant_id','SELECT'), ('delivery_tasks','tenant_id','SELECT'),
+    ('delivery_tasks','id','SELECT'), ('delivery_tasks','sender_identity_id','SELECT'),
+    ('delivery_logs','task_id','SELECT'), ('rule_conditions','rule_id','SELECT'),
+    ('identity_secrets','identity_id','SELECT'), ('account_leases','identity_id','SELECT'),
+    ('canonical_events','id','SELECT'), ('canonical_events','receiver_identity_id','SELECT'),
+    ('media_group_members','group_event_id','SELECT'), ('media_group_members','member_event_id','SELECT'),
+    ('media_relay_jobs','canonical_event_id','SELECT'), ('media_relay_jobs','receiver_identity_id','SELECT'),
+    ('media_relay_jobs','status','SELECT'),
+    ('audit_logs','tenant_id','SELECT'), ('system_logs','tenant_id','SELECT'),
+    ('login_sessions','tenant_id','SELECT'), ('bot_console_sessions','tenant_id','SELECT'),
+    ('bot_console_updates','tenant_id','SELECT'), ('bot_console_updates','bot_id','SELECT'),
+    ('web_sessions','tenant_id','SELECT'), ('tenant_consents','tenant_id','SELECT'),
+    ('tenant_notifications','tenant_id','SELECT'), ('tenant_notifications','identity_id','SELECT'),
+    ('system_logs','tenant_id','INSERT'), ('system_logs','level','INSERT'),
+    ('system_logs','module','INSERT'), ('system_logs','event','INSERT'), ('system_logs','context','INSERT')
+),
+violations AS (
+  SELECT 'tenant_purge 或 finalizer 角色缺失或属性不符' AS reason
+   WHERE (SELECT count(*) FROM roles) <> 2
+      OR EXISTS (
+        SELECT 1 FROM roles
+         WHERE rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication
+      )
+      OR NOT EXISTS (SELECT 1 FROM roles WHERE rolname='tenant_purge' AND rolcanlogin)
+      OR NOT EXISTS (SELECT 1 FROM roles WHERE rolname='tenant_purge_finalizer' AND NOT rolcanlogin)
+  UNION ALL
+  SELECT 'purge/finalizer 参与角色成员关系或拥有额外对象'
+   WHERE EXISTS (
+     SELECT 1 FROM pg_auth_members m
+      WHERE (m.member IN (SELECT oid FROM roles) OR m.roleid IN (SELECT oid FROM roles))
+        AND NOT (
+          m.member = (SELECT oid FROM pg_roles WHERE rolname='tgm_test')
+          AND NOT has_database_privilege(m.member, current_database(), 'CONNECT')
+        )
+   )
+      OR EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE c.relowner IN (SELECT oid FROM roles) AND n.nspname NOT LIKE 'pg\_%'
+      )
+      OR EXISTS (
+        SELECT 1 FROM pg_namespace n
+         WHERE n.nspowner IN (SELECT oid FROM roles) AND n.nspname NOT LIKE 'pg\_%'
+      )
+      OR EXISTS (
+        SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+         WHERE p.proowner IN (SELECT oid FROM roles)
+           AND NOT (n.nspname='public' AND p.proname='tenant_purge_finalize'
+                    AND p.proargtypes='20'::oidvector)
+      )
+  UNION ALL
+  SELECT '终结函数缺失、重载或属性漂移'
+   WHERE (SELECT count(*) FROM purge) <> 1 OR NOT EXISTS (
+     SELECT 1 FROM purge
+      WHERE pronargs = 1 AND proargtypes = '20'::oidvector
+        AND prokind = 'f' AND prorettype = 'text'::regtype
+        AND prolang = (SELECT oid FROM pg_language WHERE lanname='plpgsql')
+        AND prosecdef AND provolatile='v' AND proparallel='u'
+        AND NOT proisstrict AND NOT proleakproof AND proargdefaults IS NULL
+        AND proowner = (SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer')
+        AND proconfig = ARRAY['search_path=pg_catalog, pg_temp']
+        AND encode(sha256(convert_to(prosrc, 'UTF8')), 'hex') = '893c9a7c9a89d32444ca01ffcc3dd1080e5c06fffc0c2a845c3b8e01af339d6a'
+   )
+  UNION ALL
+  SELECT '终结函数 EXECUTE ACL 漂移'
+   WHERE NOT EXISTS (
+     SELECT 1 FROM purge, LATERAL aclexplode(coalesce(proacl, acldefault('f', proowner))) a
+      WHERE a.grantee = (SELECT oid FROM pg_roles WHERE rolname='tenant_purge')
+        AND a.privilege_type='EXECUTE' AND NOT a.is_grantable
+   ) OR EXISTS (
+     SELECT 1 FROM purge, LATERAL aclexplode(coalesce(proacl, acldefault('f', proowner))) a
+      WHERE NOT (a.grantee IN (
+        (SELECT oid FROM pg_roles WHERE rolname='tenant_purge'),
+        (SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer')
+      ) AND a.privilege_type='EXECUTE' AND NOT a.is_grantable)
+   )
+  UNION ALL
+  SELECT 'tenant_purge 不得持有表、列、序列或 schema CREATE 权限'
+   WHERE has_schema_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge'), 'public', 'CREATE')
+      OR EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+         CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('DELETE'),('TRUNCATE'),('REFERENCES'),('TRIGGER')) p(privilege)
+        WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f')
+          AND has_table_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge'), c.oid, p.privilege)
+      )
+  UNION ALL
+  SELECT 'finalizer 不得在用户 schema 建对象'
+   WHERE EXISTS (
+     SELECT 1 FROM pg_namespace n
+      WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+        AND has_schema_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer'), n.oid, 'CREATE')
+   )
+      OR EXISTS (
+        SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+         CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('REFERENCES')) p(privilege)
+        WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f') AND a.attnum>0 AND NOT a.attisdropped
+          AND has_column_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge'), c.oid, a.attnum, p.privilege)
+      )
+      OR EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+         CROSS JOIN (VALUES ('USAGE'),('SELECT'),('UPDATE')) p(privilege)
+        WHERE n.nspname='public' AND c.relkind='S'
+          AND has_sequence_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge'), c.oid, p.privilege)
+      )
+  UNION ALL
+  SELECT 'finalizer 根表或日志权限不符'
+   WHERE has_table_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer'), 'public.tenants', 'TRUNCATE')
+      OR has_table_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer'), 'public.tenants', 'UPDATE')
+      OR has_table_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer'), 'public.tenants', 'INSERT')
+      OR NOT has_table_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer'), 'public.tenants', 'DELETE')
+      OR NOT has_sequence_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer'), 'public.system_logs_id_seq', 'USAGE')
+  UNION ALL
+  SELECT 'finalizer 缺少必要列权限: ' || e.tbl || '.' || e.col || ':' || e.privilege
+    FROM expected_columns e
+   WHERE NOT has_column_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer'),
+                                  format('public.%s', e.tbl), e.col, e.privilege)
+  UNION ALL
+  SELECT 'finalizer 存在未批准的列权限: ' || n.nspname || '.' || c.relname || '.' || a.attname || ':' || p.privilege
+    FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+    CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('REFERENCES')) p(privilege)
+   WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f') AND a.attnum>0 AND NOT a.attisdropped
+     AND has_column_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer'), c.oid, a.attnum, p.privilege)
+     AND NOT EXISTS (SELECT 1 FROM expected_columns e WHERE e.tbl=c.relname AND e.col=a.attname AND e.privilege=p.privilege)
+  UNION ALL
+  SELECT 'finalizer 存在未批准的表/序列权限'
+   WHERE EXISTS (
+     SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+      CROSS JOIN LATERAL aclexplode(c.relacl) a
+     WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f')
+       AND a.grantee=(SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer')
+       AND NOT (c.relname='tenants' AND a.privilege_type='DELETE' AND NOT a.is_grantable)
+   )
+      OR EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+         CROSS JOIN LATERAL aclexplode(c.relacl) a
+        WHERE n.nspname='public' AND c.relkind='S'
+          AND a.grantee=(SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer')
+          AND NOT (c.relname='system_logs_id_seq' AND a.privilege_type='USAGE' AND NOT a.is_grantable)
+      )
+  UNION ALL
+  SELECT 'finalizer 缺少固定 RLS 读取策略或存在恒真策略'
+   WHERE (SELECT count(*) FROM pg_policy p
+           WHERE p.polcmd = 'r'
+             AND (SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer') = ANY(p.polroles)) <> 20
+      OR EXISTS (
+        SELECT 1 FROM pg_policy p
+         WHERE (SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer') = ANY(p.polroles)
+           AND p.polcmd = 'r'
+           AND (pg_get_expr(p.polqual,p.polrelid) IS NULL
+                OR pg_get_expr(p.polqual,p.polrelid) IN ('true', '(true)'))
+      )
+  UNION ALL
+  SELECT 'finalizer 日志策略漂移'
+   WHERE NOT EXISTS (
+     SELECT 1 FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid
+      WHERE c.oid='public.system_logs'::regclass AND p.polname='tenant_purge_finalizer_log'
+        AND p.polcmd='a' AND p.polroles=ARRAY[(SELECT oid FROM pg_roles WHERE rolname='tenant_purge_finalizer')]::oid[]
+        AND pg_get_expr(p.polwithcheck,p.polrelid) LIKE '%tenant_purge%'
+        AND pg_get_expr(p.polwithcheck,p.polrelid) LIKE '%tenant_root%'
+        AND pg_get_expr(p.polwithcheck,p.polrelid) LIKE '%rows%'
+   )
 )
 SELECT reason::text FROM violations;
 
