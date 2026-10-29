@@ -10,9 +10,15 @@ CREATE ROLE shared_cleanup LOGIN PASSWORD 'scpw' NOSUPERUSER NOBYPASSRLS NOCREAT
 CREATE ROLE media_cleanup LOGIN PASSWORD 'mcpw' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
 CREATE ROLE platform_cleanup LOGIN PASSWORD 'pcpw' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
 CREATE ROLE tenant_lifecycle LOGIN PASSWORD 'tlpw' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+CREATE ROLE tenant_purge LOGIN PASSWORD 'pupw' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+CREATE ROLE tenant_purge_finalizer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
 CREATE ROLE tgm_test    LOGIN PASSWORD 'tpw' NOSUPERUSER CREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
 GRANT tgm_owner TO postgres;
 GRANT tgm_owner TO tgm_test WITH SET TRUE, INHERIT FALSE;
+GRANT tenant_purge_finalizer TO tgm_owner WITH ADMIN OPTION;
+-- 供 SQLx 临时库迁移由 tgm_test 转授 finalizer；生产库通过 REVOKE CONNECT
+-- 隔离 tgm_test，C16 也将其排除在生产登录路径之外。
+GRANT tenant_purge_finalizer TO tgm_test WITH ADMIN OPTION;
 
 -- 坑 1：PG 15+ 起 public schema 默认不对非 owner 开放。
 -- 漏这一行，迁移第一条 CREATE TABLE 就 "permission denied for schema public"
@@ -22,7 +28,7 @@ GRANT USAGE ON SCHEMA public TO app_user, auth_lookup, platform_ops, media_clean
 
 -- 测试角色只用于 SQLx 控制库、临时库和 schema 库，不得连接生产库。
 REVOKE CONNECT ON DATABASE tgm FROM PUBLIC;
-GRANT CONNECT ON DATABASE tgm TO postgres, app_user, auth_lookup, platform_ops, media_cleanup;
+GRANT CONNECT ON DATABASE tgm TO postgres, app_user, auth_lookup, platform_ops, media_cleanup, tenant_purge;
 
 -- SQLx 的控制连接不能落到生产库；schema 库单独供 cargo sqlx prepare 使用。
 \connect postgres
