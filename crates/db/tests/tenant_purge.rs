@@ -60,6 +60,54 @@ async fn finalize(pool: &PgPool, tenant: i64) -> Result<String, sqlx::Error> {
         .await
 }
 
+async fn candidates(pool: &PgPool, limit: i64) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar("SELECT public.tenant_purge_candidates($1)")
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn candidate_enumeration_returns_only_due_deleted_tenants_in_order(
+    injected: PgPool,
+) -> TestResult {
+    let (_app, admin) = support::pools(injected).await;
+    let purge = purge_pool(&admin).await?;
+    support::assert_role(&purge, "tenant_purge").await;
+    support::assert_not_bypassrls(&purge).await;
+
+    let first = deleted_tenant(admin.raw(), "31 days").await?;
+    let second = deleted_tenant(admin.raw(), "45 days").await?;
+    let recent = deleted_tenant(admin.raw(), "29 days").await?;
+    let active = due_tenant(admin.raw(), "active").await?;
+    let suspended = due_tenant(admin.raw(), "suspended").await?;
+    let deleted_without_timestamp: i64 = sqlx::query_scalar(
+        "INSERT INTO tenants(name,owner_user_id,status) VALUES('purge-null',99011,'deleted') RETURNING id",
+    )
+    .fetch_one(admin.raw())
+    .await?;
+
+    let mut expected = vec![first, second];
+    expected.sort_unstable();
+    assert_eq!(candidates(&purge, 5000).await?, expected);
+    assert_eq!(candidates(&purge, 1).await?, vec![expected[0]]);
+    assert!(!expected.contains(&recent));
+    assert!(!expected.contains(&active));
+    assert!(!expected.contains(&suspended));
+    assert!(!expected.contains(&deleted_without_timestamp));
+    assert!(
+        sqlx::query("SELECT id FROM tenants")
+            .fetch_optional(&purge)
+            .await
+            .is_err()
+    );
+
+    for invalid_limit in [0, 5001] {
+        assert!(candidates(&purge, invalid_limit).await.is_err());
+    }
+    Ok(())
+}
+
 #[sqlx::test(migrations = "../../migrations-test")]
 async fn finalizer_deletes_due_empty_tenant_and_writes_platform_log(
     injected: PgPool,

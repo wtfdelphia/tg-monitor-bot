@@ -418,6 +418,9 @@ SELECT q::text FROM (
         OR
         (n.nspname = 'public' AND p.proname = 'tenant_purge_batch'
          AND p.proargtypes = '20 25'::oidvector)
+        OR
+        (n.nspname = 'public' AND p.proname = 'tenant_purge_candidates'
+         AND p.proargtypes = '20'::oidvector)
       )
 ) q;
 
@@ -1608,6 +1611,12 @@ WITH batch AS (
     JOIN pg_namespace n ON n.oid = p.pronamespace
    WHERE n.nspname = 'public' AND p.proname = 'tenant_purge_batch'
 ),
+candidates AS (
+  SELECT p.*, n.nspname
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'public' AND p.proname = 'tenant_purge_candidates'
+),
 roles AS (
   SELECT r.oid, r.rolname, r.rolcanlogin, r.rolsuper, r.rolbypassrls,
          r.rolcreatedb, r.rolcreaterole, r.rolreplication
@@ -1697,6 +1706,30 @@ violations AS (
         AND NOT proisstrict AND NOT proleakproof AND proargdefaults IS NULL
         AND proowner = (SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher')
         AND proconfig = ARRAY['search_path=pg_catalog, pg_temp']
+   )
+  UNION ALL
+  SELECT '候选枚举函数缺失、重载或属性漂移'
+   WHERE (SELECT count(*) FROM candidates) <> 1 OR NOT EXISTS (
+     SELECT 1 FROM candidates
+      WHERE pronargs = 1 AND proargtypes = '20'::oidvector
+        AND prokind = 'f' AND proretset AND prorettype = 'int8'::regtype
+        AND prolang = (SELECT oid FROM pg_language WHERE lanname='plpgsql')
+        AND prosecdef AND provolatile='v' AND proparallel='u'
+        AND NOT proisstrict AND NOT proleakproof AND proargdefaults IS NULL
+        AND proowner = (SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher')
+        AND proconfig = ARRAY['search_path=pg_catalog, pg_temp']
+        AND encode(sha256(convert_to(prosrc, 'UTF8')), 'hex') = '204493e9184713ef8ab6d86b5853c7c8bd134eed88abf2688ffb024e35c14de4'
+   )
+  UNION ALL
+  SELECT '候选枚举函数 EXECUTE ACL 漂移'
+   WHERE NOT EXISTS (
+     SELECT 1 FROM candidates, LATERAL aclexplode(coalesce(proacl, acldefault('f', proowner))) permission
+      WHERE permission.grantee = (SELECT oid FROM pg_roles WHERE rolname='tenant_purge')
+        AND permission.privilege_type='EXECUTE' AND NOT permission.is_grantable
+   ) OR EXISTS (
+     SELECT 1 FROM candidates, LATERAL aclexplode(coalesce(proacl, acldefault('f', proowner))) permission
+      WHERE permission.grantee NOT IN (proowner, (SELECT oid FROM pg_roles WHERE rolname='tenant_purge'))
+         OR permission.privilege_type <> 'EXECUTE' OR permission.is_grantable
    )
   UNION ALL
   SELECT '批处理函数 EXECUTE ACL 漂移'
