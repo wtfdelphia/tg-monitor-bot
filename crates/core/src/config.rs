@@ -446,6 +446,14 @@ pub fn check_tenant_lifecycle(
     )
 }
 
+pub fn check_tenant_purge(
+    raw_profile: Option<&str>,
+    present: &[&str],
+    rust_log: Option<&str>,
+) -> Vec<ConfigProblem> {
+    check_cleanup(raw_profile, present, rust_log, "TGM_DB_URL_TENANT_PURGE")
+}
+
 fn check_cleanup(
     raw_profile: Option<&str>,
     present: &[&str],
@@ -518,6 +526,7 @@ fn known_names() -> &'static [&'static str] {
         "TGM_DB_URL_MEDIA_CLEANUP",
         "TGM_DB_URL_PLATFORM_CLEANUP",
         "TGM_DB_URL_TENANT_LIFECYCLE",
+        "TGM_DB_URL_TENANT_PURGE",
         "TGM_DB_URL_EXECUTION",
         "TGM_REDIS_URL",
         "TGM_S3_ENDPOINT",
@@ -607,8 +616,8 @@ mod tests {
     }
     use super::{
         COMMON, ConfigProblem, Role, check, check_auth_cleanup, check_kek_backend,
-        check_platform_cleanup, check_shared_cleanup, check_tenant_cleanup, extra_required,
-        known_names, validate_oidc_alg,
+        check_platform_cleanup, check_shared_cleanup, check_tenant_cleanup, check_tenant_purge,
+        extra_required, known_names, validate_oidc_alg,
     };
     use crate::oidc::OidcSigningAlgorithm;
 
@@ -689,6 +698,47 @@ mod tests {
             check(Role::Rule, Some("production"), &present, None)
                 .contains(&ConfigProblem::Unexpected("TGM_DB_URL_TENANT_CLEANUP"))
         );
+    }
+
+    #[test]
+    fn tenant_purge_configuration_is_an_independent_credential_boundary() {
+        let present = ["TGM_PROFILE", "TGM_DB_URL_TENANT_PURGE"];
+        assert!(check_tenant_purge(Some("production"), &present, None).is_empty());
+        for forbidden in known_names().iter().copied().chain(["DATABASE_URL"]) {
+            if ["TGM_PROFILE", "TGM_DB_URL_TENANT_PURGE", "RUST_LOG"].contains(&forbidden) {
+                continue;
+            }
+            let mut mixed = present.to_vec();
+            mixed.push(forbidden);
+            assert!(
+                check_tenant_purge(Some("production"), &mixed, None)
+                    .contains(&ConfigProblem::Unexpected(forbidden)),
+                "不应把 {forbidden} 带入物理清理环境"
+            );
+        }
+        assert!(
+            check_tenant_purge(Some("production"), &[], None)
+                .contains(&ConfigProblem::Missing("TGM_DB_URL_TENANT_PURGE"))
+        );
+        assert!(check_tenant_purge(None, &[], None).contains(&ConfigProblem::ProfileMissing));
+        assert!(
+            check_tenant_purge(Some("production"), &present, Some("debug"))
+                .iter()
+                .any(|problem| matches!(problem, ConfigProblem::SqlxLogNotSilenced(_)))
+        );
+        for role in [
+            Role::ControlPlane,
+            Role::BotGateway,
+            Role::MtprotoWorker,
+            Role::Fanout,
+            Role::Rule,
+            Role::Delivery,
+        ] {
+            assert!(
+                check(role, Some("production"), &present, None)
+                    .contains(&ConfigProblem::Unexpected("TGM_DB_URL_TENANT_PURGE"))
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,10 @@
+[Unit]
+Description=TGM deleted tenant physical purge daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=tgm-tenant-purge.service
+
+[Install]
+WantedBy=timers.target

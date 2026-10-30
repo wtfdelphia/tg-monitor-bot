@@ -7,6 +7,9 @@
 调用层和部署工件，不申请改变已合入迁移、不申请真实生产租户删除，也不据此宣布 WP-8
 通过。
 
+本片在隔离分支 `codex/WP-8-tenant-purge-runtime` 上实现。提交前仍须完成专项数据库测试、静态门禁、
+systemd 单元解析和完整本地门禁；在这些结果形成证据前，不将本片标记为通过。
+
 基线与判据：`docs/plan/proposals/WP-8-tenant-purge-batches.md` §三至§六；
 `docs/plan/evidence/WP-8-租户物理清理终结入口-2026-10-29.md`；
 `docs/design/plan/00-里程碑与工期.md` §4.3 WP-8；
@@ -121,11 +124,11 @@ CLI 不在一个长事务中包住多个批次；每次数据库函数调用保�
 重新升级并停止，不在本任务中自行扩大范围。生产备份副本留存与恢复后防止已删除数据重新
 可用的流程仍须单独定案，不能把本命令的成功写成全副本删除完成。
 
-本提案批准后，在独立 worktree 实现；本地门禁和专项验收通过后，再申请按一个提交提交、
-推送并开向 `dev` 的 PR。PR CI 和合入仍分别等待维护人裁决。
+本提案已在独立 worktree 实现；专项验收和完整本地门禁均已通过。本提交用于推送并开向
+`dev` 的 PR，PR CI 和合入仍分别等待维护人裁决。
 
 [report]
 task: WP-8-tenant-purge-runtime
-path: escalated
-gates: not-run
-escalation: docs/plan/proposals/WP-8-tenant-purge-runtime.md
+path: ok
+gates: pass
+escalation: -

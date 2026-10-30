@@ -467,6 +467,101 @@ async fn batch_event_shared_reference_and_media_blockers_are_repeatable(
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]
+async fn batcher_has_only_approved_reference_select_columns(injected: PgPool) -> TestResult {
+    let (_app, admin) = support::pools(injected).await;
+    let purge = purge_pool(&admin).await?;
+    support::assert_role(&purge, "tenant_purge").await;
+
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname
+           FROM pg_attribute a
+          WHERE a.attrelid = 'public.tenant_events'::regclass
+            AND a.attnum > 0
+            AND NOT a.attisdropped
+            AND has_column_privilege(
+              'tenant_purge_batcher',
+              'public.tenant_events'::regclass,
+              a.attname,
+              'SELECT'
+            )
+          ORDER BY a.attnum",
+    )
+    .fetch_all(&purge)
+    .await?;
+
+    assert_eq!(
+        columns,
+        vec![
+            "id".to_owned(),
+            "tenant_id".to_owned(),
+            "canonical_event_id".to_owned(),
+            "source_ref".to_owned(),
+        ]
+    );
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT has_column_privilege(
+           'tenant_purge_batcher',
+           'public.tenant_events'::regclass,
+           'matched_keywords',
+           'SELECT'
+         )"
+        )
+        .fetch_one(&purge)
+        .await?
+    );
+    let rule_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname
+           FROM pg_attribute a
+          WHERE a.attrelid = 'public.rules'::regclass
+            AND a.attnum > 0
+            AND NOT a.attisdropped
+            AND has_column_privilege(
+              'tenant_purge_batcher',
+              'public.rules'::regclass,
+              a.attname,
+              'SELECT'
+            )
+          ORDER BY a.attnum",
+    )
+    .fetch_all(&purge)
+    .await?;
+    assert_eq!(
+        rule_columns,
+        vec![
+            "id".to_owned(),
+            "tenant_id".to_owned(),
+            "target_ref".to_owned()
+        ]
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT has_column_privilege(
+           'tenant_purge_batcher',
+           'public.rules'::regclass,
+           'target_ref',
+           'SELECT'
+         )"
+        )
+        .fetch_one(&purge)
+        .await?
+    );
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT has_column_privilege(
+           'tenant_purge_batcher',
+           'public.rules'::regclass,
+           'source_ref',
+           'SELECT'
+         )"
+        )
+        .fetch_one(&purge)
+        .await?
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn batch_lock_and_log_failure_roll_back(injected: PgPool) -> TestResult {
     let (_app, admin) = support::pools(injected).await;
     let purge = purge_pool(&admin).await?;
