@@ -5,7 +5,9 @@
 //! 尚未接入的角色会明确失败，不伪装成成功启动。
 
 use clap::{Parser, Subcommand, ValueEnum};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use tgm_core::config::Role as CoreRole;
 use tokio::sync::watch;
@@ -43,6 +45,12 @@ enum Command {
     TenantLifecycle {
         #[command(subcommand)]
         action: LifecycleAction,
+    },
+    PurgeDeletedTenants {
+        #[arg(long)]
+        tenant_id: Option<i64>,
+        #[arg(long, default_value_t = 100)]
+        max_tenants: i64,
     },
     /// 导出 OpenAPI 契约；`--check` 则与仓库内的 openapi.json 比对
     Openapi {
@@ -633,6 +641,77 @@ fn present_env_names() -> Vec<String> {
         .collect()
 }
 
+fn tenant_purge_pool_options(url: &str) -> anyhow::Result<PgConnectOptions> {
+    let parsed = PgConnectOptions::from_str(url)
+        .map_err(|_| anyhow::anyhow!("租户物理清理数据库连接配置无效"))?
+        .application_name("tgm-tenant-purge");
+    let port = url
+        .split('?')
+        .next()
+        .and_then(|base| base.rsplit_once(':'))
+        .and_then(|(_, port)| port.rsplit_once('/').map(|(port, _)| port))
+        .and_then(|port| port.parse::<u16>().ok());
+    if port == Some(56432) || port == Some(56433) {
+        anyhow::bail!("租户物理清理不得经过 PgBouncer");
+    }
+    Ok(parsed)
+}
+
+fn tenant_purge_command(tenant_id: Option<i64>, max_tenants: i64) -> anyhow::Result<()> {
+    let present = present_env_names();
+    let names: Vec<&str> = present.iter().map(String::as_str).collect();
+    let profile = std::env::var("TGM_PROFILE").ok();
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let problems =
+        tgm_core::config::check_tenant_purge(profile.as_deref(), &names, rust_log.as_deref());
+    if !problems.is_empty() {
+        for problem in problems {
+            eprintln!("tgm: 配置错误：{problem}");
+        }
+        anyhow::bail!("租户物理清理配置错误，拒绝执行");
+    }
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let url = std::env::var("TGM_DB_URL_TENANT_PURGE")
+            .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_TENANT_PURGE"))?;
+        let options = tenant_purge_pool_options(&url)?;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .map_err(|_| anyhow::anyhow!("租户物理清理数据库连接失败"))?;
+        let result = tgm_app::tenant_purge::run(
+            &pool,
+            tenant_id,
+            max_tenants,
+            tgm_app::shutdown_signal(),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        pool.close().await;
+        println!(
+            "tgm: 租户物理清理结束：candidates={} completed={} failed={} batches={} rows_deleted={} blocked={} stopped={}",
+            result.candidates,
+            result.completed,
+            result.failed,
+            result.batches,
+            result.rows_deleted,
+            result.blocked,
+            result.stopped
+        );
+        for failure in &result.failures {
+            eprintln!(
+                "tgm: 租户 {} 类别 {} 未完成：result={} blocked={}",
+                failure.tenant_id, failure.category, failure.result, failure.blocked
+            );
+        }
+        if !result.successful() {
+            anyhow::bail!("租户物理清理未完整执行，需重跑");
+        }
+        Ok(())
+    })
+}
+
 /// eng/01 §四 的启动期校验。全部六项按文档顺序，**但缺失项收齐再一次报**。
 ///
 /// 顺序不是随意的：不连库的两条（§4.1/§4.5）先跑，因为连库那两条要用
@@ -807,6 +886,13 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         });
+    }
+    if let Command::PurgeDeletedTenants {
+        tenant_id,
+        max_tenants,
+    } = cmd
+    {
+        return tenant_purge_command(tenant_id, max_tenants);
     }
     if let Command::CleanupAuth { category } = cmd {
         let present = present_env_names();
@@ -1032,6 +1118,7 @@ fn main() -> anyhow::Result<()> {
         Command::CleanupShared => unreachable!("已在上面处理"),
         Command::CleanupPlatform => unreachable!("已在上面处理"),
         Command::TenantLifecycle { .. } => unreachable!("已在上面处理"),
+        Command::PurgeDeletedTenants { .. } => unreachable!("已在上面处理"),
         Command::Openapi { check } => {
             openapi(check)?;
         }

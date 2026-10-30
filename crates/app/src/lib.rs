@@ -26,6 +26,7 @@ pub mod rule;
 pub mod shared_retention;
 pub mod target_probe;
 pub mod tenant_notify;
+pub mod tenant_purge;
 pub mod tenant_retention;
 
 /// 退出信号：`SIGTERM`（`docker stop` / systemd）或 Ctrl-C，先到先完成。
