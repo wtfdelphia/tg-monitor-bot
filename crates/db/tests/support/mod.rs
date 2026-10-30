@@ -16,6 +16,13 @@
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
+fn direct_port() -> u16 {
+    std::env::var("TGM_TEST_PG_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(55432)
+}
+
 /// `sqlx::test` 注入的测试管理池。
 ///
 /// 包成 newtype 且**不实现 `Deref`**（eng/03 §2.1）：两个池的类型本来一样，
@@ -45,7 +52,7 @@ pub async fn pools(injected: PgPool) -> (PgPool, AdminOnlyPool) {
 /// 端口 55432 是直连 PG；经 PgBouncer 的 56432 由 [`app_pool_via_bouncer`] 用。
 async fn app_pool(admin: &PgPool) -> PgPool {
     let db = current_database(admin).await;
-    connect_as("app_user", "apw", 55432, &db).await
+    connect_as("app_user", "apw", direct_port(), &db).await
 }
 
 /// 以 `auth_lookup` 连到 `sqlx::test` 刚建出来的那个库。
@@ -61,7 +68,10 @@ pub async fn auth_pool(admin: &AdminOnlyPool) -> PgPool {
     let db = current_database(admin.raw()).await;
     PgPoolOptions::new()
         .max_connections(3)
-        .connect(&format!("postgres://auth_lookup:lpw@127.0.0.1:55432/{db}"))
+        .connect(&format!(
+            "postgres://auth_lookup:lpw@127.0.0.1:{}/{db}",
+            direct_port()
+        ))
         .await
         .unwrap_or_else(|e| panic!("以 auth_lookup 连 {db} 失败：{e}"))
 }

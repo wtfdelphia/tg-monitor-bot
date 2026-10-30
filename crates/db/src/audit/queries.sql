@@ -412,8 +412,13 @@ SELECT q::text FROM (
   JOIN pg_namespace n ON n.oid = p.pronamespace
     WHERE n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
       AND p.prosecdef
-      AND NOT (n.nspname = 'public' AND p.proname = 'tenant_purge_finalize'
-               AND p.proargtypes = '20'::oidvector)
+      AND NOT (
+        (n.nspname = 'public' AND p.proname = 'tenant_purge_finalize'
+         AND p.proargtypes = '20'::oidvector)
+        OR
+        (n.nspname = 'public' AND p.proname = 'tenant_purge_batch'
+         AND p.proargtypes = '20 25'::oidvector)
+      )
 ) q;
 
 -- name: A9 双方都有 tenant_id NOT NULL 时外键必须含 tenant_id
@@ -1593,6 +1598,185 @@ violations AS (
         AND pg_get_expr(p.polwithcheck,p.polrelid) LIKE '%tenant_root%'
         AND pg_get_expr(p.polwithcheck,p.polrelid) LIKE '%rows%'
    )
+)
+SELECT reason::text FROM violations;
+
+-- name: C17 租户物理清理批处理入口必须是唯一精确权限集合
+WITH batch AS (
+  SELECT p.*, n.nspname
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'public' AND p.proname = 'tenant_purge_batch'
+),
+roles AS (
+  SELECT r.oid, r.rolname, r.rolcanlogin, r.rolsuper, r.rolbypassrls,
+         r.rolcreatedb, r.rolcreaterole, r.rolreplication
+    FROM pg_roles r
+   WHERE r.rolname IN ('tenant_purge', 'tenant_purge_batcher')
+),
+expected_select(tbl, col) AS (
+  VALUES
+    ('tenants','id'), ('tenants','status'), ('tenants','deleted_at'),
+    ('identities','id'), ('identities','tenant_id'),
+    ('tenant_members','tenant_id'), ('tenant_members','user_id'),
+    ('credential_keys','tenant_id'),
+    ('source_subscriptions','tenant_id'), ('source_subscriptions','id'),
+    ('source_subscriptions','receiver_identity_id'),
+    ('target_channels','tenant_id'), ('target_channels','id'),
+    ('target_channels','sender_identity_id'),
+    ('keywords','tenant_id'), ('keywords','id'),
+    ('rules','tenant_id'), ('rules','id'),
+    ('rule_versions','tenant_id'), ('rule_versions','rule_id'), ('rule_versions','version'),
+    ('rule_conditions','rule_id'), ('rule_conditions','id'),
+    ('rule_replacements','tenant_id'), ('rule_replacements','rule_id'), ('rule_replacements','seq'),
+    ('identity_secrets','identity_id'), ('account_leases','identity_id'),
+    ('notify_dedup','tenant_id'), ('notify_dedup','fingerprint'), ('notify_dedup','target_ref'),
+    ('delivery_tasks','tenant_id'), ('delivery_tasks','id'), ('delivery_tasks','sender_identity_id'),
+    ('delivery_tasks','tenant_event_id'), ('delivery_tasks','status'), ('delivery_tasks','updated_at'),
+    ('delivery_logs','task_id'), ('delivery_logs','id'),
+    ('tenant_events','tenant_id'), ('tenant_events','id'), ('tenant_events','canonical_event_id'),
+    ('canonical_events','id'), ('canonical_events','receiver_identity_id'),
+    ('media_group_members','group_event_id'), ('media_group_members','member_event_id'),
+    ('media_relay_jobs','canonical_event_id'), ('media_relay_jobs','receiver_identity_id'),
+    ('media_relay_jobs','status'),
+    ('login_sessions','tenant_id'), ('login_sessions','id'),
+    ('bot_console_sessions','tenant_id'), ('bot_console_sessions','tg_user_id'),
+    ('bot_console_updates','tenant_id'), ('bot_console_updates','bot_id'), ('bot_console_updates','update_id'),
+    ('web_sessions','tenant_id'), ('web_sessions','id'),
+    ('tenant_consents','tenant_id'), ('tenant_consents','id'),
+    ('tenant_notifications','tenant_id'), ('tenant_notifications','id'), ('tenant_notifications','identity_id'),
+    ('audit_logs','tenant_id'), ('audit_logs','id'),
+    ('system_logs','tenant_id'), ('system_logs','id')
+),
+expected_insert(tbl, col) AS (
+  VALUES
+    ('system_logs','tenant_id'), ('system_logs','level'), ('system_logs','module'),
+    ('system_logs','event'), ('system_logs','context')
+),
+expected_delete(tbl) AS (
+  VALUES
+    ('tenant_members'), ('credential_keys'), ('source_subscriptions'), ('target_channels'),
+    ('keywords'), ('rules'), ('rule_versions'), ('rule_replacements'), ('rule_conditions'),
+    ('tenant_events'), ('notify_dedup'), ('delivery_tasks'), ('delivery_logs'),
+    ('login_sessions'), ('bot_console_sessions'), ('bot_console_updates'), ('web_sessions'),
+    ('tenant_consents'), ('tenant_notifications'), ('audit_logs'), ('system_logs'),
+    ('identity_secrets'), ('account_leases'), ('canonical_events')
+),
+violations AS (
+  SELECT 'tenant_purge 或 batcher 角色缺失或属性不符' AS reason
+   WHERE (SELECT count(*) FROM roles) <> 2
+      OR EXISTS (SELECT 1 FROM roles WHERE rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication)
+      OR NOT EXISTS (SELECT 1 FROM roles WHERE rolname='tenant_purge' AND rolcanlogin)
+      OR NOT EXISTS (SELECT 1 FROM roles WHERE rolname='tenant_purge_batcher' AND NOT rolcanlogin)
+  UNION ALL
+  SELECT 'batcher 参与角色成员关系或拥有对象'
+   WHERE EXISTS (
+     SELECT 1 FROM pg_auth_members m
+      WHERE (m.member IN (SELECT oid FROM roles) OR m.roleid IN (SELECT oid FROM roles))
+        AND NOT (
+          m.member = (SELECT oid FROM pg_roles WHERE rolname='tgm_test')
+          AND NOT has_database_privilege(m.member, current_database(), 'CONNECT')
+        )
+   )
+      OR EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE c.relowner IN (SELECT oid FROM roles) AND n.nspname NOT LIKE 'pg\_%'
+      )
+      OR EXISTS (
+        SELECT 1 FROM pg_namespace n
+         WHERE n.nspowner IN (SELECT oid FROM roles) AND n.nspname NOT LIKE 'pg\_%'
+      )
+  UNION ALL
+  SELECT '批处理函数缺失、重载或属性漂移'
+   WHERE (SELECT count(*) FROM batch) <> 1 OR NOT EXISTS (
+     SELECT 1 FROM batch
+      WHERE pronargs = 2 AND proargtypes = '20 25'::oidvector
+        AND prokind = 'f' AND prorettype = 'record'::regtype
+        AND prolang = (SELECT oid FROM pg_language WHERE lanname='plpgsql')
+        AND prosecdef AND provolatile='v' AND proparallel='u'
+        AND NOT proisstrict AND NOT proleakproof AND proargdefaults IS NULL
+        AND proowner = (SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher')
+        AND proconfig = ARRAY['search_path=pg_catalog, pg_temp']
+   )
+  UNION ALL
+  SELECT '批处理函数 EXECUTE ACL 漂移'
+   WHERE NOT EXISTS (
+     SELECT 1 FROM batch, LATERAL aclexplode(coalesce(proacl, acldefault('f', proowner))) permission
+      WHERE permission.grantee = (SELECT oid FROM pg_roles WHERE rolname='tenant_purge')
+        AND permission.privilege_type='EXECUTE' AND NOT permission.is_grantable
+   ) OR EXISTS (
+     SELECT 1 FROM batch, LATERAL aclexplode(coalesce(proacl, acldefault('f', proowner))) permission
+      WHERE permission.grantee NOT IN (proowner, (SELECT oid FROM pg_roles WHERE rolname='tenant_purge'))
+         OR permission.privilege_type <> 'EXECUTE' OR permission.is_grantable
+   )
+  UNION ALL
+  SELECT 'batcher schema CREATE 或根表权限漂移'
+   WHERE EXISTS (
+     SELECT 1 FROM pg_namespace n
+      WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+        AND has_schema_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher'), n.oid, 'CREATE')
+   ) OR has_table_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher'), 'public.tenants', 'DELETE')
+      OR has_table_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher'), 'public.tenants', 'TRUNCATE')
+  UNION ALL
+  SELECT 'batcher 缺少必要列权限: ' || e.tbl || '.' || e.col
+    FROM expected_select e
+   WHERE NOT has_column_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher'), format('public.%s', e.tbl), e.col, 'SELECT')
+  UNION ALL
+  SELECT 'batcher 存在未批准的列权限: ' || n.nspname || '.' || c.relname || '.' || a.attname || ':' || p.privilege
+    FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+    CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('REFERENCES')) p(privilege)
+   WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f') AND a.attnum>0 AND NOT a.attisdropped
+     AND has_column_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher'), c.oid, a.attnum, p.privilege)
+     AND NOT (
+       (p.privilege='SELECT' AND EXISTS (SELECT 1 FROM expected_select e WHERE e.tbl=c.relname AND e.col=a.attname))
+       OR
+       (p.privilege='INSERT' AND EXISTS (SELECT 1 FROM expected_insert e WHERE e.tbl=c.relname AND e.col=a.attname))
+     )
+  UNION ALL
+  SELECT 'batcher 缺少必要日志列权限: ' || e.tbl || '.' || e.col
+    FROM expected_insert e
+   WHERE NOT has_column_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher'), format('public.%s', e.tbl), e.col, 'INSERT')
+  UNION ALL
+  SELECT 'batcher 缺少或多出表级 DELETE 权限: ' || c.relname
+    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+   WHERE n.nspname='public' AND c.relkind IN ('r','p')
+     AND has_table_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher'), c.oid, 'DELETE')
+     AND NOT EXISTS (SELECT 1 FROM expected_delete e WHERE e.tbl=c.relname)
+  UNION ALL
+  SELECT 'batcher 缺少批准的表级 DELETE 权限: ' || e.tbl
+    FROM expected_delete e
+   WHERE NOT has_table_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher'), format('public.%s', e.tbl), 'DELETE')
+  UNION ALL
+  SELECT 'batcher 存在未批准的表/序列授权'
+   WHERE EXISTS (
+     SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+      CROSS JOIN LATERAL aclexplode(c.relacl) permission
+     WHERE n.nspname='public' AND c.relkind IN ('r','p','S')
+       AND permission.grantee=(SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher')
+       AND NOT (
+         (c.relkind IN ('r','p') AND permission.privilege_type='DELETE' AND EXISTS (SELECT 1 FROM expected_delete e WHERE e.tbl=c.relname))
+         OR (c.relname='system_logs_id_seq' AND permission.privilege_type='USAGE')
+       )
+   )
+  UNION ALL
+  SELECT 'batcher 缺少日志序列 USAGE'
+   WHERE NOT has_sequence_privilege((SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher'), 'public.system_logs_id_seq', 'USAGE')
+  UNION ALL
+  SELECT 'batcher RLS 策略缺失、恒真或日志策略漂移'
+   WHERE (SELECT count(*) FROM pg_policy p WHERE (SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher') = ANY(p.polroles)) <> 44
+      OR EXISTS (
+        SELECT 1 FROM pg_policy p
+         WHERE (SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher') = ANY(p.polroles)
+           AND p.polcmd IN ('r','d')
+           AND (pg_get_expr(p.polqual,p.polrelid) IS NULL OR pg_get_expr(p.polqual,p.polrelid) IN ('true','(true)'))
+      )
+      OR NOT EXISTS (
+        SELECT 1 FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid
+         WHERE c.oid='public.system_logs'::regclass AND p.polname='tenant_purge_batcher_log'
+           AND p.polcmd='a' AND p.polroles=ARRAY[(SELECT oid FROM pg_roles WHERE rolname='tenant_purge_batcher')]::oid[]
+           AND pg_get_expr(p.polwithcheck,p.polrelid) LIKE '%tenant_purge%'
+           AND pg_get_expr(p.polwithcheck,p.polrelid) LIKE '%blocked%'
+      )
 )
 SELECT reason::text FROM violations;
 
