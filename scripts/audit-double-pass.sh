@@ -46,6 +46,7 @@ declare -A BREAK=(
   [C14]="GRANT SELECT (secret_ciphertext) ON identity_secrets TO tenant_lifecycle;"
   [C15]="ALTER TABLE identities DISABLE TRIGGER identity_lifecycle_write_fence;"
   [C16]="GRANT UPDATE ON tenants TO tenant_purge_finalizer;"
+  [C17]="GRANT SELECT (name) ON tenants TO tenant_purge_batcher;"
   [A2a]="ALTER ROLE app_user BYPASSRLS;"
   [A2b]="ALTER TABLE keywords OWNER TO app_user;"
   # NOT VALID：不加的话新约束要校验现有行，而会话里没有 app.tenant_id，
@@ -106,6 +107,7 @@ declare -A UNDO=(
   [C14]="REVOKE SELECT (secret_ciphertext) ON identity_secrets FROM tenant_lifecycle;"
   [C15]="ALTER TABLE identities ENABLE TRIGGER identity_lifecycle_write_fence;"
   [C16]="REVOKE UPDATE ON tenants FROM tenant_purge_finalizer;"
+  [C17]="REVOKE SELECT (name) ON tenants FROM tenant_purge_batcher;"
   [A2a]="ALTER ROLE app_user NOBYPASSRLS;"
   # 改回 owner **不还原受赠权限**。实测：ALTER TABLE keywords OWNER TO app_user
   # 之后 relacl 里 app_user 那条受赠条目消失了（被并进 owner 条目），
@@ -149,7 +151,7 @@ declare -A AS_SUPER=([A2a]=1 [A2b]=1 [A8]=1 [C5]=1)
 #             必然同时触发 A1。两条断言从不同角度抓同一个事实，是冗余而非耦合
 declare -A ALSO=([A2b]="A1")
 
-ORDER=(MAIN A1 A2a A2b A3 A4 A5 A6 A7 A8 A9 C1 C4 C2 C6 C7 C5 C8 C9 C10 C11 C12 C13 C14 C15 C16)
+ORDER=(MAIN A1 A2a A2b A3 A4 A5 A6 A7 A8 A9 C1 C4 C2 C6 C7 C5 C8 C9 C10 C11 C12 C13 C14 C15 C16 C17)
 
 psql_do() {  # $1=sql  $2=1 表示以超级用户身份
   if [ "${2:-}" = "1" ]; then

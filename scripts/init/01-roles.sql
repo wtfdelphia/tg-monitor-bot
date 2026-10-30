@@ -12,13 +12,18 @@ CREATE ROLE platform_cleanup LOGIN PASSWORD 'pcpw' NOSUPERUSER NOBYPASSRLS NOCRE
 CREATE ROLE tenant_lifecycle LOGIN PASSWORD 'tlpw' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
 CREATE ROLE tenant_purge LOGIN PASSWORD 'pupw' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
 CREATE ROLE tenant_purge_finalizer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+CREATE ROLE tenant_purge_batcher NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
 CREATE ROLE tgm_test    LOGIN PASSWORD 'tpw' NOSUPERUSER CREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
 GRANT tgm_owner TO postgres;
 GRANT tgm_owner TO tgm_test WITH SET TRUE, INHERIT FALSE;
 GRANT tenant_purge_finalizer TO tgm_owner WITH ADMIN OPTION;
+GRANT tenant_purge_batcher TO tgm_owner WITH ADMIN OPTION;
 -- 供 SQLx 临时库迁移由 tgm_test 转授 finalizer；生产库通过 REVOKE CONNECT
 -- 隔离 tgm_test，C16 也将其排除在生产登录路径之外。
 GRANT tenant_purge_finalizer TO tgm_test WITH ADMIN OPTION;
+-- SQLx 临时库重放批处理迁移需要由 tgm_test 代授 batcher；生产库通过撤销
+-- tgm_test 的 CONNECT 隔离该测试成员关系，C17 不把它计入生产登录路径。
+GRANT tenant_purge_batcher TO tgm_test WITH ADMIN OPTION;
 
 -- 坑 1：PG 15+ 起 public schema 默认不对非 owner 开放。
 -- 漏这一行，迁移第一条 CREATE TABLE 就 "permission denied for schema public"
