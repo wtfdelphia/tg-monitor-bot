@@ -1,0 +1,15 @@
+.git
+.github
+.codex
+.env
+.env.*
+!.env.example
+target
+**/target
+ai-driver-logs
+**/*.session
+**/qr.link
+**/qr.png
+**/qr.html
+tmp
+temp
