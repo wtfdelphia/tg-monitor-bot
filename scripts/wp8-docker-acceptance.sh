@@ -2,10 +2,61 @@
 set -euo pipefail
 umask 077
 
-ROOT="$(git rev-parse --show-toplevel)"
+ROOT="${TGM_ACCEPTANCE_ROOT:-}"
+IMAGE=""
+PREBUILT=0
+PROJECT_OVERRIDE=""
+
+usage() {
+  cat <<'EOF'
+用法：
+  scripts/wp8-docker-acceptance.sh
+  scripts/wp8-docker-acceptance.sh --image <已加载镜像引用>
+
+默认模式从当前仓库构建镜像；--image 模式只使用已加载的镜像，不构建、不删除该镜像。
+可通过 --project-name 固定本次隔离 Compose project 名称。
+可通过 TGM_ACCEPTANCE_ROOT 指定包含 deploy/docker/ 和 scripts/init/ 的验收根目录。
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --image)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      IMAGE="$2"
+      PREBUILT=1
+      shift 2
+      ;;
+    --project-name)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      PROJECT_OVERRIDE="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ -z "$ROOT" ]; then
+  ROOT="$(git rev-parse --show-toplevel)"
+fi
 SUFFIX="${UID}-$$"
-PROJECT="tgm-wp8-acceptance-$SUFFIX"
-IMAGE="tgm-wp8-acceptance:$SUFFIX"
+PROJECT="${PROJECT_OVERRIDE:-tgm-wp8-acceptance-$SUFFIX}"
+case "$PROJECT" in
+  ""|*[!a-zA-Z0-9_-]*)
+    printf '拒绝执行：Compose project 名称包含不允许的字符。\n' >&2
+    exit 2
+    ;;
+esac
+if [ "$PREBUILT" -eq 0 ]; then
+  IMAGE="tgm-wp8-acceptance:$SUFFIX"
+fi
 BUILDER="tgm-wp8-acceptance-$SUFFIX"
 COMPOSE_FILE="$ROOT/deploy/docker/wp8-acceptance.compose.yaml"
 TEMP_DIR="$(mktemp -d /tmp/tgm-wp8-docker-acceptance.XXXXXX)"
@@ -21,6 +72,11 @@ LOCK_PID=""
 cleanup() {
   local result=$?
   trap - EXIT
+  if [ "$result" -ne 0 ] && [ "$RESOURCES_OWNED" -eq 1 ]; then
+    printf '验收失败，保留 PostgreSQL 诊断日志：\n' >&2
+    "${COMPOSE[@]}" ps --all >&2 || true
+    "${COMPOSE[@]}" logs --no-color postgres >&2 || true
+  fi
   if [ -n "$LOCK_PID" ]; then
     kill "$LOCK_PID" 2>/dev/null || true
     wait "$LOCK_PID" 2>/dev/null || true
@@ -41,20 +97,8 @@ trap cleanup EXIT
 
 command -v docker >/dev/null
 command -v sha256sum >/dev/null
+docker compose version >/dev/null
 [ -f "$COMPOSE_FILE" ]
-
-if [ -n "$("${COMPOSE[@]}" ps --all --quiet)" ]; then
-  printf '拒绝执行：Compose project %s 已有容器。\n' "$PROJECT" >&2
-  exit 1
-fi
-if docker image inspect "$IMAGE" >/dev/null 2>&1; then
-  printf '拒绝执行：镜像标签 %s 已存在。\n' "$IMAGE" >&2
-  exit 1
-fi
-if docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
-  printf '拒绝执行：Buildx builder %s 已存在。\n' "$BUILDER" >&2
-  exit 1
-fi
 
 printf 'TGM_PROFILE=development\nTGM_DB_URL_OWNER=postgres://postgres:pw@postgres:5432/tgm\n' \
   >"$TGM_ACCEPTANCE_OWNER_ENV"
@@ -62,11 +106,33 @@ printf 'TGM_PROFILE=development\nTGM_DB_URL_TENANT_PURGE=postgres://tenant_purge
   >"$TGM_ACCEPTANCE_PURGE_ENV"
 chmod 600 "$TGM_ACCEPTANCE_OWNER_ENV" "$TGM_ACCEPTANCE_PURGE_ENV"
 
-docker buildx create --name "$BUILDER" --driver docker-container >/dev/null
-BUILDER_CREATED=1
-IMAGE_OWNED=1
-docker buildx build --builder "$BUILDER" --progress plain --no-cache --load --tag "$IMAGE" \
-  --file "$ROOT/Dockerfile" "$ROOT"
+if [ -n "$("${COMPOSE[@]}" ps --all --quiet)" ]; then
+  printf '拒绝执行：Compose project %s 已有容器。\n' "$PROJECT" >&2
+  exit 1
+fi
+if [ "$PREBUILT" -eq 1 ]; then
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || {
+    printf '拒绝执行：预构建镜像 %s 不存在。\n' "$IMAGE" >&2
+    exit 1
+  }
+else
+  if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    printf '拒绝执行：镜像标签 %s 已存在。\n' "$IMAGE" >&2
+    exit 1
+  fi
+  if docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
+    printf '拒绝执行：Buildx builder %s 已存在。\n' "$BUILDER" >&2
+    exit 1
+  fi
+fi
+
+if [ "$PREBUILT" -eq 0 ]; then
+  docker buildx create --name "$BUILDER" --driver docker-container >/dev/null
+  BUILDER_CREATED=1
+  IMAGE_OWNED=1
+  docker buildx build --builder "$BUILDER" --progress plain --no-cache --load --tag "$IMAGE" \
+    --file "$ROOT/Dockerfile" "$ROOT"
+fi
 IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$IMAGE")"
 IMAGE_SHA="$(docker image save "$IMAGE" | sha256sum | cut -d ' ' -f 1)"
 printf '镜像 ID：%s\n镜像归档 SHA-256：%s\n' "$IMAGE_ID" "$IMAGE_SHA"
@@ -81,6 +147,8 @@ docker run --rm --entrypoint /bin/sh "$IMAGE" -ec \
 "${COMPOSE[@]}" config --quiet
 RESOURCES_OWNED=1
 "${COMPOSE[@]}" up --detach --wait postgres
+"${COMPOSE[@]}" exec --no-TTY postgres psql -U postgres -d tgm -v ON_ERROR_STOP=1 \
+  <"$ROOT/scripts/init/01-roles.sql"
 "${COMPOSE[@]}" run --rm --no-deps tgm-owner migrate
 "${COMPOSE[@]}" run --rm --no-deps tgm-owner audit-rls
 "${COMPOSE[@]}" run --rm --no-deps tgm-purge purge-deleted-tenants --max-tenants 1
