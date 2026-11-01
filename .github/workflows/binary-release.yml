@@ -1,0 +1,227 @@
+name: Native binary release
+
+concurrency:
+  group: native-binary-release-${{ inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '已存在且位于 main 历史中的 vMAJOR.MINOR.PATCH tag'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  checks: read
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: 'true'
+  BUILDER_IMAGE: tgm-native-builder:${{ github.run_id }}
+  COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+  COSIGN_CERTIFICATE_IDENTITY_REGEXP: https://github\.com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-release\.yml@refs/(tags/v[0-9]+\.[0-9]+\.[0-9]+|heads/main)
+
+jobs:
+  release:
+    name: Build and publish CentOS 7 compatible binary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [ '${{ github.event_name }}' = workflow_dispatch ]; then
+            tag="$INPUT_TAG"
+          else
+            tag='${{ github.ref_name }}'
+          fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Reject manual runs outside main
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo 'workflow_dispatch 只能从 main 分支重跑已存在的 release tag。' >&2
+          exit 1
+
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Validate tag and main ancestry
+        id: validate
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch origin main --no-tags
+          tag_commit="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          main_commit="$(git rev-parse origin/main^{commit})"
+          git merge-base --is-ancestor "$tag_commit" "$main_commit" || {
+            echo '发布 tag 不在 main 历史中。' >&2
+            exit 1
+          }
+          test -z "$(git status --porcelain)"
+          printf '发布 tag：%s\n提交：%s\nmain：%s\n' "$RELEASE_TAG" "$tag_commit" "$main_commit"
+          echo "source_commit=$tag_commit" >> "$GITHUB_OUTPUT"
+          checks="$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$tag_commit/check-runs?per_page=100" --jq '.check_runs[] | [.name, .status, .conclusion] | @tsv')"
+          for required in static database; do
+            printf '%s\n' "$checks" | awk -F '\t' -v name="$required" '$1 == name && $2 == "completed" && $3 == "success" { found=1 } END { exit !found }' || {
+              echo "提交 $tag_commit 缺少成功的 $required CI check。" >&2
+              printf '%s\n' "$checks" >&2
+              exit 1
+            }
+          done
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Resolve workspace version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tgm") | .version')"
+          test "v$version" = '${{ steps.tag.outputs.tag }}'
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build CentOS 7 builder
+        run: docker build --pull=false -f deploy/native/centos7-builder.Dockerfile -t "$BUILDER_IMAGE" .
+
+      - name: Extract binary and builder metadata
+        id: build
+        run: |
+          set -euo pipefail
+          container="$(docker create "$BUILDER_IMAGE")"
+          trap 'docker rm "$container" >/dev/null' EXIT
+          mkdir -p dist
+          docker cp "$container:/src/target/release/tgm" dist/tgm
+          docker image inspect --format '{{.Id}}' "$BUILDER_IMAGE" > dist/builder-image.id
+          chmod 0755 dist/tgm
+          python3 - <<'PY'
+          import re
+          import subprocess
+
+          output = subprocess.check_output(['readelf', '--version-info', 'dist/tgm'], text=True)
+          versions = []
+          for value in re.findall(r'GLIBC_([0-9]+(?:\.[0-9]+)*)', output):
+              parts = tuple(map(int, value.split('.')))
+              versions.append(parts + (0,) * (3 - len(parts)))
+          if max(versions, default=(0, 0, 0)) > (2, 17, 0):
+              raise SystemExit('二进制包含高于 glibc 2.17 的符号。')
+          PY
+          ldd dist/tgm
+          ./dist/tgm --help >/dev/null
+          ./dist/tgm purge-deleted-tenants --help >/dev/null
+          scripts/native-release-preflight.sh --binary dist/tgm --unit-dir deploy/systemd
+
+      - name: Generate source SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: dist/sbom.cdx.json
+          upload-artifact: false
+
+      - name: Package release archive
+        run: |
+          set -euo pipefail
+          epoch='${{ github.event.head_commit.timestamp || '' }}'
+          if [ -z "$epoch" ]; then epoch="$(git show -s --format=%ct HEAD)"; else epoch="$(date -d "$epoch" +%s)"; fi
+          python3 scripts/native-release-package.py \
+            --binary dist/tgm \
+            --sbom dist/sbom.cdx.json \
+            --version '${{ steps.version.outputs.version }}' \
+            --source-commit "$(git rev-parse HEAD)" \
+            --rust-toolchain "$(rustup show active-toolchain | awk '{print $1}')" \
+            --builder-image "$(cat dist/builder-image.id)" \
+            --source-date-epoch "$epoch" \
+            --output dist/package
+          (cd dist/package && sha256sum "tgm-${{ steps.version.outputs.version }}-linux-x86_64-gnu.tar.gz") > dist/SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Sign checksums with Sigstore keyless identity
+        working-directory: dist
+        run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+
+      - name: Write signed provenance record
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          SOURCE_COMMIT: ${{ steps.validate.outputs.source_commit }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="dist/package/tgm-${VERSION}-linux-x86_64-gnu.tar.gz"
+          archive_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+          python3 - "$archive_sha256" > dist/provenance.json <<'PY'
+          import json
+          import os
+          import sys
+
+          archive_sha256 = sys.argv[1]
+          document = {
+              "_type": "https://in-toto.io/Statement/v1",
+              "subject": [{
+                  "name": f"tgm-{os.environ['VERSION']}-linux-x86_64-gnu.tar.gz",
+                  "digest": {"sha256": archive_sha256},
+              }],
+              "predicateType": "https://slsa.dev/provenance/v1",
+              "predicate": {
+                  "buildDefinition": {
+                      "buildType": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/.github/workflows/binary-release.yml",
+                      "externalParameters": {
+                          "release_tag": os.environ["RELEASE_TAG"],
+                      },
+                      "resolvedDependencies": [{
+                          "uri": f"git+https://github.com/{os.environ['GITHUB_REPOSITORY']}@refs/tags/{os.environ['RELEASE_TAG']}",
+                          "digest": {"gitCommit": os.environ["SOURCE_COMMIT"]},
+                      }],
+                  },
+                  "runDetails": {
+                      "builder": {
+                          "id": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+                      },
+                      "metadata": {"invocationId": os.environ["GITHUB_RUN_ID"]},
+                  },
+              },
+          }
+          json.dump(document, sys.stdout, ensure_ascii=False, indent=2)
+          sys.stdout.write("\n")
+          PY
+          cosign sign-blob --yes --bundle dist/provenance.sigstore.json dist/provenance.json
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          assets=(dist/package/tgm-*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sigstore.json dist/provenance.json dist/provenance.sigstore.json dist/sbom.cdx.json dist/package/BUILDINFO.json)
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" --clobber "${assets[@]}"
+          else
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --generate-notes \
+              "${assets[@]}"
+          fi
+
+      - name: Cleanup builder and temporary Docker resources
+        if: always()
+        run: |
+          docker rm -f $(docker ps -aq --filter "ancestor=$BUILDER_IMAGE") 2>/dev/null || true
+          docker image rm "$BUILDER_IMAGE" 2>/dev/null || true

@@ -67,7 +67,7 @@ clap = { version = "4.6", features = ["derive"] }
 axum = "0.8"
 utoipa = "5.5"
 tower = { version = "0.5", features = ["util"] }
-josekit = "0.10.3"
+josekit = { version = "0.10.3", features = ["vendored"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # 本仓 crate
