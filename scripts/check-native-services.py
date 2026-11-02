@@ -53,6 +53,7 @@ class NativeServices(unittest.TestCase):
         executable(self.fixture / "bin/tgm", '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\nprintf "%s\\n" "--env-file --check-config"\n')
         executable(self.fixture / "scripts/native-release-preflight.sh", '#!/bin/sh\nprintf "preflight %s\\n" "$*" >> "$CALLS"\nexit "${PREFLIGHT_STATUS:-0}"\n')
         shutil.copyfile(self.installer, self.fixture / "scripts/install-native.sh")
+        shutil.copyfile(ROOT / "scripts/verify-native-candidate.py", self.fixture / "scripts/verify-native-candidate.py")
         (self.fixture / "VERSION").write_text("0.1.0\n", encoding="utf-8")
         self.stub("cosign", 'printf "cosign %s\\n" "$*" >> "$CALLS"\nexit "${SIGNATURE_STATUS:-0}"')
         self.stub("systemctl", 'printf "systemctl %s\\n" "$*" >> "$CALLS"\n[ "$*" = "--user show-environment" ] || exit 99\nexit "${MANAGER_STATUS:-0}"')
@@ -99,6 +100,27 @@ exec {real_ln} "$@"''')
 
     def make_archive(self, version: str) -> tuple[Path, Path, Path]:
         (self.fixture / "VERSION").write_text(f"{version}\n", encoding="utf-8")
+        buildinfo = {"channel": "stable", "stable": True, "version": version}
+        candidate = re.fullmatch(r"([0-9]+\.[0-9]+\.[0-9]+)-candidate\.([1-9][0-9]*)\.([1-9][0-9]*)\.([0-9a-f]{12})", version)
+        if candidate:
+            shutil.copyfile(ROOT / "scripts/verify-native-candidate.py", self.fixture / "scripts/verify-native-candidate.py")
+            source_commit = candidate.group(4) + "0" * 28
+            run_id = int(candidate.group(2))
+            attempt = int(candidate.group(3))
+            buildinfo = {
+                "channel": "candidate", "stable": False, "version": version,
+                "source_commit": source_commit, "candidate_run_id": run_id,
+                "candidate_attempt": attempt, "ci_run_id": 456,
+                "workflow_run_url": f"https://github.com/wtfdelphia/tg-monitor-bot/actions/runs/{run_id}",
+                "target": "x86_64-unknown-linux-gnu",
+                "builder_image": "sha256:" + "b" * 64,
+                "release_tag": f"candidate-{run_id}-a{attempt}-{candidate.group(4)}",
+                "artifact": f"tgm-{version}-linux-x86_64-gnu.tar.gz",
+            }
+        else:
+            (self.fixture / "scripts/verify-native-candidate.py").unlink(missing_ok=True)
+        (self.fixture / "BUILDINFO.json").write_text(json.dumps(buildinfo), encoding="utf-8")
+        (self.fixture / "sbom.cdx.json").write_text(json.dumps({"bomFormat": "CycloneDX", "version": 1}), encoding="utf-8")
         files = sorted(path for path in self.fixture.rglob("*") if path.is_file() and path.name != "SHA256SUMS")
         checksums = "".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(self.fixture).as_posix()}\n" for path in files)
         (self.fixture / "SHA256SUMS").write_text(checksums, encoding="utf-8")
@@ -107,9 +129,58 @@ exec {real_ln} "$@"''')
             for path in sorted(self.fixture.rglob("*")):
                 stream.add(path, arcname="./" + path.relative_to(self.fixture).as_posix(), recursive=False)
         outer = self.base / f"checksums-{version}"
-        outer.write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n", encoding="utf-8")
+        outer_files = [(archive, archive.name)]
+        if candidate:
+            outer_files.extend((
+                (self.fixture / "BUILDINFO.json", "candidate-BUILDINFO.json"),
+                (self.fixture / "sbom.cdx.json", "candidate-sbom.cdx.json"),
+            ))
+        outer.write_text("".join(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {name}\n"
+            for path, name in outer_files
+        ), encoding="utf-8")
+        release_buildinfo = self.base / "candidate-BUILDINFO.json"
+        release_sbom = self.base / "candidate-sbom.cdx.json"
+        shutil.copyfile(self.fixture / "BUILDINFO.json", release_buildinfo)
+        shutil.copyfile(self.fixture / "sbom.cdx.json", release_sbom)
         bundle = self.base / "bundle.json"
         bundle.write_text("{}\n", encoding="utf-8")
+        if candidate:
+            archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            provenance = {
+                "_type": "https://in-toto.io/Statement/v1",
+                "subject": [{"name": archive.name, "digest": {"sha256": archive_digest}}],
+                "predicateType": "https://slsa.dev/provenance/v1",
+                "predicate": {
+                    "buildDefinition": {
+                        "buildType": "https://github.com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-candidate.yml",
+                        "externalParameters": {
+                            "channel": "candidate", "candidate_tag": buildinfo["release_tag"],
+                            "candidate_version": version, "candidate_run_id": str(run_id),
+                            "candidate_attempt": str(attempt), "ci_run_id": "456",
+                            "target": buildinfo["target"], "builder_image": buildinfo["builder_image"],
+                        },
+                        "resolvedDependencies": [{
+                            "uri": "git+https://github.com/wtfdelphia/tg-monitor-bot@refs/heads/dev",
+                            "digest": {"gitCommit": buildinfo["source_commit"]},
+                        }],
+                    },
+                    "runDetails": {
+                        "builder": {"id": f"https://github.com/wtfdelphia/tg-monitor-bot/actions/runs/{run_id}"},
+                        "metadata": {
+                            "invocationId": f"https://github.com/wtfdelphia/tg-monitor-bot/actions/runs/{run_id}/attempts/{attempt}"
+                        },
+                    },
+                },
+            }
+            self.provenance = self.base / "provenance.json"
+            self.provenance.write_text(json.dumps(provenance), encoding="utf-8")
+            self.provenance_bundle = self.base / "provenance.sigstore.json"
+            self.provenance_bundle.write_text("{}\n", encoding="utf-8")
+            self.buildinfo_path = self.fixture / "BUILDINFO.json"
+        else:
+            self.provenance = None
+            self.provenance_bundle = None
         return archive, outer, bundle
 
     def invoke(self, *arguments: str, **environment: str) -> subprocess.CompletedProcess[str]:
@@ -122,6 +193,16 @@ exec {real_ln} "$@"''')
             arguments.append("--accept-same-uid")
         return self.invoke(*arguments, "--archive", str(self.archive), "--checksums", str(self.checksums),
                            "--bundle", str(self.bundle), **environment)
+
+    def install_candidate(self, **environment: str) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "--user", "--candidate", "--accept-candidate", "--archive", str(self.archive),
+            "--checksums", str(self.checksums), "--bundle", str(self.bundle),
+            "--provenance", str(self.provenance), "--provenance-bundle", str(self.provenance_bundle),
+            "--buildinfo", str(self.base / "candidate-BUILDINFO.json"),
+            "--sbom", str(self.base / "candidate-sbom.cdx.json"),
+            **environment,
+        )
 
     def assert_success(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -177,6 +258,93 @@ exec {real_ln} "$@"''')
         self.assert_rejected(self.install(SIGNATURE_STATUS="1"))
         self.assert_rejected(self.install(PREFLIGHT_STATUS="1"))
         self.assert_rejected(self.install(INSTALL_FAILURE="1"))
+
+    def test_candidate_install_requires_explicit_nonproduction_path(self) -> None:
+        version = "0.1.0-candidate.12345.1.0123456789ab"
+        self.archive, self.checksums, self.bundle = self.make_archive(version)
+        ordinary = self.invoke(
+            "--user", "--archive", str(self.archive), "--checksums", str(self.checksums),
+            "--bundle", str(self.bundle),
+        )
+        self.assert_rejected(ordinary)
+        missing_confirmation = self.invoke(
+            "--user", "--candidate", "--archive", str(self.archive), "--checksums", str(self.checksums),
+            "--bundle", str(self.bundle), "--provenance", str(self.provenance),
+            "--provenance-bundle", str(self.provenance_bundle),
+        )
+        self.assert_rejected(missing_confirmation)
+        self.assert_rejected(self.install_candidate(MOCK_UID="0"))
+        self.assert_rejected(self.invoke(
+            "--user", "--rollback", "0.1.0", "--buildinfo", str(self.fixture / "BUILDINFO.json"),
+        ))
+        self.assert_rejected(self.invoke(
+            "--root", "--candidate", "--accept-candidate", "--archive", str(self.archive),
+            "--checksums", str(self.checksums), "--bundle", str(self.bundle),
+            "--provenance", str(self.provenance), "--provenance-bundle", str(self.provenance_bundle),
+            MOCK_UID="0",
+        ))
+        self.assert_rejected(self.invoke(
+            "--user", "--candidate", "--accept-candidate", "--app-services",
+            "--archive", str(self.archive), "--checksums", str(self.checksums),
+            "--bundle", str(self.bundle), "--provenance", str(self.provenance),
+            "--provenance-bundle", str(self.provenance_bundle),
+        ))
+        stable_link = self.home / ".local/bin/tgm"
+        stable_link.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (self.home / ".local").chmod(0o700)
+        stable_link.parent.chmod(0o700)
+        stable_link.symlink_to("/existing/stable/tgm")
+        self.assert_success(self.install_candidate())
+        candidate_binary = self.home / ".local/opt/tgm/candidates/0.1.0-candidate.12345.1.0123456789ab/bin/tgm"
+        self.assertTrue(candidate_binary.is_file())
+        self.assertEqual(os.readlink(stable_link), "/existing/stable/tgm")
+        calls = self.calls.read_text(encoding="utf-8")
+        self.assertIn("--certificate-identity https://github.com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-candidate.yml@refs/heads/dev", calls)
+        self.assertIn("provenance.sigstore.json", calls)
+        self.assertFalse(any(line.startswith("systemctl ") for line in calls.splitlines()))
+
+    def test_candidate_install_rejects_mismatched_release_buildinfo(self) -> None:
+        version = "0.1.0-candidate.12348.1.abcdef012345"
+        self.archive, self.checksums, self.bundle = self.make_archive(version)
+        (self.base / "candidate-BUILDINFO.json").write_text('{"channel":"candidate"}\n', encoding="utf-8")
+        self.assert_rejected(self.install_candidate())
+
+    def test_candidate_install_rejects_mismatched_workflow_run_url(self) -> None:
+        version = "0.1.0-candidate.12349.1.abcdef012345"
+        self.archive, self.checksums, self.bundle = self.make_archive(version)
+        buildinfo_path = self.base / "candidate-BUILDINFO.json"
+        buildinfo = json.loads(buildinfo_path.read_text(encoding="utf-8"))
+        buildinfo["workflow_run_url"] = "https://github.com/example/repo/actions/runs/12349"
+        buildinfo_path.write_text(json.dumps(buildinfo), encoding="utf-8")
+        self.assert_rejected(self.install_candidate())
+
+    def test_candidate_install_rejects_tampered_provenance(self) -> None:
+        version = "0.1.0-candidate.12346.1.abcdef012345"
+        self.archive, self.checksums, self.bundle = self.make_archive(version)
+        original = json.loads(self.provenance.read_text(encoding="utf-8"))
+        mutations = (
+            lambda value: value["predicate"]["buildDefinition"]["resolvedDependencies"][0]["digest"].update(gitCommit="f" * 40),
+            lambda value: value["predicate"]["buildDefinition"]["externalParameters"].update(candidate_attempt="2"),
+            lambda value: value["predicate"]["buildDefinition"]["externalParameters"].update(builder_image="sha256:other"),
+            lambda value: value["predicate"]["buildDefinition"]["resolvedDependencies"][0].update(uri="git+https://example.invalid/repo@refs/heads/dev"),
+            lambda value: value["predicate"]["runDetails"]["metadata"].update(invocationId="other"),
+            lambda value: value["subject"][0]["digest"].update(sha256="0" * 64),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                provenance = json.loads(json.dumps(original))
+                mutate(provenance)
+                self.provenance.write_text(json.dumps(provenance), encoding="utf-8")
+                self.assert_rejected(self.install_candidate())
+
+    def test_candidate_install_rejects_extra_outer_checksum_entries(self) -> None:
+        version = "0.1.0-candidate.12347.1.abcdef012345"
+        self.archive, self.checksums, self.bundle = self.make_archive(version)
+        self.checksums.write_text(
+            self.checksums.read_text(encoding="ascii") + "0" * 64 + "  unexpected.tar.gz\n",
+            encoding="ascii",
+        )
+        self.assert_rejected(self.install_candidate())
 
     def test_failed_update_keeps_existing_binary_unit_and_config(self) -> None:
         self.assert_success(self.install())
@@ -266,6 +434,64 @@ exec {real_ln} "$@"''')
             self.assertIn("./deploy/systemd/app/tgm-app@.service", names)
             for role in ROLES:
                 self.assertIn(f"./deploy/systemd/app/{role}.env.example", names)
+
+    def test_candidate_package_is_marked_non_stable_and_unique(self) -> None:
+        binary = self.fixture / "bin/tgm"
+        sbom = self.base / "candidate-sbom.json"
+        sbom.write_text(json.dumps({"bomFormat": "CycloneDX"}), encoding="utf-8")
+        commit = "a" * 40
+        result = subprocess.run([
+            "python3", str(ROOT / "scripts/native-release-package.py"), "--binary", str(binary),
+            "--sbom", str(sbom), "--version", "0.1.0", "--channel", "candidate",
+            "--candidate-run-id", "123", "--candidate-attempt", "2", "--candidate-ci-run-id", "456",
+            "--candidate-run-url", "https://github.com/wtfdelphia/tg-monitor-bot/actions/runs/123",
+            "--source-commit", commit, "--rust-toolchain", "test", "--builder-image", "test",
+            "--source-date-epoch", "1700000000", "--output", str(self.base / "candidate-package"),
+        ], env=self.environment, text=True, capture_output=True, timeout=20)
+        self.assert_success(result)
+        archive = self.base / "candidate-package/tgm-0.1.0-candidate.123.2.aaaaaaaaaaaa-linux-x86_64-gnu.tar.gz"
+        self.assertTrue(archive.is_file())
+        with tarfile.open(archive) as stream:
+            package_root = Path(stream.getnames()[0].removeprefix("./"))
+            buildinfo_member = next(name for name in stream.getnames() if name.endswith("/BUILDINFO.json"))
+            readme_member = next(name for name in stream.getnames() if name.endswith("/README.md"))
+            buildinfo = json.load(stream.extractfile(buildinfo_member))
+            readme = stream.extractfile(readme_member).read().decode()
+        self.assertEqual(buildinfo["channel"], "candidate")
+        self.assertIs(buildinfo["stable"], False)
+        self.assertEqual(buildinfo["source_commit"], commit)
+        self.assertEqual(buildinfo["ci_run_id"], 456)
+        self.assertEqual(buildinfo["workflow_run_url"], "https://github.com/wtfdelphia/tg-monitor-bot/actions/runs/123")
+        self.assertNotIn("\\n+", readme)
+        self.assertIn("CANDIDATE / NOT STABLE", readme)
+        self.assertIn("candidate-provenance.json", readme)
+        self.assertIn("--accept-candidate", readme)
+        self.assertIn("预先安装 Python 3", readme)
+        self.assertNotIn("\n+", readme)
+        self.assertNotIn("@CANDIDATE_", readme)
+
+    def test_stable_package_readme_does_not_advertise_candidate_assets(self) -> None:
+        binary = self.fixture / "bin/tgm"
+        sbom = self.base / "stable-sbom.json"
+        sbom.write_text(json.dumps({"bomFormat": "CycloneDX"}), encoding="utf-8")
+        output = self.base / "stable-package"
+        result = subprocess.run([
+            "python3", str(ROOT / "scripts/native-release-package.py"), "--binary", str(binary),
+            "--sbom", str(sbom), "--version", "0.1.0", "--source-commit", "0" * 40,
+            "--rust-toolchain", "test", "--builder-image", "test", "--source-date-epoch", "1700000000",
+            "--output", str(output),
+        ], env=self.environment, text=True, capture_output=True, timeout=20)
+        self.assert_success(result)
+        with tarfile.open(output / "tgm-0.1.0-linux-x86_64-gnu.tar.gz") as stream:
+            readme_member = next(name for name in stream.getnames() if name.endswith("/README.md"))
+            readme = stream.extractfile(readme_member).read().decode()
+            buildinfo_member = next(name for name in stream.getnames() if name.endswith("/BUILDINFO.json"))
+            buildinfo = json.load(stream.extractfile(buildinfo_member))
+        self.assertNotIn("candidate-SHA256SUMS", readme)
+        self.assertNotIn("@CANDIDATE_", readme)
+        self.assertNotIn("发布通道：", readme)
+        self.assertNotIn("channel", buildinfo)
+        self.assertNotIn("stable", buildinfo)
 
     def test_preflight_rejects_unsupported_directives_even_when_verify_returns_zero(self) -> None:
         self.stub("ldd", 'if [ "$1" = --version ]; then echo "ldd (GNU libc) 2.17"; else echo "libc.so.6 => /lib64/libc.so.6"; fi')
