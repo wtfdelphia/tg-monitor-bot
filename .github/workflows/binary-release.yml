@@ -125,6 +125,7 @@ jobs:
           ./dist/tgm --help >/dev/null
           ./dist/tgm purge-deleted-tenants --help >/dev/null
           scripts/native-release-preflight.sh --binary dist/tgm --unit-dir deploy/systemd
+          scripts/native-release-preflight.sh --binary dist/tgm --unit-dir deploy/systemd --app-services
 
       - name: Generate source SBOM
         uses: anchore/sbom-action@v0

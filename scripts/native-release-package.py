@@ -88,9 +88,7 @@ def main() -> int:
         readme = readme.replace("@SOURCE_COMMIT@", args.source_commit)
         readme = readme.replace("@TARGET@", args.target)
         (staging / "README.md").write_text(readme, encoding="utf-8")
-        for source in sorted((repository / "deploy" / "systemd").iterdir()):
-            if source.is_file():
-                shutil.copy2(source, staging / "deploy" / "systemd" / source.name)
+        shutil.copytree(repository / "deploy" / "systemd", staging / "deploy" / "systemd", dirs_exist_ok=True)
 
         buildinfo = {
             "artifact": archive_name,

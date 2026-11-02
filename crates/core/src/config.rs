@@ -184,7 +184,7 @@ fn extra_required(role: Role) -> &'static [&'static str] {
 /// 与必填集的差集是「可选项」：`TGM_LISTEN_ADDR`（有默认值）、
 /// `TGM_KMS_KEY_ARN` / `TGM_LOCAL_KEK`（取决于 `TGM_KEK_BACKEND`）、
 /// 以及 `RUST_LOG` 和 AWS 那两个。
-fn allowed(role: Role) -> Vec<&'static str> {
+pub fn allowed(role: Role) -> Vec<&'static str> {
     let mut v: Vec<&'static str> = COMMON.to_vec();
     v.push("RUST_LOG");
     v.extend_from_slice(extra_required(role));

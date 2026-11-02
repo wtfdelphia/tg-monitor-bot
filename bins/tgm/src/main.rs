@@ -13,6 +13,7 @@ use tgm_core::config::Role as CoreRole;
 use tokio::sync::watch;
 
 mod kms_kek;
+mod native_config;
 
 #[derive(Parser)]
 #[command(name = "tgm", version, about = "Telegram 多租户内容监控与分发平台")]
@@ -27,6 +28,10 @@ enum Command {
     Serve {
         #[arg(long)]
         role: Role,
+        #[arg(long)]
+        env_file: Option<std::path::PathBuf>,
+        #[arg(long, requires = "env_file")]
+        check_config: bool,
     },
     /// 跑数据库迁移（与 `sqlx migrate run --source migrations` 同一份文件）
     Migrate,
@@ -1074,7 +1079,15 @@ fn main() -> anyhow::Result<()> {
     // SIGTERM 监听必须在 preflight 连库之前注册：preflight 一连上库，外部就可能把进程视为已启动，
     // 这之后、监听注册之前到达的 SIGTERM 会走默认处置直接杀进程（strace 实测）。
     let mut serve_runtime = None;
-    if let Command::Serve { role } = &cmd {
+    if let Command::Serve {
+        role,
+        env_file: Some(path),
+        check_config,
+    } = &cmd
+    {
+        return native_config::run(role, path, *check_config);
+    }
+    if let Command::Serve { role, .. } = &cmd {
         let rt = tokio::runtime::Runtime::new()?;
         // signal::unix::signal 要求在运行时上下文里调用，enter 只为注册，不轮询。
         let signal = {
@@ -1097,7 +1110,7 @@ fn main() -> anyhow::Result<()> {
         serve_runtime = Some((rt, signal));
     }
     match cmd {
-        Command::Serve { role } => {
+        Command::Serve { role, .. } => {
             let (rt, signal) = serve_runtime
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("serve 运行时未初始化"))?;
