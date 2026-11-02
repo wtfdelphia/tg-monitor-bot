@@ -2,7 +2,12 @@
 
 任务 id：`PRE-008-native-systemd-app-roles`。
 
-状态：待批准。提案基线为 `cloud/dev` 上的部署与配置约定及 PRE-007 原生二进制发布提案。PRE-007 实现当前在 PR #78，尚未合并；本提案的安装集成须以该 PR 的最终合并内容为准。PRE-007 只打包现有 cleanup unit/timer；本提案为常驻应用角色定义 systemd 服务工件、root 与普通用户安装方式及非生产验收，不自动安装到生产机，不启动服务，不执行迁移。
+状态：实施与本地验收已完成；目标 CentOS 7 实机验收待完成。PR #78、#79 已合入 `dev`；安装集成以 PRE-007 的最终合并内容为基线。PRE-007 只打包现有 cleanup unit/timer；本提案为常驻应用角色定义 systemd 服务工件、root 与普通用户安装方式及非生产验收，不自动安装到生产机，不启动服务，不执行迁移。
+
+实施授权记录（2026-11-02）：维护人在 PR #78、#79 合入 `dev` 后明确要求开始实施本提案。
+实施基线为 `4fe63d828def54fae08021af983fccf781f44c28`，不改变生产操作授权边界。
+本地实现和验证记录见 `../evidence/PRE-008-应用角色原生systemd实施-2026-11-02.md`；
+目标 CentOS 7 的实际 manager、沙箱和启停验收尚未提供，不能据此宣布整体出口通过。
 
 ## 一、背景与目标
 
@@ -98,6 +103,6 @@
 
 [report]
 task: PRE-008-native-systemd-app-roles
-path: escalated
-gates: not-run
-escalation: docs/plan/proposals/PRE-008-应用角色原生systemd服务.md
+path: ok
+gates: pass
+escalation: -

@@ -7,18 +7,22 @@ ARCHIVE=""
 CHECKSUMS=""
 BUNDLE=""
 ROLLBACK=""
+APP_SERVICES=0
+ACCEPT_SAME_UID=0
+APP_ROLES=(control-plane bot-gateway mtproto-worker fanout rule delivery)
 IDENTITY_REGEXP="${COSIGN_CERTIFICATE_IDENTITY_REGEXP:-https://github\\.com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-release\\.yml@refs/(tags/v[0-9]+\\.[0-9]+\\.[0-9]+|heads/main)}"
 OIDC_ISSUER="${COSIGN_CERTIFICATE_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 
 usage() {
   cat <<'EOF'
 用法：
-  scripts/install-native.sh --root --archive <包.tar.gz> --checksums <SHA256SUMS> --bundle <SHA256SUMS.sigstore.json>
-  scripts/install-native.sh --user --archive <包.tar.gz> --checksums <SHA256SUMS> --bundle <SHA256SUMS.sigstore.json>
+  scripts/install-native.sh --root [--app-services] --archive <包.tar.gz> --checksums <SHA256SUMS> --bundle <SHA256SUMS.sigstore.json>
+  scripts/install-native.sh --user [--app-services --accept-same-uid] --archive <包.tar.gz> --checksums <SHA256SUMS> --bundle <SHA256SUMS.sigstore.json>
   scripts/install-native.sh --root --rollback <版本>
   scripts/install-native.sh --user --rollback <版本>
 
 安装器只做签名、校验、复制和帮助命令检查，不执行迁移、不启动服务、不启用 timer。
+--app-services 只安装应用 unit，不安装 cleanup unit；user 模式须接受同 UID 下没有角色凭据隔离。
 EOF
 }
 
@@ -36,11 +40,46 @@ atomic_symlink() {
   local link="$2"
   local parent
   parent="$(dirname "$link")"
-  mkdir -p "$parent"
-  local temporary="$parent/.tgm-link.$$"
-  rm -f "$temporary"
-  ln -s "$target" "$temporary"
-  mv -Tf "$temporary" "$link"
+  check_directory_path "$parent"
+  reject_non_symlink_target "$link"
+  (
+    temporary="$(mktemp -d "$parent/.tgm-link.XXXXXX")"
+    trap 'rm -f -- "$temporary/tgm"; rmdir -- "$temporary"' EXIT
+    ln -s "$target" "$temporary/tgm"
+    mv -Tf "$temporary/tgm" "$link"
+  )
+}
+
+check_directory_path() {
+  local directory="$1" owner mode caller
+  caller="$(id -u)"
+  case "$directory" in /*) ;; *) fail '安装路径必须为绝对路径' ;; esac
+  while :; do
+    [ ! -L "$directory" ] || fail "安装父目录是符号链接：$directory"
+    if [ -e "$directory" ]; then
+      [ -d "$directory" ] || fail "安装父路径不是目录：$directory"
+      owner="$(stat -c %u "$directory")"
+      mode="$(stat -c %a "$directory")"
+      [ "$owner" = 0 ] || [ "$owner" = "$caller" ] || fail "安装父目录属主不可信：$directory"
+      [ "$((8#$mode & 0022))" = 0 ] || \
+        { [ "$owner" = 0 ] && [ "$((8#$mode & 01000))" != 0 ]; } || \
+        fail "安装父目录允许其他身份写入：$directory"
+    fi
+    [ "$directory" != / ] || break
+    directory="$(dirname "$directory")"
+  done
+}
+
+prepare_directory() {
+  local directory="$1" mode="$2"
+  check_directory_path "$directory"
+  if [ ! -d "$directory" ]; then
+    if [ "$MODE" = root ]; then
+      install -d -o root -g root -m "$mode" "$directory"
+    else
+      install -d -m "$mode" "$directory"
+    fi
+  fi
 }
 
 reject_non_symlink_target() {
@@ -52,9 +91,34 @@ check_existing_file() {
   local source="$1"
   local destination="$2"
   if [ -e "$destination" ] || [ -L "$destination" ]; then
-    [ -f "$destination" ] || fail "目标路径不是普通文件，拒绝覆盖：$destination"
+    [ -f "$destination" ] && [ ! -L "$destination" ] || fail "目标路径不是普通文件，拒绝覆盖：$destination"
+    local owner mode
+    owner="$(stat -c %u "$destination")"
+    mode="$(stat -c %a "$destination")"
+    [ "$owner" = 0 ] || [ "$owner" = "$(id -u)" ] || fail "目标文件属主不可信：$destination"
+    [ "$((8#$mode & 0022))" = 0 ] || fail "目标文件允许其他身份写入：$destination"
     cmp -s "$source" "$destination" || fail "目标文件内容不同，拒绝覆盖：$destination"
   fi
+}
+
+install_new_file() {
+  local source="$1" destination="$2" mode="$3"
+  check_existing_file "$source" "$destination"
+  [ ! -e "$destination" ] || return 0
+  (
+    temporary="$(mktemp "$(dirname "$destination")/.tgm-file.XXXXXX")"
+    trap 'rm -f -- "$temporary"' EXIT
+    if [ "$MODE" = root ]; then
+      install -o root -g root -m "$mode" "$source" "$temporary"
+    else
+      install -m "$mode" "$source" "$temporary"
+    fi
+    if ! ln -T -- "$temporary" "$destination" 2>/dev/null; then
+      [ -e "$destination" ] || [ -L "$destination" ] || fail "工件无法落地：$destination"
+      check_existing_file "$source" "$destination"
+    fi
+  )
+  printf '已写入工件：%s\n' "$destination"
 }
 
 verify_archive_members() {
@@ -127,7 +191,136 @@ validate_binary() {
   [ -x "$binary" ] || fail "发布包中的 tgm 不可执行"
   local preflight="$package_root/scripts/native-release-preflight.sh"
   [ -x "$preflight" ] || fail '发布包缺少 native-release-preflight.sh'
-  "$preflight" --binary "$binary" --unit-dir "$package_root/deploy/systemd"
+  local arguments=(--binary "$binary" --unit-dir "$package_root/deploy/systemd")
+  [ "$APP_SERVICES" = 0 ] || arguments+=(--app-services)
+  "$preflight" "${arguments[@]}"
+}
+
+check_installed_app_compatibility() {
+  local package_root="$1" installed_unit unit APP_SERVICES=1
+  if [ "$MODE" = root ]; then
+    installed_unit=/etc/systemd/system/tgm-app@.service
+    unit="$package_root/deploy/systemd/app/tgm-app@.service"
+  else
+    installed_unit="$HOME/.config/systemd/user/tgm-app@.service"
+    unit="$package_root/deploy/systemd/app/user/tgm-app@.service"
+  fi
+  if [ -e "$installed_unit" ] || [ -L "$installed_unit" ]; then
+    validate_binary "$package_root/bin/tgm" "$package_root"
+    check_existing_file "$unit" "$installed_unit"
+  fi
+}
+
+check_app_account() {
+  local account="$1" entry group_entry account_uid account_gid account_home account_shell group_gid group_members password other other_uid other_gid accounts groups
+  accounts="$(getent passwd)" || fail '无法枚举本机账号，拒绝安装应用服务'
+  groups="$(getent group)" || fail '无法枚举本机组，拒绝安装应用服务'
+  if entry="$(getent passwd "$account")"; then
+    IFS=: read -r _ _ account_uid account_gid _ account_home account_shell <<< "$entry"
+    group_entry="$(getent group "$account")" || fail "服务用户缺少同名组：$account"
+    IFS=: read -r _ _ group_gid group_members <<< "$group_entry"
+    [ "$account_uid" -ne 0 ] && [ "$group_gid" -ne 0 ] && [ "$account_gid" = "$group_gid" ] || fail "服务账号身份不符合专用非 root 要求：$account"
+    [ "$account_home" = "/nonexistent/$account" ] || fail "服务账号 HOME 不符合隔离要求：$account"
+    [ ! -e "$account_home" ] && [ ! -L "$account_home" ] || fail "服务账号 HOME 必须不存在：$account"
+    case "$account_shell" in /sbin/nologin|/usr/sbin/nologin) ;; *) fail "服务账号允许登录：$account" ;; esac
+    [ "$(id -G "$account")" = "$account_gid" ] || fail "服务账号有额外组权限：$account"
+    [ -z "$group_members" ] || [ "$group_members" = "$account" ] || fail "服务组包含其他成员：$account"
+    entry="$(getent shadow "$account")" || fail "无法检查服务账号密码锁定状态：$account"
+    IFS=: read -r _ password _ <<< "$entry"
+    case "$password" in '!'*|'*'*) ;; *) fail "服务账号密码未锁定：$account" ;; esac
+    while IFS=: read -r other _ other_uid other_gid _; do
+      [ "$other" = "$account" ] || { [ "$other_uid" != "$account_uid" ] && [ "$other_gid" != "$account_gid" ]; } || \
+        fail "服务账号 UID 或主组与其他身份共享：$account"
+    done <<< "$accounts"
+    while IFS=: read -r other _ other_gid _; do
+      [ "$other" = "$account" ] || [ "$other_gid" != "$account_gid" ] || \
+        fail "服务组 GID 与其他组共享：$account"
+    done <<< "$groups"
+  elif group_entry="$(getent group "$account")"; then
+    IFS=: read -r _ _ group_gid group_members <<< "$group_entry"
+    [ -z "$group_members" ] || fail "既有服务组包含其他成员：$account"
+    [ "$group_gid" -ne 0 ] || fail "服务组不得使用 root 组：$account"
+    while IFS=: read -r other _ _ other_gid _; do
+      [ "$other_gid" != "$group_gid" ] || fail "既有服务组被其他账号用作主组：$account"
+    done <<< "$accounts"
+    while IFS=: read -r other _ other_gid _; do
+      [ "$other" = "$account" ] || [ "$other_gid" != "$group_gid" ] || \
+        fail "既有服务组 GID 与其他组共享：$account"
+    done <<< "$groups"
+  fi
+}
+
+check_app_services() {
+  local extracted="$1" role account passwd_entry account_home
+  [ -f "$extracted/deploy/systemd/app/tgm-app@.service" ] || fail '发布包缺少应用服务模板'
+  [ -f "$extracted/deploy/systemd/app/user/tgm-app@.service" ] || fail '发布包缺少用户级应用服务模板'
+  for role in "${APP_ROLES[@]}"; do
+    [ -f "$extracted/deploy/systemd/app/$role.env.example" ] || fail "发布包缺少角色配置示例：$role"
+  done
+  if [ "$MODE" = root ]; then
+    check_directory_path /etc/tgm/app
+    check_directory_path /etc/systemd/system
+    require_command getent
+    require_command groupadd
+    require_command useradd
+    require_command nologin
+    check_existing_file "$extracted/deploy/systemd/app/tgm-app@.service" /etc/systemd/system/tgm-app@.service
+    for role in "${APP_ROLES[@]}"; do
+      check_app_account "tgm-$role"
+      check_existing_file "$extracted/deploy/systemd/app/$role.env.example" "/etc/tgm/app/$role.env.example"
+    done
+  else
+    [ "$ACCEPT_SAME_UID" = 1 ] || fail 'user 应用服务不隔离角色凭据；须显式传入 --accept-same-uid'
+    require_command systemctl
+    require_command getent
+    passwd_entry="$(getent passwd "$(id -u)")" || fail '无法确定用户级服务的 HOME'
+    IFS=: read -r _ _ _ _ _ account_home _ <<< "$passwd_entry"
+    [ "$HOME" = "$account_home" ] || fail '用户级 unit 的 %h 与 HOME 不一致，拒绝安装'
+    check_directory_path "$HOME/.config/tgm/app"
+    check_directory_path "$HOME/.config/systemd/user"
+    systemctl --user show-environment >/dev/null 2>&1 || fail '用户级 systemd manager 不可用；可只安装二进制，或选 root 系统级安装'
+    check_existing_file "$extracted/deploy/systemd/app/user/tgm-app@.service" "$HOME/.config/systemd/user/tgm-app@.service"
+    for role in "${APP_ROLES[@]}"; do
+      check_existing_file "$extracted/deploy/systemd/app/$role.env.example" "$HOME/.config/tgm/app/$role.env.example"
+    done
+  fi
+}
+
+install_app_services() {
+  local release_root="$1" role account destination
+  if [ "$MODE" = root ]; then
+    for role in "${APP_ROLES[@]}"; do
+      account="tgm-$role"
+      if ! getent group "$account" >/dev/null; then
+        groupadd --system "$account"
+        printf '已创建服务组：%s\n' "$account"
+      fi
+      if ! getent passwd "$account" >/dev/null; then
+        useradd --system --gid "$account" \
+          --home-dir "/nonexistent/$account" --shell "$(command -v nologin)" --no-create-home "$account"
+        printf '已创建服务账号：%s\n' "$account"
+      fi
+      check_app_account "$account"
+    done
+    prepare_directory /etc/tgm/app 0755
+    destination=/etc/systemd/system/tgm-app@.service
+    install_new_file "$release_root/deploy/systemd/app/tgm-app@.service" "$destination" 0644
+    for role in "${APP_ROLES[@]}"; do
+      destination="/etc/tgm/app/$role.env.example"
+      install_new_file "$release_root/deploy/systemd/app/$role.env.example" "$destination" 0644
+    done
+  else
+    prepare_directory "$HOME/.config/tgm/app" 0700
+    prepare_directory "$HOME/.config/systemd/user" 0755
+    destination="$HOME/.config/systemd/user/tgm-app@.service"
+    install_new_file "$release_root/deploy/systemd/app/user/tgm-app@.service" "$destination" 0644
+    for role in "${APP_ROLES[@]}"; do
+      destination="$HOME/.config/tgm/app/$role.env.example"
+      install_new_file "$release_root/deploy/systemd/app/$role.env.example" "$destination" 0600
+    done
+    printf '用户级服务同 UID 运行，不提供角色间凭据隔离；未设置 linger，退出登录后的持续运行须另行确认。\n'
+  fi
+  printf '已安装六角色应用模板和示例；未创建实际环境文件，未 daemon-reload，未启动或启用服务。\n'
 }
 
 install_root() {
@@ -135,18 +328,25 @@ install_root() {
   local version="$2"
   [ "$(id -u)" -eq 0 ] || fail "--root 必须由 root 执行"
   local release_root="/opt/tgm/releases/$version"
-  [ ! -e "$release_root" ] || fail "目标版本目录已存在：$release_root"
+  check_directory_path /opt/tgm/releases
+  check_directory_path /usr/local/bin
+  check_directory_path /etc/systemd/system
+  check_directory_path /etc/tgm
+  [ ! -e "$release_root" ] && [ ! -L "$release_root" ] || fail "目标版本目录已存在：$release_root"
   reject_non_symlink_target /usr/local/bin/tgm
-  while IFS= read -r unit; do
-    check_existing_file "$unit" "/etc/systemd/system/$(basename "$unit")"
-  done < <(find "$extracted/deploy/systemd" -maxdepth 1 -type f \( -name '*.service' -o -name '*.timer' \) -print | sort)
-  while IFS= read -r example; do
-    destination="/etc/tgm/$(basename "$example")"
-    [ ! -L "$destination" ] || fail "环境示例目标是符号链接，拒绝安装：$destination"
-    [ ! -e "$destination" ] || [ -f "$destination" ] || \
-      fail "环境示例目标不是普通文件，拒绝安装：$destination"
-  done < <(find "$extracted/deploy/systemd" -maxdepth 1 -type f -name '*.env.example' -print | sort)
-  install -d -o root -g root -m 0755 /opt/tgm/releases
+  [ "$APP_SERVICES" = 0 ] || check_app_services "$extracted"
+  if [ "$APP_SERVICES" = 0 ]; then
+    while IFS= read -r unit; do
+      check_existing_file "$unit" "/etc/systemd/system/$(basename "$unit")"
+    done < <(find "$extracted/deploy/systemd" -maxdepth 1 -type f \( -name '*.service' -o -name '*.timer' \) -print | sort)
+    while IFS= read -r example; do
+      destination="/etc/tgm/$(basename "$example")"
+      [ ! -L "$destination" ] || fail "环境示例目标是符号链接，拒绝安装：$destination"
+      [ ! -e "$destination" ] || [ -f "$destination" ] || \
+        fail "环境示例目标不是普通文件，拒绝安装：$destination"
+    done < <(find "$extracted/deploy/systemd" -maxdepth 1 -type f -name '*.env.example' -print | sort)
+  fi
+  prepare_directory /opt/tgm/releases 0755
   (
     local stage="/opt/tgm/releases/.${version}.stage.$$"
     trap 'rm -rf -- "$stage"' EXIT
@@ -158,21 +358,26 @@ install_root() {
       ! -path "$stage/scripts/native-release-preflight.sh" -exec chmod 0644 {} +
     find "$stage" -type d -exec chmod 0755 {} +
     ln -s bin/tgm "$stage/tgm"
-    mv "$stage" "$release_root"
+    mv -T -n "$stage" "$release_root"
+    [ ! -e "$stage" ] || fail "版本目录在安装期间被创建，拒绝覆盖：$release_root"
     trap - EXIT
   )
+  printf '已创建版本目录：%s\n' "$release_root"
 
-  install -d -o root -g root -m 0755 /etc/systemd/system /etc/tgm /usr/local/bin
-  find "$release_root/deploy/systemd" -maxdepth 1 -type f \( -name '*.service' -o -name '*.timer' \) \
-    | while IFS= read -r unit; do
-        destination="/etc/systemd/system/$(basename "$unit")"
-        [ -e "$destination" ] || install -o root -g root -m 0644 "$unit" "$destination"
-      done
-  find "$release_root/deploy/systemd" -maxdepth 1 -type f -name '*.env.example' \
-    | while IFS= read -r example; do
-        destination="/etc/tgm/$(basename "$example")"
-        [ -e "$destination" ] || install -o root -g root -m 0644 "$example" "$destination"
-      done
+  prepare_directory /etc/systemd/system 0755
+  prepare_directory /etc/tgm 0755
+  prepare_directory /usr/local/bin 0755
+  if [ "$APP_SERVICES" = 0 ]; then
+    while IFS= read -r unit; do
+      destination="/etc/systemd/system/$(basename "$unit")"
+      install_new_file "$unit" "$destination" 0644
+    done < <(find "$release_root/deploy/systemd" -maxdepth 1 -type f \( -name '*.service' -o -name '*.timer' \) -print)
+    while IFS= read -r example; do
+      destination="/etc/tgm/$(basename "$example")"
+      install_new_file "$example" "$destination" 0644
+    done < <(find "$release_root/deploy/systemd" -maxdepth 1 -type f -name '*.env.example' -print)
+  fi
+  [ "$APP_SERVICES" = 0 ] || install_app_services "$release_root"
   atomic_symlink "$release_root/tgm" /usr/local/bin/tgm
   printf 'root 安装完成：%s\n' "$release_root"
   printf '未执行迁移、未启动服务、未启用 timer。\n'
@@ -183,9 +388,12 @@ install_user() {
   local version="$2"
   [ "$(id -u)" -ne 0 ] || fail "--user 不接受 root 执行，请使用实际非 root 用户"
   local release_root="$HOME/.local/opt/tgm/releases/$version"
-  [ ! -e "$release_root" ] || fail "目标版本目录已存在：$release_root"
+  check_directory_path "$HOME/.local/opt/tgm/releases"
+  check_directory_path "$HOME/.local/bin"
+  [ ! -e "$release_root" ] && [ ! -L "$release_root" ] || fail "目标版本目录已存在：$release_root"
   reject_non_symlink_target "$HOME/.local/bin/tgm"
-  mkdir -p "$HOME/.local/opt/tgm/releases"
+  [ "$APP_SERVICES" = 0 ] || check_app_services "$extracted"
+  prepare_directory "$HOME/.local/opt/tgm/releases" 0755
   (
     local stage="$HOME/.local/opt/tgm/releases/.${version}.stage.$$"
     trap 'rm -rf -- "$stage"' EXIT
@@ -193,29 +401,35 @@ install_user() {
     cp -a "$extracted/." "$stage/"
     chmod 0755 "$stage/bin/tgm" "$stage/scripts/install-native.sh" "$stage/scripts/native-release-preflight.sh"
     ln -s bin/tgm "$stage/tgm"
-    mv "$stage" "$release_root"
+    mv -T -n "$stage" "$release_root"
+    [ ! -e "$stage" ] || fail "版本目录在安装期间被创建，拒绝覆盖：$release_root"
     trap - EXIT
   )
-  mkdir -p "$HOME/.local/bin"
+  printf '已创建版本目录：%s\n' "$release_root"
+  prepare_directory "$HOME/.local/bin" 0755
+  [ "$APP_SERVICES" = 0 ] || install_app_services "$release_root"
   atomic_symlink "$release_root/tgm" "$HOME/.local/bin/tgm"
   printf 'user 安装完成：%s\n' "$release_root"
-  printf '未安装 systemd unit，未改变系统服务状态。\n'
+  printf '未改变系统服务状态。\n'
 }
 
 rollback() {
   local version="$1"
   validate_version "$version"
+  local release_root link
   if [ "$MODE" = root ]; then
     [ "$(id -u)" -eq 0 ] || fail "--root 必须由 root 执行"
-    local release="/opt/tgm/releases/$version/tgm"
-    [ -x "$release" ] || fail "root 版本不存在：$release"
-    atomic_symlink "$release" /usr/local/bin/tgm
+    release_root="/opt/tgm/releases/$version"
+    link=/usr/local/bin/tgm
   else
     [ "$(id -u)" -ne 0 ] || fail "--user 不接受 root 执行"
-    local release="$HOME/.local/opt/tgm/releases/$version/tgm"
-    [ -x "$release" ] || fail "user 版本不存在：$release"
-    atomic_symlink "$release" "$HOME/.local/bin/tgm"
+    release_root="$HOME/.local/opt/tgm/releases/$version"
+    link="$HOME/.local/bin/tgm"
   fi
+  check_directory_path "$release_root"
+  [ -x "$release_root/tgm" ] || fail "版本不存在：$release_root"
+  check_installed_app_compatibility "$release_root"
+  atomic_symlink "$release_root/tgm" "$link"
   printf '已切换到版本：%s\n' "$version"
   printf '数据库迁移不会被回滚。\n'
 }
@@ -228,13 +442,17 @@ while [ "$#" -gt 0 ]; do
     --checksums) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; CHECKSUMS="$2"; shift 2 ;;
     --bundle) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; BUNDLE="$2"; shift 2 ;;
     --rollback) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; ROLLBACK="$2"; shift 2 ;;
+    --app-services) APP_SERVICES=1; shift ;;
+    --accept-same-uid) ACCEPT_SAME_UID=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
 done
 
 [ -n "$MODE" ] || { usage >&2; exit 2; }
+[ "$ACCEPT_SAME_UID" = 0 ] || { [ "$MODE" = user ] && [ "$APP_SERVICES" = 1 ]; } || fail '--accept-same-uid 仅用于 user 应用服务安装'
 if [ -n "$ROLLBACK" ]; then
+  [ "$APP_SERVICES" = 0 ] || fail '回滚只切换已安装的二进制，不安装应用 unit'
   [ -z "$ARCHIVE" ] && [ -z "$CHECKSUMS" ] && [ -z "$BUNDLE" ] || fail '回滚不能与发布包参数同时使用'
   rollback "$ROLLBACK"
   exit 0
@@ -263,6 +481,7 @@ archive_name="$(basename "$ARCHIVE")"
 [ "$archive_name" = "tgm-${version}-linux-x86_64-gnu.tar.gz" ] || \
   fail "归档文件名与 VERSION 不一致：$archive_name / $version"
 validate_binary "$package_root/bin/tgm" "$package_root"
+check_installed_app_compatibility "$package_root"
 if [ "$MODE" = root ]; then
   install_root "$package_root" "$version"
 else

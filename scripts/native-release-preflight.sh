@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 用法：
-  scripts/native-release-preflight.sh --binary <tgm> --unit-dir <deploy/systemd>
+  scripts/native-release-preflight.sh --binary <tgm> --unit-dir <deploy/systemd> [--app-services]
 
 只做本地/目标机预检，不启动服务、不执行迁移、不连接数据库。
 EOF
@@ -21,6 +21,7 @@ require_command() {
 
 BINARY=""
 UNIT_DIR=""
+APP_SERVICES=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --binary)
@@ -36,6 +37,10 @@ while [ "$#" -gt 0 ]; do
     --help|-h)
       usage
       exit 0
+      ;;
+    --app-services)
+      APP_SERVICES=1
+      shift
       ;;
     *)
       usage >&2
@@ -54,6 +59,7 @@ UNIT_DIR="$(cd "$UNIT_DIR" && pwd -P)"
 require_command ldd
 require_command openssl
 require_command systemd-analyze
+systemd-analyze --version
 
 ldd_output="$(ldd "$BINARY" 2>&1)" || fail "ldd 无法解析二进制"
 printf '%s\n' "$ldd_output"
@@ -72,6 +78,27 @@ printf '目标机 OpenSSL：%s\n' "$openssl_version"
 
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/tgm-native-unit-check.XXXXXX")"
 trap 'rm -rf -- "$temporary"' EXIT
+if [ "$APP_SERVICES" = 1 ]; then
+  for unit in "$UNIT_DIR/app/tgm-app@.service" "$UNIT_DIR/app/user/tgm-app@.service"; do
+    [ -f "$unit" ] || fail "缺少应用服务模板：$unit"
+    if ! systemd-analyze verify "$unit" >"$temporary/verify.log" 2>&1; then
+      cat "$temporary/verify.log" >&2
+      fail '应用服务 unit 解析失败'
+    fi
+    cat "$temporary/verify.log"
+    if grep -F 'tgm-app@' "$temporary/verify.log" | grep -Ei 'unknown (lvalue|key|section)|failed to parse|not supported|unsupported' >/dev/null; then
+      fail 'systemd 不支持应用 unit 中的配置；拒绝静默降级'
+    fi
+  done
+  for role in control-plane bot-gateway mtproto-worker fanout rule delivery; do
+    [ -f "$UNIT_DIR/app/$role.env.example" ] || fail "缺少角色环境示例：$role"
+    help_output="$("$BINARY" serve --role "$role" --help)" || fail "角色 help 失败：$role"
+    printf '%s\n' "$help_output" | grep -F -- '--env-file' >/dev/null || fail '二进制不支持原生环境文件'
+    printf '%s\n' "$help_output" | grep -F -- '--check-config' >/dev/null || fail '二进制不支持离线配置检查'
+  done
+  printf '原生应用服务预检通过：架构=x86_64 glibc=%s unit=pass help=pass；尚未启动服务或验证沙箱。\n' "$glibc_version"
+  exit 0
+fi
 unit_files=()
 while IFS= read -r unit; do
   rendered="$temporary/$(basename "$unit")"

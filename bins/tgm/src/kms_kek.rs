@@ -118,7 +118,7 @@ impl Kek for KmsKek {
     }
 }
 
-fn key_arn_parts(key_arn: &str) -> Option<(&str, &str)> {
+pub(super) fn key_arn_parts(key_arn: &str) -> Option<(&str, &str)> {
     let mut parts = key_arn.splitn(6, ':');
     let arn = parts.next()?;
     let partition = parts.next()?;
