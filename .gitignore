@@ -1,4 +1,5 @@
 /target
+scripts/__pycache__/
 **/*.rs.bk
 .env
 # AI 驱动循环的运行日志（提示词、执行器对话、卡口输出、PR 正文）——
