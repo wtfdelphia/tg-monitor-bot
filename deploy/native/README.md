@@ -2,6 +2,10 @@
 
 版本：`@VERSION@`
 
+发布通道：`@CHANNEL@`
+
+@STABILITY_NOTICE@
+
 来源提交：`@SOURCE_COMMIT@`
 
 目标：`@TARGET@`
@@ -27,6 +31,8 @@ SHA256SUMS
 SHA256SUMS.sigstore.json
 ```
 
+@CANDIDATE_DISTRIBUTION@
+
 目标机必须是 Linux x86-64，glibc 不低于 2.17。安装器要求本机已有 `cosign`、`tar`、
 `sha256sum`、`ldd`、`openssl` 和 `systemd-analyze`；它不会联网下载工具、依赖或脚本。签名验证失败、
 压缩包校验失败、包内校验失败、动态依赖不满足、unit/timer 预检失败或帮助命令失败时，
@@ -47,6 +53,8 @@ bash scripts/install-native.sh --root \
 
 安装完成后，人工执行 `systemctl daemon-reload`、备份恢复库迁移、`tgm audit-rls` 和
 目标机 unit 验收；确认批准前不要启用任何 timer。
+
+@CANDIDATE_INSTALL@
 
 ## 非 root 安装
 

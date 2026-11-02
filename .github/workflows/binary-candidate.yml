@@ -1,0 +1,496 @@
+name: Native binary candidate
+
+concurrency:
+  group: native-binary-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: 'true'
+  BUILDER_IMAGE: tgm-native-candidate-builder:${{ github.run_id }}-${{ github.run_attempt }}
+  COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+  COSIGN_CERTIFICATE_IDENTITY: https://github.com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-candidate.yml@refs/heads/dev
+
+jobs:
+  guard:
+    name: Require manual dispatch from dev
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Reject other event or ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          test "$EVENT_NAME" = workflow_dispatch && test "$REF" = refs/heads/dev || {
+            echo '候选包只能由 dev 分支上的 workflow_dispatch 生成。' >&2
+            exit 1
+          }
+
+  build:
+    name: Build non-stable CentOS 7 candidate
+    runs-on: ubuntu-latest
+    needs: guard
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      candidate_tag: ${{ steps.source.outputs.candidate_tag }}
+      candidate_version: ${{ steps.source.outputs.candidate_version }}
+      ci_run_id: ${{ steps.source.outputs.ci_run_id }}
+      builder_image_id: ${{ steps.build.outputs.builder_image_id }}
+    steps:
+      - name: Checkout exact dev commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Candidate packaging and install regression tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/check-native-services.py
+
+      - name: Validate source ancestry and successful CI run
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git fetch origin dev --no-tags
+          unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+          git merge-base --is-ancestor "$SOURCE_COMMIT" origin/dev || {
+            echo '源码提交不属于当前 dev 历史。' >&2
+            exit 1
+          }
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain)"
+          runs="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SOURCE_COMMIT&per_page=100")"
+          run="$(jq -c --arg commit "$SOURCE_COMMIT" '[.workflow_runs[] | select(.head_sha == $commit and .head_branch == "dev" and .event == "push")] | sort_by(.run_number) | last // empty' <<<"$runs")"
+          test -n "$run" || {
+            echo "提交 $SOURCE_COMMIT 没有 CI workflow run。" >&2
+            exit 1
+          }
+          run_id="$(jq -r '.id' <<<"$run")"
+          run_status="$(jq -r '.status' <<<"$run")"
+          conclusion="$(jq -r '.conclusion' <<<"$run")"
+          jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100")"
+          required_failures=()
+          required_statuses=()
+          for required in static database; do
+            status="$(jq -r --arg name "$required" '[.jobs[] | select(.name == $name) | "\(.status)/\(.conclusion // \"null\")"] | if length == 1 then .[0] else if length == 0 then "missing" else "duplicate" end end' <<<"$jobs")"
+            required_statuses+=("$required=$status")
+            if ! jq -e --arg name "$required" '([.jobs[] | select(.name == $name)] | length) == 1 and ([.jobs[] | select(.name == $name and .status == "completed" and .conclusion == "success")] | length) == 1' <<<"$jobs" >/dev/null; then
+              required_failures+=("$required=$status")
+            fi
+          done
+          if [ "${#required_failures[@]}" -gt 0 ]; then
+            printf 'CI run %s 的必需 job 未全部成功：%s\n' "$run_id" "${required_failures[*]}" >&2
+            exit 1
+          fi
+          if [ "$run_status" != completed ] || [ "$conclusion" != success ]; then
+            printf '提交 %s 的 CI run %s 状态/结论为 %s/%s；必需 job：%s\n' \
+              "$SOURCE_COMMIT" "$run_id" "$run_status" "$conclusion" "${required_statuses[*]}" >&2
+            exit 1
+          fi
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tgm") | .version')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          short_sha="${SOURCE_COMMIT:0:12}"
+          candidate_tag="candidate-${GITHUB_RUN_ID}-a${GITHUB_RUN_ATTEMPT}-${short_sha}"
+          candidate_version="${version}-candidate.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.${short_sha}"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$candidate_tag" >/dev/null 2>&1; then
+            echo "候选 tag 已存在：$candidate_tag" >&2
+            exit 1
+          fi
+          if gh release view "$candidate_tag" >/dev/null 2>&1; then
+            echo "候选 Release 已存在：$candidate_tag" >&2
+            exit 1
+          fi
+          printf 'candidate_tag=%s\ncandidate_version=%s\nci_run_id=%s\n' \
+            "$candidate_tag" "$candidate_version" "$run_id" >> "$GITHUB_OUTPUT"
+          printf '候选源提交：%s\n成功 CI run：%s\n候选标签：%s\n候选版本：%s\n' \
+            "$SOURCE_COMMIT" "$run_id" "$candidate_tag" "$candidate_version"
+
+      - name: Build CentOS 7 builder
+        run: docker build --pull=false -f deploy/native/centos7-builder.Dockerfile -t "$BUILDER_IMAGE" .
+
+      - name: Extract and validate binary
+        id: build
+        run: |
+          set -euo pipefail
+          container="$(docker create "$BUILDER_IMAGE")"
+          trap 'docker rm "$container" >/dev/null' EXIT
+          mkdir -p dist
+          docker cp "$container:/src/target/release/tgm" dist/tgm
+          docker image inspect --format '{{.Id}}' "$BUILDER_IMAGE" > dist/builder-image.id
+          echo "builder_image_id=$(cat dist/builder-image.id)" >> "$GITHUB_OUTPUT"
+          chmod 0755 dist/tgm
+          python3 - <<'PY'
+          import re
+          import subprocess
+
+          output = subprocess.check_output(['readelf', '--version-info', 'dist/tgm'], text=True)
+          versions = []
+          for value in re.findall(r'GLIBC_([0-9]+(?:\.[0-9]+)*)', output):
+              parts = tuple(map(int, value.split('.')))
+              versions.append(parts + (0,) * (3 - len(parts)))
+          if max(versions, default=(0, 0, 0)) > (2, 17, 0):
+              raise SystemExit('候选二进制包含高于 glibc 2.17 的符号。')
+          PY
+          ldd dist/tgm
+          ./dist/tgm --help >/dev/null
+          ./dist/tgm purge-deleted-tenants --help >/dev/null
+          scripts/native-release-preflight.sh --binary dist/tgm --unit-dir deploy/systemd
+          scripts/native-release-preflight.sh --binary dist/tgm --unit-dir deploy/systemd --app-services
+
+      - name: Generate source SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: dist/sbom.cdx.json
+          upload-artifact: false
+
+      - name: Package candidate
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          CANDIDATE_TAG: ${{ steps.source.outputs.candidate_tag }}
+          CANDIDATE_VERSION: ${{ steps.source.outputs.candidate_version }}
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tgm") | .version')"
+          epoch="$(git show -s --format=%ct "$SOURCE_COMMIT")"
+          python3 scripts/native-release-package.py \
+            --binary dist/tgm \
+            --sbom dist/sbom.cdx.json \
+            --version "$version" \
+            --channel candidate \
+            --candidate-run-id "$GITHUB_RUN_ID" \
+            --candidate-attempt "$GITHUB_RUN_ATTEMPT" \
+            --candidate-ci-run-id "${{ steps.source.outputs.ci_run_id }}" \
+            --candidate-run-url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --source-commit "$SOURCE_COMMIT" \
+            --rust-toolchain "$(rustup show active-toolchain | awk '{print $1}')" \
+            --builder-image "$(cat dist/builder-image.id)" \
+            --source-date-epoch "$epoch" \
+            --output dist/package
+          test "$(basename "$(find dist/package -maxdepth 1 -name 'tgm-*.tar.gz' -print -quit)")" = \
+            "tgm-${CANDIDATE_VERSION}-linux-x86_64-gnu.tar.gz"
+      - name: Upload unsigned candidate build
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgm-candidate-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/package/**
+            dist/sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Cleanup candidate builder
+        if: always()
+        run: |
+          containers="$(docker ps -aq --filter "ancestor=$BUILDER_IMAGE")"
+          if [ -n "$containers" ]; then docker rm -f $containers; fi
+          docker image rm "$BUILDER_IMAGE" 2>/dev/null || true
+          rm -rf -- dist
+
+  sign:
+    name: Sign and verify candidate artifacts
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      actions: read
+      id-token: write
+    steps:
+      - name: Download candidate build
+        uses: actions/download-artifact@v4
+        with:
+          name: tgm-candidate-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Sign checksums and write provenance
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          CANDIDATE_TAG: ${{ needs.build.outputs.candidate_tag }}
+          CANDIDATE_VERSION: ${{ needs.build.outputs.candidate_version }}
+          CI_RUN_ID: ${{ needs.build.outputs.ci_run_id }}
+          BUILDER_IMAGE_ID: ${{ needs.build.outputs.builder_image_id }}
+        run: |
+          set -euo pipefail
+          archive="dist/package/tgm-${CANDIDATE_VERSION}-linux-x86_64-gnu.tar.gz"
+          test -f "$archive"
+          test -f dist/package/BUILDINFO.json
+          test -f dist/package/sbom.cdx.json
+          tar -xOf "$archive" ./BUILDINFO.json > dist/BUILDINFO.internal.json
+          tar -xOf "$archive" ./sbom.cdx.json > dist/sbom.internal.cdx.json
+          cmp dist/package/BUILDINFO.json dist/BUILDINFO.internal.json
+          cmp dist/sbom.cdx.json dist/sbom.internal.cdx.json
+          tar -xOf "$archive" ./BUILDINFO.json > dist/BUILDINFO.json
+          jq -e \
+            --arg version "$CANDIDATE_VERSION" \
+            --arg commit "$SOURCE_COMMIT" \
+            --arg tag "$CANDIDATE_TAG" \
+            --arg builder "$BUILDER_IMAGE_ID" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg ci "$CI_RUN_ID" \
+            '.channel == "candidate" and .stable == false and
+             .version == $version and .source_commit == $commit and
+             .release_tag == $tag and .builder_image == $builder and
+             .candidate_run_id == ($run | tonumber) and
+             .candidate_attempt == ($attempt | tonumber) and
+             .ci_run_id == ($ci | tonumber) and
+            .workflow_run_url == ("https://github.com/" + env.GITHUB_REPOSITORY + "/actions/runs/" + $run) and
+             .target == "x86_64-unknown-linux-gnu"' \
+            dist/BUILDINFO.json >/dev/null
+          archive_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+          cp dist/package/BUILDINFO.json dist/candidate-BUILDINFO.json
+          cp dist/package/sbom.cdx.json dist/candidate-sbom.cdx.json
+          buildinfo_sha256="$(sha256sum dist/candidate-BUILDINFO.json | awk '{print $1}')"
+          sbom_sha256="$(sha256sum dist/candidate-sbom.cdx.json | awk '{print $1}')"
+          printf '%s  %s\n%s  %s\n%s  %s\n' \
+            "$archive_sha256" "$(basename "$archive")" \
+            "$buildinfo_sha256" candidate-BUILDINFO.json \
+            "$sbom_sha256" candidate-sbom.cdx.json > dist/candidate-SHA256SUMS
+          cosign sign-blob --yes --bundle dist/candidate-SHA256SUMS.sigstore.json dist/candidate-SHA256SUMS
+          python3 - "$archive_sha256" > dist/provenance.json <<'PY'
+          import json
+          import os
+          import sys
+
+          archive_sha256 = sys.argv[1]
+          repository = os.environ['GITHUB_REPOSITORY']
+          run_id = int(os.environ['GITHUB_RUN_ID'])
+          attempt = int(os.environ['GITHUB_RUN_ATTEMPT'])
+          document = {
+              "_type": "https://in-toto.io/Statement/v1",
+              "subject": [{
+                  "name": f"tgm-{os.environ['CANDIDATE_VERSION']}-linux-x86_64-gnu.tar.gz",
+                  "digest": {"sha256": archive_sha256},
+              }],
+              "predicateType": "https://slsa.dev/provenance/v1",
+              "predicate": {
+                  "buildDefinition": {
+                      "buildType": f"https://github.com/{repository}/.github/workflows/binary-candidate.yml",
+                      "externalParameters": {
+                          "channel": "candidate",
+                          "candidate_tag": os.environ['CANDIDATE_TAG'],
+                          "candidate_version": os.environ['CANDIDATE_VERSION'],
+                          "candidate_run_id": str(run_id),
+                          "candidate_attempt": str(attempt),
+                          "ci_run_id": os.environ['CI_RUN_ID'],
+                          "target": "x86_64-unknown-linux-gnu",
+                          "builder_image": os.environ['BUILDER_IMAGE_ID'],
+                      },
+                      "resolvedDependencies": [{
+                          "uri": f"git+https://github.com/{repository}@refs/heads/dev",
+                          "digest": {"gitCommit": os.environ['SOURCE_COMMIT']},
+                      }],
+                  },
+                  "runDetails": {
+                      "builder": {"id": f"https://github.com/{repository}/actions/runs/{run_id}"},
+                      "metadata": {"invocationId": f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{attempt}"},
+                  },
+              },
+          }
+          json.dump(document, sys.stdout, ensure_ascii=False, indent=2)
+          sys.stdout.write("\n")
+          PY
+          cosign sign-blob --yes --bundle dist/provenance.sigstore.json dist/provenance.json
+          cosign verify-blob --offline \
+            --bundle dist/candidate-SHA256SUMS.sigstore.json \
+            --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+            --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+            dist/candidate-SHA256SUMS >/dev/null
+          cosign verify-blob --offline \
+            --bundle dist/provenance.sigstore.json \
+            --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+            --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+            dist/provenance.json >/dev/null
+          cp "$archive" "dist/$(basename "$archive")"
+          jq -e \
+            --arg archive "$(basename "$archive")" \
+            --arg digest "$archive_sha256" \
+            --arg commit "$SOURCE_COMMIT" \
+            --arg tag "$CANDIDATE_TAG" \
+            --arg version "$CANDIDATE_VERSION" \
+            --arg ci "$CI_RUN_ID" \
+            --arg builder "$BUILDER_IMAGE_ID" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            '.predicateType == "https://slsa.dev/provenance/v1" and
+             .subject == [{name: $archive, digest: {sha256: $digest}}] and
+             .predicate.buildDefinition.buildType == ("https://github.com/" + env.GITHUB_REPOSITORY + "/.github/workflows/binary-candidate.yml") and
+             .predicate.buildDefinition.externalParameters.channel == "candidate" and
+             .predicate.buildDefinition.externalParameters.candidate_tag == $tag and
+             .predicate.buildDefinition.externalParameters.candidate_version == $version and
+             (.predicate.buildDefinition.externalParameters.candidate_run_id | tostring) == $run and
+             (.predicate.buildDefinition.externalParameters.candidate_attempt | tostring) == $attempt and
+             (.predicate.buildDefinition.externalParameters.ci_run_id | tostring) == $ci and
+             .predicate.buildDefinition.externalParameters.builder_image == $builder and
+             .predicate.buildDefinition.resolvedDependencies == [{uri: ("git+https://github.com/" + env.GITHUB_REPOSITORY + "@refs/heads/dev"), digest: {gitCommit: $commit}}] and
+             .predicate.runDetails.builder.id == ("https://github.com/" + env.GITHUB_REPOSITORY + "/actions/runs/" + $run) and
+             .predicate.runDetails.metadata == {invocationId: ("https://github.com/" + env.GITHUB_REPOSITORY + "/actions/runs/" + $run + "/attempts/" + $attempt)}' \
+            dist/provenance.json >/dev/null
+          mv dist/provenance.json dist/candidate-provenance.json
+          mv dist/provenance.sigstore.json dist/candidate-provenance.sigstore.json
+
+      - name: Upload signed candidate assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgm-candidate-signed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/tgm-*.tar.gz
+            dist/candidate-SHA256SUMS
+            dist/candidate-SHA256SUMS.sigstore.json
+            dist/candidate-provenance.json
+            dist/candidate-provenance.sigstore.json
+            dist/candidate-sbom.cdx.json
+            dist/candidate-BUILDINFO.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Cleanup signed candidate assets
+        if: always()
+        run: rm -rf -- dist
+
+  publish:
+    name: Create non-overwriting GitHub Pre-release
+    runs-on: ubuntu-latest
+    needs: [build, sign]
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout verifier at exact source commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download signed candidate assets
+        uses: actions/download-artifact@v4
+        with:
+          name: tgm-candidate-signed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Check signed release asset set
+        env:
+          CANDIDATE_TAG: ${{ needs.build.outputs.candidate_tag }}
+          CANDIDATE_VERSION: ${{ needs.build.outputs.candidate_version }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          archive="dist/tgm-${CANDIDATE_VERSION}-linux-x86_64-gnu.tar.gz"
+          expected_assets=(
+            "$(basename "$archive")"
+            candidate-SHA256SUMS
+            candidate-SHA256SUMS.sigstore.json
+            candidate-provenance.json
+            candidate-provenance.sigstore.json
+            candidate-sbom.cdx.json
+            candidate-BUILDINFO.json
+          )
+          mapfile -t expected_assets < <(printf '%s\n' "${expected_assets[@]}" | sort)
+          mapfile -t actual_assets < <(find dist -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          test "${actual_assets[*]}" = "${expected_assets[*]}" || {
+            printf 'Release 资产集合不匹配。实际：%s\n预期：%s\n' \
+              "${actual_assets[*]}" "${expected_assets[*]}" >&2
+            exit 1
+          }
+          tar -xOf "$archive" ./BUILDINFO.json | cmp - dist/candidate-BUILDINFO.json
+          tar -xOf "$archive" ./sbom.cdx.json | cmp - dist/candidate-sbom.cdx.json
+          (cd dist && sha256sum -c candidate-SHA256SUMS)
+          mkdir -p dist/verify
+          tar -xOf "$archive" ./BUILDINFO.json > dist/verify/BUILDINFO.json
+          tar -xOf "$archive" ./sbom.cdx.json > dist/verify/sbom.cdx.json
+          python3 scripts/verify-native-candidate.py \
+            --archive "$archive" \
+            --checksums dist/candidate-SHA256SUMS \
+            --checksum-bundle dist/candidate-SHA256SUMS.sigstore.json \
+            --provenance dist/candidate-provenance.json \
+            --provenance-bundle dist/candidate-provenance.sigstore.json \
+            --buildinfo dist/candidate-BUILDINFO.json \
+            --sbom dist/candidate-sbom.cdx.json \
+            --package-buildinfo dist/verify/BUILDINFO.json \
+            --package-sbom dist/verify/sbom.cdx.json \
+            --version "$CANDIDATE_VERSION"
+
+      - name: Create immutable GitHub Pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          CANDIDATE_TAG: ${{ needs.build.outputs.candidate_tag }}
+          CANDIDATE_VERSION: ${{ needs.build.outputs.candidate_version }}
+          CI_RUN_ID: ${{ needs.build.outputs.ci_run_id }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$CANDIDATE_TAG" >/dev/null 2>&1; then
+            echo "候选 tag 已存在，拒绝覆盖：$CANDIDATE_TAG" >&2
+            exit 1
+          fi
+          if gh release view "$CANDIDATE_TAG" >/dev/null 2>&1; then
+            echo "候选 Release 已存在，拒绝覆盖：$CANDIDATE_TAG" >&2
+            exit 1
+          fi
+          assets=(dist/tgm-*.tar.gz dist/candidate-SHA256SUMS dist/candidate-SHA256SUMS.sigstore.json dist/candidate-provenance.json dist/candidate-provenance.sigstore.json dist/candidate-sbom.cdx.json dist/candidate-BUILDINFO.json)
+          cat > dist/release-notes.md <<EOF
+          **CANDIDATE / NOT STABLE**
+
+          仅供隔离的非生产验收，不是稳定版，不得用于生产。
+
+          源码提交：$SOURCE_COMMIT
+          成功 CI run：$CI_RUN_ID
+          构建 run：https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID（attempt $GITHUB_RUN_ATTEMPT）
+          候选版本：$CANDIDATE_VERSION
+
+          验证签名、provenance 和 SHA-256 后再执行验收。
+          EOF
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f "ref=refs/tags/$CANDIDATE_TAG" -f "sha=$SOURCE_COMMIT" >/dev/null
+          tag_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$CANDIDATE_TAG")"
+          jq -e --arg commit "$SOURCE_COMMIT" \
+            '.object.type == "commit" and .object.sha == $commit' \
+            <<<"$tag_ref" >/dev/null || {
+            echo "候选 tag 没有指向源提交：$(jq -r '.object.sha // "missing"' <<<"$tag_ref") != $SOURCE_COMMIT" >&2
+            exit 1
+          }
+          gh release create "$CANDIDATE_TAG" \
+            --prerelease \
+            --verify-tag \
+            --title "CANDIDATE / NOT STABLE: $CANDIDATE_VERSION" \
+            --notes-file dist/release-notes.md \
+            "${assets[@]}"
+          release="$(gh release view "$CANDIDATE_TAG" --json isPrerelease,tagName)"
+          jq -e --arg tag "$CANDIDATE_TAG" \
+            '.isPrerelease == true and .tagName == $tag' \
+            <<<"$release" >/dev/null || { echo 'GitHub Release 元数据与候选源不匹配。' >&2; exit 1; }
+          final_tag_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$CANDIDATE_TAG")"
+          jq -e --arg commit "$SOURCE_COMMIT" \
+            '.object.type == "commit" and .object.sha == $commit' \
+            <<<"$final_tag_ref" >/dev/null || {
+            echo '候选 Release 创建后 tag 不再指向源提交。' >&2
+            exit 1
+          }
+
+      - name: Cleanup downloaded candidate assets
+        if: always()
+        run: rm -rf -- dist

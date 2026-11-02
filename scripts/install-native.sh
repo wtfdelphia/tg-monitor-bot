@@ -9,6 +9,12 @@ BUNDLE=""
 ROLLBACK=""
 APP_SERVICES=0
 ACCEPT_SAME_UID=0
+CANDIDATE=0
+ACCEPT_CANDIDATE=0
+PROVENANCE=""
+PROVENANCE_BUNDLE=""
+RELEASE_BUILDINFO=""
+RELEASE_SBOM=""
 APP_ROLES=(control-plane bot-gateway mtproto-worker fanout rule delivery)
 IDENTITY_REGEXP="${COSIGN_CERTIFICATE_IDENTITY_REGEXP:-https://github\\.com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-release\\.yml@refs/(tags/v[0-9]+\\.[0-9]+\\.[0-9]+|heads/main)}"
 OIDC_ISSUER="${COSIGN_CERTIFICATE_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
@@ -18,8 +24,11 @@ usage() {
 用法：
   scripts/install-native.sh --root [--app-services] --archive <包.tar.gz> --checksums <SHA256SUMS> --bundle <SHA256SUMS.sigstore.json>
   scripts/install-native.sh --user [--app-services --accept-same-uid] --archive <包.tar.gz> --checksums <SHA256SUMS> --bundle <SHA256SUMS.sigstore.json>
+  scripts/install-native.sh --user --candidate --accept-candidate --archive <包.tar.gz> --checksums <SHA256SUMS> --bundle <签名 bundle> --provenance <provenance.json> --provenance-bundle <provenance 签名 bundle> --buildinfo <BUILDINFO.json> --sbom <sbom.cdx.json>
   scripts/install-native.sh --root --rollback <版本>
   scripts/install-native.sh --user --rollback <版本>
+
+候选包必须显式使用 --candidate --accept-candidate，并提供签名来源证明；候选包不代表稳定版。
 
 安装器只做签名、校验、复制和帮助命令检查，不执行迁移、不启动服务、不启用 timer。
 --app-services 只安装应用 unit，不安装 cleanup unit；user 模式须接受同 UID 下没有角色凭据隔离。
@@ -162,6 +171,15 @@ verify_outer_checksum() {
 verify_signature() {
   local checksums="$1"
   local bundle="$2"
+  if [ "$CANDIDATE" = 1 ]; then
+    cosign verify-blob \
+      --offline \
+      --bundle "$bundle" \
+      --certificate-identity 'https://github.com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-candidate.yml@refs/heads/dev' \
+      --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+      "$checksums" >/dev/null || fail "候选 SHA256SUMS 的 cosign 身份验证失败"
+    return
+  fi
   cosign verify-blob \
     --offline \
     --bundle "$bundle" \
@@ -172,8 +190,13 @@ verify_signature() {
 
 validate_version() {
   local version="$1"
-  printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || \
-    fail "VERSION 文件必须是 MAJOR.MINOR.PATCH"
+  if [ "$CANDIDATE" = 1 ]; then
+    printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-candidate\.[1-9][0-9]*\.[1-9][0-9]*\.[0-9a-f]{12}$' || \
+      fail '候选 VERSION 格式无效'
+  else
+    printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || \
+      fail 'VERSION 文件必须是 MAJOR.MINOR.PATCH；候选包需显式指定 --candidate'
+  fi
 }
 
 read_version() {
@@ -413,6 +436,30 @@ install_user() {
   printf '未改变系统服务状态。\n'
 }
 
+install_candidate() {
+  local extracted="$1"
+  local version="$2"
+  [ "$(id -u)" -ne 0 ] || fail '候选包不接受 root 执行'
+  local candidate_root="$HOME/.local/opt/tgm/candidates/$version"
+  check_directory_path "$HOME/.local/opt/tgm/candidates"
+  [ ! -e "$candidate_root" ] && [ ! -L "$candidate_root" ] || fail "候选目录已存在：$candidate_root"
+  prepare_directory "$HOME/.local/opt/tgm/candidates" 0755
+  (
+    local stage
+    stage="$(mktemp -d "$HOME/.local/opt/tgm/candidates/.${version}.stage.XXXXXX")"
+    trap 'rm -rf -- "$stage"' EXIT
+    cp -a "$extracted/." "$stage/"
+    chmod 0755 "$stage/bin/tgm" "$stage/scripts/install-native.sh" \
+      "$stage/scripts/native-release-preflight.sh" "$stage/scripts/verify-native-candidate.py"
+    mv -T -n "$stage" "$candidate_root"
+    [ ! -e "$stage" ] || fail "候选目录在安装期间被创建，拒绝覆盖：$candidate_root"
+    trap - EXIT
+  )
+  printf '已隔离安装候选包：%s\n' "$candidate_root"
+  printf '未切换 ~/.local/bin/tgm，未安装或改变 systemd unit。\n'
+  printf '验收二进制：%s/bin/tgm\n' "$candidate_root"
+}
+
 rollback() {
   local version="$1"
   validate_version "$version"
@@ -441,7 +488,13 @@ while [ "$#" -gt 0 ]; do
     --archive) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; ARCHIVE="$2"; shift 2 ;;
     --checksums) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; CHECKSUMS="$2"; shift 2 ;;
     --bundle) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; BUNDLE="$2"; shift 2 ;;
+    --provenance) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; PROVENANCE="$2"; shift 2 ;;
+    --provenance-bundle) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; PROVENANCE_BUNDLE="$2"; shift 2 ;;
+    --buildinfo) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; RELEASE_BUILDINFO="$2"; shift 2 ;;
+    --sbom) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; RELEASE_SBOM="$2"; shift 2 ;;
     --rollback) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; ROLLBACK="$2"; shift 2 ;;
+    --candidate) CANDIDATE=1; shift ;;
+    --accept-candidate) ACCEPT_CANDIDATE=1; shift ;;
     --app-services) APP_SERVICES=1; shift ;;
     --accept-same-uid) ACCEPT_SAME_UID=1; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -450,21 +503,47 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$MODE" ] || { usage >&2; exit 2; }
+[ "$ACCEPT_CANDIDATE" = 0 ] || [ "$CANDIDATE" = 1 ] || fail '--accept-candidate 需要 --candidate'
+[ "$CANDIDATE" = 0 ] || [ "$ACCEPT_CANDIDATE" = 1 ] || fail '验收候选包必须显式指定 --accept-candidate'
+if [ "$CANDIDATE" = 1 ]; then
+  [ "$MODE" = user ] || fail '候选包只允许安装到非 root 用户目录'
+  [ "$APP_SERVICES" = 0 ] || fail '候选包不安装 systemd unit'
+fi
 [ "$ACCEPT_SAME_UID" = 0 ] || { [ "$MODE" = user ] && [ "$APP_SERVICES" = 1 ]; } || fail '--accept-same-uid 仅用于 user 应用服务安装'
 if [ -n "$ROLLBACK" ]; then
   [ "$APP_SERVICES" = 0 ] || fail '回滚只切换已安装的二进制，不安装应用 unit'
-  [ -z "$ARCHIVE" ] && [ -z "$CHECKSUMS" ] && [ -z "$BUNDLE" ] || fail '回滚不能与发布包参数同时使用'
+  [ -z "$ARCHIVE" ] && [ -z "$CHECKSUMS" ] && [ -z "$BUNDLE" ] && \
+    [ -z "$PROVENANCE" ] && [ -z "$PROVENANCE_BUNDLE" ] && \
+    [ -z "$RELEASE_BUILDINFO" ] && [ -z "$RELEASE_SBOM" ] || fail '回滚不能与发布包参数同时使用'
+  [ "$CANDIDATE" = 0 ] && [ -z "$PROVENANCE" ] && [ -z "$PROVENANCE_BUNDLE" ] && \
+    [ -z "$RELEASE_BUILDINFO" ] && [ -z "$RELEASE_SBOM" ] || fail '回滚不能使用候选验证参数'
   rollback "$ROLLBACK"
   exit 0
 fi
 
 [ -n "$ARCHIVE" ] && [ -n "$CHECKSUMS" ] && [ -n "$BUNDLE" ] || { usage >&2; exit 2; }
+if [ "$CANDIDATE" = 1 ]; then
+  [ -n "$PROVENANCE" ] && [ -n "$PROVENANCE_BUNDLE" ] && \
+    [ -n "$RELEASE_BUILDINFO" ] && [ -n "$RELEASE_SBOM" ] || \
+    fail '候选包必须提供 provenance、BUILDINFO、SBOM 与对应签名材料'
+  [ "$MODE" = user ] || fail '候选包只允许安装到非 root 用户目录'
+  [ "$APP_SERVICES" = 0 ] || fail '候选包不安装 systemd unit'
+else
+  [ -z "$PROVENANCE" ] && [ -z "$PROVENANCE_BUNDLE" ] && \
+    [ -z "$RELEASE_BUILDINFO" ] && [ -z "$RELEASE_SBOM" ] || \
+    fail '稳定包不能携带候选来源参数'
+fi
 require_command tar
 require_command sha256sum
 require_command cosign
+[ "$CANDIDATE" = 0 ] || require_command python3
 [ -f "$ARCHIVE" ] || fail "发布包不存在：$ARCHIVE"
 [ -f "$CHECKSUMS" ] || fail "SHA256SUMS 不存在：$CHECKSUMS"
 [ -f "$BUNDLE" ] || fail "签名 bundle 不存在：$BUNDLE"
+[ "$CANDIDATE" = 0 ] || [ -f "$PROVENANCE" ] || fail "provenance 不存在：$PROVENANCE"
+[ "$CANDIDATE" = 0 ] || [ -f "$PROVENANCE_BUNDLE" ] || fail "provenance 签名 bundle 不存在：$PROVENANCE_BUNDLE"
+[ "$CANDIDATE" = 0 ] || [ -f "$RELEASE_BUILDINFO" ] || fail "候选 BUILDINFO 不存在：$RELEASE_BUILDINFO"
+[ "$CANDIDATE" = 0 ] || [ -f "$RELEASE_SBOM" ] || fail "候选 SBOM 不存在：$RELEASE_SBOM"
 verify_outer_checksum "$ARCHIVE" "$CHECKSUMS"
 verify_signature "$CHECKSUMS" "$BUNDLE"
 verify_archive_members "$ARCHIVE"
@@ -480,6 +559,22 @@ version="$(read_version "$package_root/VERSION")"
 archive_name="$(basename "$ARCHIVE")"
 [ "$archive_name" = "tgm-${version}-linux-x86_64-gnu.tar.gz" ] || \
   fail "归档文件名与 VERSION 不一致：$archive_name / $version"
+if [ "$CANDIDATE" = 1 ]; then
+  [ -f "$package_root/BUILDINFO.json" ] || fail '候选包缺少 BUILDINFO.json'
+  python3 "$package_root/scripts/verify-native-candidate.py" \
+    --archive "$ARCHIVE" --checksums "$CHECKSUMS" --checksum-bundle "$BUNDLE" \
+    --provenance "$PROVENANCE" --provenance-bundle "$PROVENANCE_BUNDLE" \
+    --buildinfo "$RELEASE_BUILDINFO" --sbom "$RELEASE_SBOM" \
+    --package-buildinfo "$package_root/BUILDINFO.json" \
+    --package-sbom "$package_root/sbom.cdx.json" --version "$version"
+else
+  [ -f "$package_root/BUILDINFO.json" ] || fail '发布包缺少 BUILDINFO.json'
+fi
+if [ "$CANDIDATE" = 1 ]; then
+  validate_binary "$package_root/bin/tgm" "$package_root"
+  install_candidate "$package_root" "$version"
+  exit 0
+fi
 validate_binary "$package_root/bin/tgm" "$package_root"
 check_installed_app_compatibility "$package_root"
 if [ "$MODE" = root ]; then
