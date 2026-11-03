@@ -90,7 +90,7 @@ jobs:
           required_failures=()
           required_statuses=()
           for required in static database; do
-            status="$(jq -r --arg name "$required" '[.jobs[] | select(.name == $name) | "\(.status)/\(.conclusion // \"null\")"] | if length == 1 then .[0] else if length == 0 then "missing" else "duplicate" end end' <<<"$jobs")"
+            status="$(jq -r --arg name "$required" '[.jobs[] | select(.name == $name) | (.status + "/" + (.conclusion // "null"))] | if length == 1 then .[0] elif length == 0 then "missing" else "duplicate" end' <<<"$jobs")"
             required_statuses+=("$required=$status")
             if ! jq -e --arg name "$required" '([.jobs[] | select(.name == $name)] | length) == 1 and ([.jobs[] | select(.name == $name and .status == "completed" and .conclusion == "success")] | length) == 1' <<<"$jobs" >/dev/null; then
               required_failures+=("$required=$status")
