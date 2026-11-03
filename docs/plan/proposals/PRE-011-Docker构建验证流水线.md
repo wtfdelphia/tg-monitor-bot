@@ -45,10 +45,9 @@ Docker-only WP-8 目标机验收已证明锁定镜像可完成隔离迁移、RLS
 - 不修改 `.github/workflows/ci.yml`、`.github/workflows/docker-publish.yml`，不改变现有
   workflow 的触发器、权限、标签、发布目标或 BuildKit 发布配置。
 
-GitHub 对 `pull_request` 使用 PR merge ref 运行检查，但不能依赖新增 workflow 的同一个 PR
-触发该 workflow。先将实现合入 `dev`，再由后续另一个以 `dev` 为 base 的 PR 触发并记录实际
-run；若当时没有其他待合并 PR，使用仅补验收证据的后续 PR 触发。`workflow_dispatch` 要求
-workflow 文件已在默认分支 `main`，本提案不将它作为入口，也不为此向 `main` 推送。
+GitHub 对 `pull_request` 在 PR merge ref 上运行 workflow；实现 PR 自身可触发新增验证入口，
+不要求该文件先进入默认分支。`workflow_dispatch` 则要求 workflow 文件已在默认分支 `main`，
+本提案不将它作为入口，也不为此向 `main` 推送。
 
 ### 2. 构建后非生产检查
 
@@ -77,8 +76,7 @@ GitHub-hosted runner 的 Docker daemon、Compose 与隔离 PostgreSQL 属于 CI 
 
 ## 三、验收判据
 
-1. workflow 合入 `dev` 后，由另一个以 `dev` 为 base 的 PR 实际触发；实现 PR 自身不作为唯一
-   触发证据。
+1. 新增 workflow 由以 `dev` 为 base 的实现 PR 实际触发，并完成 GitHub-hosted runner 验收。
 2. 构建步骤在 GitHub-hosted `ubuntu-24.04` runner 上完成；构建日志证明 `push: false`，没有
    registry login、GHCR tag 推送或 `packages: write` 权限。
 3. 镜像运行用户和运行时内容检查通过；合成 PostgreSQL 环境中的迁移、`audit-rls` 与租户清理反证
@@ -101,8 +99,8 @@ GitHub-hosted runner 的 Docker daemon、Compose 与隔离 PostgreSQL 属于 CI 
 
 1. 以最新远端 `dev` 为基线复核 PRE-006、PRE-010 与 Docker-only 脚本。
 2. 新增独立只读、无推送 workflow，确认 PR merge ref、Docker 构建与资源清理边界。
-3. 用 `actionlint` 和适用静态检查核验 workflow；合入 `dev` 后，通过后续以 `dev` 为 base 的 PR
-   确认 GitHub job 实际触发并通过。
+3. 用 `actionlint` 和适用静态检查核验 workflow；通过以 `dev` 为 base 的实现 PR 确认 GitHub job
+   实际触发并通过。
 4. 归档脱敏 run 链接、构建 SHA、Docker-only 检查摘要和资源清理结果；保持 `main` 与 GHCR 未变。
 5. PRE-011 验收完成后，再继续独立的 CentOS 7 候选二进制目标机验收；WP-8 的产品/法务输入、
    跨副本留存与生产运维验收仍按各自证据台账推进。
