@@ -1,0 +1,72 @@
+name: Docker build validation
+
+on:
+  pull_request:
+    branches: [dev]
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-build-validation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-accept:
+    name: Build and run non-production acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      IMAGE: tgm-pre011-validation:${{ github.run_id }}-${{ github.run_attempt }}
+      PROJECT: tgm-pre011-${{ github.run_id }}-${{ github.run_attempt }}
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
+    steps:
+      - name: Checkout pull request merge ref
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image without publishing
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}
+
+      - name: Check runtime image
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Config.User}}' "$IMAGE")" = '10001:10001'
+          if docker image inspect --format '{{json .Config.Env}}' "$IMAGE" | grep -q 'SQLX_OFFLINE'; then
+            echo 'Runtime image unexpectedly contains SQLX_OFFLINE.' >&2
+            exit 1
+          fi
+          docker run --rm --network none --entrypoint /bin/sh "$IMAGE" -ec \
+            'test "$(id -u)" = 10001 && test ! -e /src && test ! -e /root/.cargo && test ! -e /.env'
+
+      - name: Run Docker-only synthetic acceptance
+        run: |
+          TGM_ACCEPTANCE_ROOT="$GITHUB_WORKSPACE" \
+            scripts/wp8-docker-acceptance.sh --image "$IMAGE" --project-name "$PROJECT"
+
+      - name: Remove this run's Docker resources
+        if: always()
+        run: |
+          set -euo pipefail
+          docker ps --all --quiet --filter "label=com.docker.compose.project=$PROJECT" \
+            | xargs --no-run-if-empty docker rm --force
+          docker network ls --quiet --filter "label=com.docker.compose.project=$PROJECT" \
+            | xargs --no-run-if-empty docker network rm
+          docker volume ls --quiet --filter "label=com.docker.compose.project=$PROJECT" \
+            | xargs --no-run-if-empty docker volume rm
+          if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+            docker image rm "$IMAGE"
+          fi
