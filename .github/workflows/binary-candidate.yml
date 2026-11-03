@@ -19,7 +19,7 @@ env:
 jobs:
   guard:
     name: Require manual dispatch from dev
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions: {}
     steps:
       - name: Reject other event or ref
@@ -35,7 +35,7 @@ jobs:
 
   build:
     name: Build non-stable CentOS 7 candidate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: guard
     permissions:
       contents: read
@@ -189,7 +189,7 @@ jobs:
           test "$(basename "$(find dist/package -maxdepth 1 -name 'tgm-*.tar.gz' -print -quit)")" = \
             "tgm-${CANDIDATE_VERSION}-linux-x86_64-gnu.tar.gz"
       - name: Upload unsigned candidate build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: tgm-candidate-build-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -208,14 +208,14 @@ jobs:
 
   sign:
     name: Sign and verify candidate artifacts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build
     permissions:
       actions: read
       id-token: write
     steps:
       - name: Download candidate build
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: tgm-candidate-build-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist
@@ -351,7 +351,7 @@ jobs:
           mv dist/provenance.sigstore.json dist/candidate-provenance.sigstore.json
 
       - name: Upload signed candidate assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: tgm-candidate-signed-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -371,7 +371,7 @@ jobs:
 
   publish:
     name: Create non-overwriting GitHub Pre-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [build, sign]
     permissions:
       contents: write
@@ -384,7 +384,7 @@ jobs:
           persist-credentials: false
 
       - name: Download signed candidate assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: tgm-candidate-signed-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist
