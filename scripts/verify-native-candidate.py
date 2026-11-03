@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Verify candidate release metadata and its signed SLSA provenance."""
 
-from __future__ import annotations
-
 import argparse
 import hashlib
 import json

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export LC_ALL=C
 
 usage() {
   cat <<'EOF'
@@ -17,6 +18,26 @@ fail() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "缺少命令：$1"
+}
+
+verify_units() {
+  local unit name status=0
+  : >"$temporary/unit-names"
+  for unit in "$@"; do
+    name="$(basename "$unit")"
+    printf '%s\n' "${name/@.service/@}" >>"$temporary/unit-names"
+    if grep -Eq '^[[:space:]]*RestrictAddressFamilies[[:space:]]*=[[:space:]]*[^[:space:]#;]' "$unit"; then
+      printf '%s\n' "$systemd_version" | grep -Eq '(^|[[:space:]])\+SECCOMP([[:space:]]|$)' || \
+        fail 'unit 要求 RestrictAddressFamilies，但目标 systemd 未声明 +SECCOMP；拒绝忽略地址族限制'
+    fi
+  done
+  systemd-analyze verify "$@" >"$temporary/verify.log" 2>&1 || status=$?
+  cat "$temporary/verify.log"
+  [ "$status" = 0 ] || fail 'systemd unit/timer 解析失败'
+  if grep -F -f "$temporary/unit-names" "$temporary/verify.log" | \
+      grep -Ei 'unknown|unrecognized|failed to (parse|set|resolve)|not supported|unsupported|ignor(ed|ing)|invalid|disabled at compile time|has no (value|timer)|lacks.*(value|setting)' >/dev/null; then
+    fail 'systemd 忽略或不支持本任务 unit/timer 的配置；拒绝静默降级'
+  fi
 }
 
 BINARY=""
@@ -59,7 +80,13 @@ UNIT_DIR="$(cd "$UNIT_DIR" && pwd -P)"
 require_command ldd
 require_command openssl
 require_command systemd-analyze
-systemd-analyze --version
+systemd_version="$(systemd-analyze --version)" || fail '无法读取 systemd 构建能力'
+printf '%s\n' "$systemd_version"
+if command -v rpm >/dev/null 2>&1; then
+  if systemd_package="$(rpm -q systemd 2>/dev/null)"; then
+    printf 'systemd RPM：%s\n' "$systemd_package"
+  fi
+fi
 
 ldd_output="$(ldd "$BINARY" 2>&1)" || fail "ldd 无法解析二进制"
 printf '%s\n' "$ldd_output"
@@ -81,14 +108,7 @@ trap 'rm -rf -- "$temporary"' EXIT
 if [ "$APP_SERVICES" = 1 ]; then
   for unit in "$UNIT_DIR/app/tgm-app@.service" "$UNIT_DIR/app/user/tgm-app@.service"; do
     [ -f "$unit" ] || fail "缺少应用服务模板：$unit"
-    if ! systemd-analyze verify "$unit" >"$temporary/verify.log" 2>&1; then
-      cat "$temporary/verify.log" >&2
-      fail '应用服务 unit 解析失败'
-    fi
-    cat "$temporary/verify.log"
-    if grep -F 'tgm-app@' "$temporary/verify.log" | grep -Ei 'unknown (lvalue|key|section)|failed to parse|not supported|unsupported' >/dev/null; then
-      fail 'systemd 不支持应用 unit 中的配置；拒绝静默降级'
-    fi
+    verify_units "$unit"
   done
   for role in control-plane bot-gateway mtproto-worker fanout rule delivery; do
     [ -f "$UNIT_DIR/app/$role.env.example" ] || fail "缺少角色环境示例：$role"
@@ -114,12 +134,31 @@ while IFS= read -r unit; do
 done < <(find "$UNIT_DIR" -maxdepth 1 -type f \( -name '*.service' -o -name '*.timer' \) -print | sort)
 [ "${#unit_files[@]}" -gt 0 ] || fail "没有找到 systemd service/timer 工件"
 
-systemd-analyze verify "${unit_files[@]}"
+verify_units "${unit_files[@]}"
+systemd-analyze --help >"$temporary/analyze-help" || fail '无法读取 systemd-analyze 命令能力'
+has_calendar=0
+if grep -Eq '^[[:space:]]+calendar([[:space:]]|$)' "$temporary/analyze-help"; then
+  has_calendar=1
+fi
+timer_count=0
 while IFS= read -r timer; do
-  calendar="$(awk -F= '$1 == "OnCalendar" { print substr($0, index($0, "=") + 1); exit }' "$timer")"
-  [ -n "$calendar" ] || fail "timer 缺少 OnCalendar：$(basename "$timer")"
-  systemd-analyze calendar "$calendar" >/dev/null
+  timer_count=$((timer_count + 1))
+  mapfile -t calendars < <(awk '
+    /^[[:space:]]*\[/ { in_timer = ($0 ~ /^[[:space:]]*\[Timer\][[:space:]]*$/) }
+    in_timer && /^[[:space:]]*OnCalendar[[:space:]]*=/ { print substr($0, index($0, "=") + 1) }
+  ' "$timer")
+  [ "${#calendars[@]}" -gt 0 ] || fail "timer 缺少 OnCalendar：$(basename "$timer")"
+  for calendar in "${calendars[@]}"; do
+    [ -n "${calendar//[[:space:]]/}" ] || fail "timer 的 OnCalendar 为空：$(basename "$timer")"
+    if [ "$has_calendar" = 1 ]; then
+      systemd-analyze calendar "$calendar" >/dev/null || fail "timer 日历解析失败：$(basename "$timer")"
+    fi
+  done
 done < <(find "$UNIT_DIR" -maxdepth 1 -type f -name '*.timer' -print | sort)
+[ "$timer_count" -gt 0 ] || fail '没有找到 cleanup timer 工件'
+if [ "$has_calendar" = 0 ]; then
+  printf '目标 systemd-analyze 无 calendar 子命令；timer 已由本机 verify 解析并核对诊断。\n'
+fi
 
 "$BINARY" --help >/dev/null
 "$BINARY" purge-deleted-tenants --help >/dev/null
