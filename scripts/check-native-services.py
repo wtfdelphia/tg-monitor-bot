@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -337,6 +338,48 @@ exec {real_ln} "$@"''')
                 self.provenance.write_text(json.dumps(provenance), encoding="utf-8")
                 self.assert_rejected(self.install_candidate())
 
+    def test_candidate_verifier_with_selected_python(self) -> None:
+        version = "0.1.0-candidate.12346.1.abcdef012345"
+        self.archive, self.checksums, self.bundle = self.make_archive(version)
+        command = [
+            os.environ.get("TGM_NATIVE_CANDIDATE_PYTHON", sys.executable), "-B",
+            str(ROOT / "scripts/verify-native-candidate.py"),
+            "--archive", str(self.archive), "--checksums", str(self.checksums),
+            "--checksum-bundle", str(self.bundle), "--provenance", str(self.provenance),
+            "--provenance-bundle", str(self.provenance_bundle),
+            "--buildinfo", str(self.base / "candidate-BUILDINFO.json"),
+            "--sbom", str(self.base / "candidate-sbom.cdx.json"),
+            "--package-buildinfo", str(self.fixture / "BUILDINFO.json"),
+            "--package-sbom", str(self.fixture / "sbom.cdx.json"), "--version", version,
+        ]
+
+        def verify(**environment: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(command, cwd=self.base, env=self.environment | environment,
+                                  text=True, capture_output=True, timeout=30)
+
+        self.assert_success(verify())
+        calls = self.calls.read_text(encoding="utf-8")
+        self.assertEqual(calls.count("cosign verify-blob --offline"), 2)
+        self.assertEqual(calls.count("--certificate-identity https://github.com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-candidate.yml@refs/heads/dev"), 2)
+        self.assertEqual(calls.count("--certificate-oidc-issuer https://token.actions.githubusercontent.com"), 2)
+        self.assertNotEqual(verify(SIGNATURE_STATUS="1").returncode, 0)
+        original = self.provenance.read_bytes()
+        for mutate in (
+            lambda value: value["predicate"]["buildDefinition"]["resolvedDependencies"][0]["digest"].update(gitCommit="f" * 40),
+            lambda value: value["predicate"]["buildDefinition"]["externalParameters"].update(candidate_attempt="2"),
+            lambda value: value["predicate"]["buildDefinition"].update(buildType="https://example.invalid/other-workflow"),
+            lambda value: value["subject"][0]["digest"].update(sha256="0" * 64),
+        ):
+            with self.subTest(mutation=mutate):
+                provenance = json.loads(original)
+                mutate(provenance)
+                self.provenance.write_text(json.dumps(provenance), encoding="utf-8")
+                self.assertNotEqual(verify().returncode, 0)
+        self.provenance.write_bytes(original)
+        with self.archive.open("ab") as stream:
+            stream.write(b"tampered archive")
+        self.assertNotEqual(verify().returncode, 0)
+
     def test_candidate_install_rejects_extra_outer_checksum_entries(self) -> None:
         version = "0.1.0-candidate.12347.1.abcdef012345"
         self.archive, self.checksums, self.bundle = self.make_archive(version)
@@ -493,16 +536,119 @@ exec {real_ln} "$@"''')
         self.assertNotIn("channel", buildinfo)
         self.assertNotIn("stable", buildinfo)
 
-    def test_preflight_rejects_unsupported_directives_even_when_verify_returns_zero(self) -> None:
+    def prepare_preflight(self) -> None:
         self.stub("ldd", 'if [ "$1" = --version ]; then echo "ldd (GNU libc) 2.17"; else echo "libc.so.6 => /lib64/libc.so.6"; fi')
         self.stub("openssl", "echo 'OpenSSL 1.0.2k'")
-        self.stub("systemd-analyze", 'if [ "$1" = --version ]; then echo "systemd 219"; elif [ "$1" = verify ]; then printf "%s\\n" "${VERIFY_WARNING:-}" >&2; else exit 99; fi')
-        for warning, expected in (("", 0), ("tgm-app@.service: Unknown lvalue 'Broken' in section 'Service'", 1), ("tgm-app@.service: Failed to parse", 1), ("snapd.service: Unknown key name 'RestartMode'", 0)):
-            result = subprocess.run([
-                "bash", str(ROOT / "scripts/native-release-preflight.sh"), "--app-services",
-                "--binary", str(self.fixture / "bin/tgm"), "--unit-dir", str(ROOT / "deploy/systemd"),
-            ], env=self.environment | {"VERIFY_WARNING": warning}, text=True, capture_output=True, timeout=20)
-            self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        self.stub("systemd-analyze", '''printf 'analyze %s\\n' "$*" >> "$CALLS"
+case "$1" in
+ --version) printf 'systemd 219\\n%s\\n' "${SYSTEMD_FEATURES-+SECCOMP}";;
+ --help) printf '  verify FILE...\\n'; [ "${HAS_CALENDAR:-1}" = 0 ] || printf '  calendar SPEC...\\n';;
+ verify) printf '%s\\n' "${VERIFY_WARNING:-}" >&2; exit "${VERIFY_STATUS:-0}";;
+ calendar) [ "${HAS_CALENDAR:-1}" = 1 ] || exit 99; exit "${CALENDAR_STATUS:-0}";;
+ *) exit 99;;
+esac''')
+
+    def preflight(self, app: bool = False, **environment: str) -> subprocess.CompletedProcess[str]:
+        command = ["bash", str(ROOT / "scripts/native-release-preflight.sh"),
+                   "--binary", str(self.fixture / "bin/tgm"),
+                   "--unit-dir", str(self.fixture / "deploy/systemd")]
+        if app:
+            command.append("--app-services")
+        return subprocess.run(command, env=self.environment | environment,
+                              text=True, capture_output=True, timeout=20)
+
+    def test_preflight_rejects_unsupported_directives_even_when_verify_returns_zero(self) -> None:
+        self.prepare_preflight()
+        for app, unit in ((True, "tgm-app@.service"), (False, "tgm-tenant-cleanup@.service")):
+            for warning, expected in (
+                ("", 0),
+                (f"{unit}: Unknown lvalue 'Broken' in section 'Service'", 1),
+                (f"{unit}: Failed to parse", 1),
+                (f"{unit}: Failed to parse protect system value, ignoring: strict", 1),
+                (f"{unit}: Support for option RestrictAddressFamilies= has been disabled at compile time and it is ignored", 1),
+                (f"{unit}: Setting unsupported on this platform", 1),
+                ("snapd.service: Unknown key name 'RestartMode'", 0),
+            ):
+                with self.subTest(app=app, warning=warning):
+                    result = self.preflight(app, VERIFY_WARNING=warning)
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_preflight_checks_seccomp_features_for_both_unit_paths(self) -> None:
+        self.prepare_preflight()
+        for app in (False, True):
+            for features in ("-SECCOMP", "", "+SECCOMP_OTHER"):
+                with self.subTest(app=app, features=features):
+                    result = self.preflight(app, SYSTEMD_FEATURES=features)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("RestrictAddressFamilies", result.stderr)
+            self.assert_success(self.preflight(app, SYSTEMD_FEATURES="+PAM +SECCOMP +AUDIT"))
+
+    def test_preflight_calendar_capability_and_parser_errors(self) -> None:
+        self.prepare_preflight()
+        self.assert_success(self.preflight(HAS_CALENDAR="0"))
+        self.assertNotIn("analyze calendar", self.calls.read_text(encoding="utf-8"))
+        self.assertIn("analyze verify", self.calls.read_text(encoding="utf-8"))
+        self.assert_success(self.preflight())
+        self.assertIn("analyze calendar daily", self.calls.read_text(encoding="utf-8"))
+        self.assertNotEqual(self.preflight(CALENDAR_STATUS="1").returncode, 0)
+        self.assertNotEqual(self.preflight(HAS_CALENDAR="0", VERIFY_STATUS="1").returncode, 0)
+        for warning in (
+            "tgm-tenant-purge.timer: Failed to parse calendar specification, ignoring: broken",
+            "tgm-tenant-purge.timer: Unknown key name 'OnCalendarTypo'",
+            "tgm-tenant-purge.timer lacks value setting. Refusing.",
+            "tgm-tenant-purge.timer: Timer has no value setting. Refusing.",
+        ):
+            with self.subTest(warning=warning):
+                self.assertNotEqual(self.preflight(HAS_CALENDAR="0", VERIFY_WARNING=warning).returncode, 0)
+
+    def test_preflight_rejects_empty_and_missing_calendar_even_with_successful_verify(self) -> None:
+        self.prepare_preflight()
+        timer = self.fixture / "deploy/systemd/tgm-tenant-purge.timer"
+        original = timer.read_text(encoding="utf-8")
+        for replacement in ("OnCalendar=", "OnCalendar=   ", "OnCalendar=daily\nOnCalendar=", "OnBootSec=1h"):
+            with self.subTest(replacement=replacement):
+                timer.write_text(original.replace("OnCalendar=daily", replacement), encoding="utf-8")
+                self.assertNotEqual(self.preflight(HAS_CALENDAR="0").returncode, 0)
+        for timer in (self.fixture / "deploy/systemd").glob("*.timer"):
+            timer.unlink()
+        self.assertNotEqual(self.preflight(HAS_CALENDAR="0").returncode, 0)
+
+    def test_preflight_failure_keeps_candidate_uninstalled(self) -> None:
+        self.prepare_preflight()
+        shutil.copyfile(ROOT / "scripts/native-release-preflight.sh", self.fixture / "scripts/native-release-preflight.sh")
+        self.archive, self.checksums, self.bundle = self.make_archive("0.1.0-candidate.12346.1.abcdef012345")
+        for environment in (
+            {"SYSTEMD_FEATURES": "-SECCOMP"},
+            {"VERIFY_WARNING": "tgm-tenant-purge.service: Failed to parse protect system value, ignoring: strict"},
+        ):
+            with self.subTest(environment=environment):
+                self.assert_rejected(self.install_candidate(**environment))
+                self.assertFalse((self.home / ".local/opt/tgm/candidates").exists())
+                self.assertFalse(any(self.fake_root.rglob("*.service")))
+                self.assertNotIn("systemctl ", self.calls.read_text(encoding="utf-8"))
+
+    def test_preflight_runs_real_systemd_parser_for_timers(self) -> None:
+        self.prepare_preflight()
+        systemd_analyze = shutil.which("systemd-analyze")
+        if systemd_analyze is None:
+            self.skipTest("host systemd-analyze unavailable")
+        self.stub("systemd-analyze", f'''if [ "$1" = --help ] && [ "${{HAS_CALENDAR:-1}}" = 0 ]; then
+ printf '  verify FILE...\\n'
+else
+ exec "{systemd_analyze}" "$@"
+fi''')
+        units = self.fixture / "deploy/systemd"
+        for unit in units.glob("*.service"):
+            contents = unit.read_text(encoding="utf-8")
+            contents = contents.replace("/usr/local/bin/tgm", str(self.fixture / "bin/tgm"))
+            unit.write_text(contents, encoding="utf-8")
+        self.assert_success(self.preflight())
+        self.assert_success(self.preflight(HAS_CALENDAR="0"))
+        timer = units / "tgm-tenant-purge.timer"
+        original = timer.read_text(encoding="utf-8")
+        timer.write_text(original.replace("OnCalendar=daily", "OnCalendar=not-a-valid-calendar"), encoding="utf-8")
+        self.assertNotEqual(self.preflight().returncode, 0)
+        self.assertNotEqual(self.preflight(HAS_CALENDAR="0").returncode, 0)
 
 
 if __name__ == "__main__":

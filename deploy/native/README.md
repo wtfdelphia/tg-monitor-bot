@@ -38,6 +38,19 @@ SHA256SUMS.sigstore.json
 压缩包校验失败、包内校验失败、动态依赖不满足、unit/timer 预检失败或帮助命令失败时，
 安装器拒绝切换当前版本。
 
+候选来源验证需要 Python 3.6 或更高版本；安装验证器不要求替换系统 Python，构建和 CI
+仍使用各自既有工具链。glibc 兼容只证明二进制 ABI 的最低要求，不证明宿主 systemd 的
+指令与安全能力满足部署要求。
+
+预检输出 systemd 版本及编译特征，RPM 环境还输出 systemd 包版本。现有 unit 包含
+`RestrictAddressFamilies`，因此要求 systemd 明确声明 `+SECCOMP`；`-SECCOMP` 或能力
+信息缺失时拒绝。cleanup 的 `ProtectSystem=strict` 等配置如果被目标解析器忽略，即使
+`verify` 返回零也拒绝。不会自动删掉配置或把 `strict` 改成 `full` 来继续安装。
+
+支持 `systemd-analyze calendar` 时保留独立日历检查；不支持时由本机 `verify` 解析
+timer，并核对解析诊断。缺少或为空的 `OnCalendar`、非法日历、未知或忽略的本任务
+unit/timer 配置都会失败。上述检查不安装或启用任何服务，也不代替目标机实际沙箱验证。
+
 ## root 安装
 
 root 模式安装到 `/opt/tgm/releases/@VERSION@`，并原子更新 `/usr/local/bin/tgm`。它还会
@@ -189,7 +202,7 @@ systemctl --user stop tgm-app@rule.service
 系统模板使用 `ProtectSystem=full`、`ProtectHome`、私有临时目录/设备及无 capabilities，
 用户模板不伪装具有相同的 namespace 隔离。unit 以 systemd 219 语法为兼容目标；目标
 CentOS 7 仍需采集实际 systemd 版本并验证解析、账号、沙箱、六角色启动/停止、限速和日志。
-`verify` 对应用模板的未知/不支持指令即使返回零也拒绝；其他宿主 unit 的警告保留显示，
+`verify` 对 cleanup 和应用模板的未知/不支持/忽略配置即使返回零也拒绝；其他宿主 unit 的警告保留显示，
 不冒充本模板错误。应用模式不运行 cleanup timer 的 `calendar` 检查，不能据此宣称旧
 systemd 已验收 cleanup 调度。开发机通过和 glibc 兼容构建都不能替代目标机运行证据。
 
