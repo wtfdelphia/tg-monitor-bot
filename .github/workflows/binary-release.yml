@@ -30,7 +30,7 @@ env:
 jobs:
   release:
     name: Build and publish CentOS 7 compatible binary
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Resolve release tag
         id: tag

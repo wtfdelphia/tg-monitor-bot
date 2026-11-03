@@ -17,29 +17,13 @@ env:
   # 写两遍就会有对不上的那天，而 clippy 的 lint 集合随版本变动（见该文件注释）。
   RUSTFLAGS: -D warnings
 
-# ── 两条 runner 侧告警的处置（2026-09-23 首跑后）──────────────────────
-#
-# ① Node.js 20 deprecated（actions/checkout@v4 target node20）
-#    已修：checkout 升到 v7。checkout 从 v5 起就是 node24
-#    （v5=单纯切 node24、v6=凭据改存独立文件、v7=ESM + 拦 fork PR 的
-#    pull_request_target/workflow_run 检出）。本仓库只用默认检出，
-#    无 submodule、无自定义 token，三个版本行为一致，所以取当前线 v7。
-#    Swatinem/rust-cache@v2 不用动 —— 那个浮动标签已经指向 node24 的
-#    2.9.2（实测 action.yml 里 using: "node24"），所以告警没点它。
-#
-# ② ubuntu-latest 将于 2026-10-19 起迁到 Ubuntu 26
-#    **这不是能「修掉」的告警，是预告**，故意不钉死 ubuntu-24.04：
-#    钉版本只是把「迁移那天出问题」换成「某天没人记得升」，而后者更安静。
-#    真正受影响的是下面装 postgresql-client-17 那步（它用
-#    $(lsb_release -cs)-pgdg 拼源）。已查：Ubuntu 26.04 代号 resolute，
-#    pgdg 已有 resolute-pgdg，且含 client-15/16/17/18 —— 那条源不会断。
-#    风险落在硬编码的 /usr/lib/postgresql/17/bin：若镜像自带 18，
-#    /usr/bin/pg_dump 会指向 18，但我们显式前置 17 的路径，仍然对。
-#    **兜底是那句版本断言**：它不对就红在装机那一步，而不是红在 R7。
+# GitHub-hosted runner 固定到 Ubuntu 24.04，避免 ubuntu-latest 在迁移期间
+# 分配不同镜像。升级 runner 前须验证 PostgreSQL client、Docker 与发布构建。
+# JavaScript Actions 使用 Node.js 24 runtime；cargo-deny 版本与配置由卡口固定。
 jobs:
   # ── 不连库的五条（eng/04 §四 前五条）────────────────────────────────
   static:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: 装工具链（components 来自 rust-toolchain.toml）
@@ -62,7 +46,7 @@ jobs:
 
       - name: cargo deny
         run: |
-          cargo install cargo-deny --locked --version 0.19.1
+          cargo install cargo-deny --locked --version 0.20.2
           cargo deny check
 
       # 负向卡口：这条 grep 保证 newtype 约束的静态检查自己没被绕过。
@@ -80,7 +64,7 @@ jobs:
 
   # ── 连库的两条 + 全部测试 ────────────────────────────────────────
   database:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: 装工具链
