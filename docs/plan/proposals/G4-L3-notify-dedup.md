@@ -2,7 +2,9 @@
 
 任务 id：`G4-L3-notify-dedup`。
 
-状态：待批准。基线为 `cloud/dev` 的 `f89bd4ed3a45f5b56ee89dcfe8ec94ee8f38eb36`；PR #92 的关口收口矩阵尚未合入，实施应在 PR #92 合入后的新 `dev` 基线上重新核对。
+状态：已批准并完成代码实施（2026-11-05）。实际实施基线为 PR #92、#93 合入后的
+`cloud/dev` `42a2fd6`；静态门禁、可信数据库门禁和本片定向测试已通过；真实 Telegram
+外部验收仍未运行。
 
 判据出处：`docs/design/plan/00-里程碑与工期.md` §4.3 WP-3、§三 G3/G4；`docs/design/spec/03-数据模型.md` §5.3；`docs/design/spec/04-数据生命周期与容量.md` §一；`docs/design/eng/03-测试策略.md` L1/L2/L3；`docs/design/eng/04-CI门禁.md` 的审计与双遍要求。
 
@@ -106,6 +108,6 @@ tgm:l3:v1\0<sender_id 或空串>\0<排序去重后的命中关键词 JSON>\0<正
 
 [report]
 task: G4-L3-notify-dedup
-path: escalated
-gates: not-run
-escalation: docs/plan/proposals/G4-L3-notify-dedup.md
+path: ok
+gates: pass
+escalation: ->

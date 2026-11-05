@@ -3804,16 +3804,19 @@ async fn task_router_lists_details_filters_tenants_and_retries_failed_tasks(admi
     let task_a1: i64 = sqlx::query_scalar(
         "INSERT INTO delivery_tasks
             (tenant_id, tenant_event_id, rule_id, rule_version, target_tg_chat_id, sender_identity_id, action,
-             status, attempt_count, last_error_code, created_at, updated_at, idem_key)
+             status, attempt_count, last_error_code, created_at, updated_at, idem_key,
+             notification_fingerprint, notification_target_ref)
          VALUES ($1, $2, $3, 1, -5410, $4, 'COPY', 'DEAD', 2, 'TIMEOUT',
                  clock_timestamp() - interval '2 minutes',
-                 clock_timestamp() - interval '2 minutes', 'task-a1')
+                 clock_timestamp() - interval '2 minutes', 'task-a1',
+                 'task-a1-fingerprint', $5)
          RETURNING id",
     )
     .bind(tenant_a)
     .bind(tenant_event_a)
     .bind(rule_a)
     .bind(identity_a)
+    .bind(target_a)
     .fetch_one(admin.raw())
     .await
     .expect("创建租户 A 死信任务失败");

@@ -594,7 +594,8 @@ SELECT q::text FROM (
      AND att.attnum > 0 AND NOT att.attisdropped
      AND att.attname IN ('id', 'tenant_id', 'tenant_event_id', 'rule_id',
                         'rule_version', 'target_tg_chat_id', 'sender_identity_id',
-                        'action', 'telegram_random_id', 'payload_snapshot', 'idem_key')
+                        'action', 'telegram_random_id', 'payload_snapshot', 'idem_key',
+                        'notification_fingerprint', 'notification_target_ref')
      AND has_column_privilege(rr.oid, att.attrelid, att.attnum, 'UPDATE')
      AND NOT (rr.rolname = 'tenant_cleanup' AND att.attname = 'tenant_event_id')
    ORDER BY 1, 2
@@ -1155,6 +1156,7 @@ WITH cleaner AS (
          ('notify_dedup', 'tenant_id', 'SELECT'),
          ('notify_dedup', 'fingerprint', 'SELECT'),
          ('notify_dedup', 'target_ref', 'SELECT'),
+         ('notify_dedup', 'status', 'SELECT'),
          ('notify_dedup', 'expires_at', 'SELECT'),
          ('bot_console_updates', 'tenant_id', 'SELECT'),
          ('bot_console_updates', 'bot_id', 'SELECT'),

@@ -285,7 +285,9 @@ pub struct DeliveryTaskInput {
     pub rule_id: i64,
     pub rule_version: i32,
     pub target_tg_chat_id: i64,
+    pub target_ref: i64,
     pub sender_identity_id: IdentityId,
+    pub notification_fingerprint: String,
     pub action: String,
     pub payload_snapshot: Value,
     /// 跨身份媒体中转：同一事务里为该事件建 `media_relay_jobs`（片 2）。
@@ -3810,6 +3812,7 @@ pub async fn enqueue_delivery_tasks(
             .ok_or(EnqueueError::EventUnavailable)?;
 
             let mut writes = Vec::with_capacity(tasks.len());
+            let mut media_relay_inserted = false;
             for task in &tasks {
                 let idem_key = delivery_idem_key(
                     tenant,
@@ -3847,6 +3850,7 @@ pub async fn enqueue_delivery_tasks(
                     });
                 }
                 let mut write = None;
+                let mut suppressed_by_notification_dedup = false;
                 for _ in 0..16 {
                     let telegram_random_id = delivery_random_id()?;
                     let inserted_id = sqlx::query_scalar::<_, i64>(
@@ -3862,14 +3866,16 @@ pub async fn enqueue_delivery_tasks(
                             telegram_random_id,
                             payload_snapshot,
                             idem_key,
+                            notification_fingerprint,
+                            notification_target_ref,
                             status,
                             last_error_code,
                             completed_at
                         )
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                                CASE WHEN $11::text IS NULL THEN 'PENDING' ELSE 'DEAD' END,
-                                $11,
-                                CASE WHEN $11::text IS NULL THEN NULL ELSE clock_timestamp() END)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                                CASE WHEN $13::text IS NULL THEN 'PENDING' ELSE 'DEAD' END,
+                                $13,
+                                CASE WHEN $13::text IS NULL THEN NULL ELSE clock_timestamp() END)
                         ON CONFLICT DO NOTHING
                         RETURNING id
                         "#,
@@ -3884,11 +3890,63 @@ pub async fn enqueue_delivery_tasks(
                     .bind(telegram_random_id)
                     .bind(&task.payload_snapshot)
                     .bind(&idem_key)
+                    .bind(if task.dead_error_code.is_none() {
+                        Some(task.notification_fingerprint.as_str())
+                    } else {
+                        None
+                    })
+                    .bind(if task.dead_error_code.is_none() {
+                        Some(task.target_ref)
+                    } else {
+                        None
+                    })
                     .bind(task.dead_error_code.as_deref())
                     .fetch_optional(&mut *conn)
                     .await?;
 
                     if let Some(id) = inserted_id {
+                        if task.dead_error_code.is_none() {
+                            let claimed = sqlx::query_scalar::<_, bool>(
+                                r#"
+                                INSERT INTO notify_dedup (
+                                    tenant_id, fingerprint, target_ref, last_sent_at,
+                                    expires_at, status, task_id, claimed_at
+                                )
+                                VALUES ($1, $2, $3, NULL,
+                                        clock_timestamp() + interval '24 hours',
+                                        'CLAIMED', $4, clock_timestamp())
+                                ON CONFLICT (tenant_id, fingerprint, target_ref)
+                                DO UPDATE SET
+                                    status = 'CLAIMED',
+                                    task_id = EXCLUDED.task_id,
+                                    claimed_at = clock_timestamp(),
+                                    last_sent_at = NULL,
+                                    expires_at = clock_timestamp() + interval '24 hours'
+                                 WHERE notify_dedup.status = 'SENT'
+                                   AND notify_dedup.expires_at <= clock_timestamp()
+                                RETURNING TRUE
+                                "#,
+                            )
+                            .bind(tenant.get())
+                            .bind(&task.notification_fingerprint)
+                            .bind(task.target_ref)
+                            .bind(id)
+                            .fetch_optional(&mut *conn)
+                            .await?
+                            .is_some();
+                            if !claimed {
+                                sqlx::query("DELETE FROM delivery_tasks WHERE tenant_id = $1 AND id = $2")
+                                    .bind(tenant.get())
+                                    .bind(id)
+                                    .execute(&mut *conn)
+                                    .await?;
+                                suppressed_by_notification_dedup = true;
+                                break;
+                            }
+                            if task.media_relay {
+                                media_relay_inserted = true;
+                            }
+                        }
                         write = Some((id, true));
                         break;
                     }
@@ -3904,6 +3962,9 @@ pub async fn enqueue_delivery_tasks(
                         write = Some((id, false));
                         break;
                     }
+                }
+                if suppressed_by_notification_dedup {
+                    continue;
                 }
                 let Some((id, inserted)) = write else {
                     return Err(sqlx::Error::Protocol(
@@ -3924,7 +3985,7 @@ pub async fn enqueue_delivery_tasks(
             // 一条 canonical event 一个 job，多租户命中同一条消息只下载一次。
             // 只有 MTProto 采集的事件能由 mtproto-worker 下载；Bot 采集的没有 job，
             // delivery 查不到 job 时直接判死，不空等 30 分钟。
-            if tasks.iter().any(|task| task.media_relay) {
+            if media_relay_inserted {
                 sqlx::query(
                     r#"
                     INSERT INTO media_relay_jobs (canonical_event_id, receiver_identity_id)
@@ -4326,6 +4387,58 @@ pub async fn retry_delivery_task(
     tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
             crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
+            let task = sqlx::query_as::<_, (Option<String>, Option<i64>, String)>(
+                "SELECT notification_fingerprint, notification_target_ref, status
+                   FROM delivery_tasks
+                  WHERE tenant_id = $1 AND id = $2
+                  FOR UPDATE",
+            )
+            .bind(tenant.get())
+            .bind(task_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some((fingerprint, target_ref, status)) = task else {
+                return Ok(false);
+            };
+            if !matches!(status.as_str(), "DEAD" | "FAILED") {
+                return Ok(false);
+            }
+            let (Some(fingerprint), Some(target_ref)) = (fingerprint, target_ref) else {
+                return Ok(false);
+            };
+            {
+                let claimed = sqlx::query_scalar::<_, bool>(
+                    r#"
+                    INSERT INTO notify_dedup (
+                        tenant_id, fingerprint, target_ref, last_sent_at,
+                        expires_at, status, task_id, claimed_at
+                    )
+                    VALUES ($1, $2, $3, NULL,
+                            clock_timestamp() + interval '24 hours',
+                            'CLAIMED', $4, clock_timestamp())
+                    ON CONFLICT (tenant_id, fingerprint, target_ref)
+                    DO UPDATE SET
+                        status = 'CLAIMED',
+                        task_id = EXCLUDED.task_id,
+                        claimed_at = clock_timestamp(),
+                        last_sent_at = NULL,
+                        expires_at = clock_timestamp() + interval '24 hours'
+                     WHERE (notify_dedup.status = 'CLAIMED' AND notify_dedup.task_id = EXCLUDED.task_id)
+                        OR (notify_dedup.status = 'SENT' AND notify_dedup.expires_at <= clock_timestamp())
+                    RETURNING TRUE
+                    "#,
+                )
+                .bind(tenant.get())
+                .bind(fingerprint)
+                .bind(target_ref)
+                .bind(task_id)
+                .fetch_optional(&mut *conn)
+                .await?
+                .is_some();
+                if !claimed {
+                    return Ok(false);
+                }
+            }
             let updated = sqlx::query(
                 r#"
                 UPDATE delivery_tasks
@@ -4476,6 +4589,23 @@ pub async fn complete_delivery_task(
             .bind(latency_ms)
             .execute(&mut *conn)
             .await?;
+            sqlx::query(
+                r#"
+                UPDATE notify_dedup
+                   SET status = 'SENT',
+                       task_id = NULL,
+                       claimed_at = NULL,
+                       last_sent_at = clock_timestamp(),
+                       expires_at = clock_timestamp() + interval '24 hours'
+                 WHERE tenant_id = $1
+                   AND task_id = $2
+                   AND status = 'CLAIMED'
+                "#,
+            )
+            .bind(tenant.get())
+            .bind(task_id)
+            .execute(&mut *conn)
+            .await?;
             Ok(true)
         })
     })
@@ -4552,6 +4682,15 @@ pub async fn record_delivery_failure(
             .bind(failure.latency_ms)
             .execute(&mut *conn)
             .await?;
+            if matches!(status, "DEAD" | "CANCELLED") {
+                sqlx::query(
+                    "DELETE FROM notify_dedup WHERE tenant_id = $1 AND task_id = $2 AND status = 'CLAIMED'",
+                )
+                .bind(tenant.get())
+                .bind(task_id)
+                .execute(&mut *conn)
+                .await?;
+            }
             Ok(Some(updated))
         })
     })
@@ -4962,6 +5101,15 @@ pub async fn defer_delivery_task(
             .execute(&mut *conn)
             .await?
             .rows_affected();
+            if !active && updated == 1 {
+                sqlx::query(
+                    "DELETE FROM notify_dedup WHERE tenant_id = $1 AND task_id = $2 AND status = 'CLAIMED'",
+                )
+                .bind(tenant.get())
+                .bind(task_id)
+                .execute(&mut *conn)
+                .await?;
+            }
             Ok(updated == 1)
         })
     })

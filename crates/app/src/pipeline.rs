@@ -420,7 +420,14 @@ pub async fn process_tenant_event(
             rule_id: matched.rule_id,
             rule_version: matched.rule_version,
             target_tg_chat_id: record.target_tg_chat_id,
+            target_ref: record.target_ref,
             sender_identity_id: record.sender_identity_id,
+            notification_fingerprint: tgm_core::notification::notification_fingerprint(
+                event_record.sender_id,
+                &matched_keywords,
+                event_record.text.as_deref(),
+                event_record.caption.as_deref(),
+            ),
             action: action_as_str(matched.action).to_string(),
             payload_snapshot: crate::delivery::freeze_delivery_snapshot(
                 &event_record,
