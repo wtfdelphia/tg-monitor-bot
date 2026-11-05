@@ -21,7 +21,9 @@ impl Seed {
             rule_id: self.rule,
             rule_version: version,
             target_tg_chat_id: -1002,
+            target_ref: 1,
             sender_identity_id: self.identity,
+            notification_fingerprint: format!("rule-version-{version}"),
             action: "COPY".to_owned(),
             payload_snapshot: serde_json::json!({
                 "source": {"tg_chat_id": -1001, "tg_message_id": 1, "media_type": "TEXT"},

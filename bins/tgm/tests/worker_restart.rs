@@ -171,7 +171,7 @@ async fn seed_event(
             media_group_id: None,
             sender_id: None,
             message_date: Utc::now(),
-            text: Some("restart regression".to_owned()),
+            text: Some(format!("restart regression {message_id}")),
             caption: None,
             media_type: Some("TEXT".to_owned()),
             content_hash: None,

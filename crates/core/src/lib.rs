@@ -15,6 +15,8 @@ pub mod error;
 pub mod ids;
 /// KEK 的 trait 与 `EnvKek`（eng/01 §三，ADR-0011/0012）。`KmsKek` 不在此 crate。
 pub mod kek;
+/// L3 通知指纹与可重算规范。
+pub mod notification;
 /// OIDC 登录协议材料、算法白名单与 nonce 一次性消费。
 pub mod oidc;
 /// `TGM_PROFILE` 的取值（eng/01 §二）。两处安全检查以它为条件。

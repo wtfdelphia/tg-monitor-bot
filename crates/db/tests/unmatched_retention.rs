@@ -295,10 +295,12 @@ async fn stale_processed_plan_cannot_enqueue_new_work(injected: PgPool) -> TestR
         rule_id: 9999,
         rule_version: 1,
         target_tg_chat_id: -1002,
+        target_ref: 1,
         sender_identity_id: sqlx::query_scalar("SELECT id FROM identities WHERE id=$1")
             .bind(identity)
             .fetch_one(admin.raw())
             .await?,
+        notification_fingerprint: "unmatched-retention".to_owned(),
         action: "COPY".to_owned(),
         payload_snapshot: serde_json::json!({}),
         media_relay: false,
