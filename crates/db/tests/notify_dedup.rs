@@ -4,6 +4,7 @@
 
 use sqlx::PgPool;
 use tgm_core::ids::{IdentityId, TenantId};
+use tgm_core::notification::notification_fingerprint;
 use tgm_db::repo::{
     DeliveryTaskFailureInput, DeliveryTaskFailureStatus, DeliveryTaskInput,
     claim_due_delivery_task, complete_delivery_task, enqueue_delivery_tasks,
@@ -20,6 +21,25 @@ struct Fixture {
     event: i64,
     rule: i64,
 }
+
+type FingerprintSource = (
+    String,
+    i64,
+    Option<i64>,
+    Option<Vec<String>>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+type ScrubbedFingerprintSource = (
+    i64,
+    Option<i64>,
+    Option<Vec<String>>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 async fn fixture(admin: &support::AdminOnlyPool, suffix: &str, target_chat: i64) -> Fixture {
     let tenant: TenantId = sqlx::query_scalar(
@@ -212,6 +232,175 @@ async fn same_target_claims_once_and_success_confirms(admin: PgPool) {
     .await
     .expect("读取 L3 状态失败");
     assert_eq!(status, "SENT");
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn sent_fingerprint_recomputes_from_retained_event_and_becomes_unavailable_after_scrub(
+    admin: PgPool,
+) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let fixture = fixture(&admin, "recompute", -8_003).await;
+    let keywords = vec!["notify".to_owned()];
+    let fingerprint = notification_fingerprint(Some(77), &keywords, Some("notify body"), None);
+    sqlx::query("UPDATE canonical_events SET content_hash = 'synthetic-content-hash' WHERE id = (SELECT canonical_event_id FROM tenant_events WHERE tenant_id = $1 AND id = $2)")
+        .bind(fixture.tenant)
+        .bind(fixture.event)
+        .execute(admin.raw())
+        .await
+        .expect("设置合成内容哈希失败");
+    let writes = enqueue_delivery_tasks(
+        &app,
+        fixture.tenant,
+        fixture.event,
+        &keywords,
+        &[task(&fixture, &fingerprint, -8_003)],
+    )
+    .await
+    .expect("创建 L3 claim 失败");
+    assert_eq!(writes.len(), 1);
+    assert!(writes[0].inserted);
+
+    let claimed = claim_due_delivery_task(&app, fixture.tenant, fixture.sender)
+        .await
+        .expect("领取通知任务失败")
+        .expect("通知任务缺失");
+    assert!(
+        complete_delivery_task(&app, fixture.tenant, claimed.id, 9_003, None)
+            .await
+            .expect("确认通知发送失败")
+    );
+
+    let canonical_event_id: i64 = sqlx::query_scalar(
+        "SELECT canonical_event_id FROM tenant_events WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(fixture.tenant)
+    .bind(fixture.event)
+    .fetch_one(admin.raw())
+    .await
+    .expect("读取测试规范事件 id 失败");
+    let source = sqlx::query_as::<_, FingerprintSource>(
+        r#"
+        SELECT dedup.fingerprint,
+               event.id,
+               event.sender_id,
+               tenant_event.matched_keywords,
+               event.text,
+               event.caption,
+               event.content_hash
+          FROM notify_dedup AS dedup
+          JOIN LATERAL (
+              SELECT tenant_event_id
+                FROM delivery_tasks
+               WHERE tenant_id = dedup.tenant_id
+                 AND notification_fingerprint = dedup.fingerprint
+                 AND notification_target_ref = dedup.target_ref
+                 AND status = 'DONE'
+                 AND completed_at <= dedup.last_sent_at
+               ORDER BY completed_at DESC, id DESC
+               LIMIT 1
+          ) AS task ON TRUE
+          JOIN tenant_events AS tenant_event
+            ON tenant_event.tenant_id = dedup.tenant_id
+           AND tenant_event.id = task.tenant_event_id
+          JOIN canonical_events AS event
+            ON event.id = tenant_event.canonical_event_id
+         WHERE dedup.tenant_id = $1
+           AND dedup.fingerprint = $2
+           AND dedup.target_ref = $3
+           AND dedup.status = 'SENT'
+        "#,
+    )
+    .bind(fixture.tenant)
+    .bind(&fingerprint)
+    .bind(fixture.target)
+    .fetch_one(admin.raw())
+    .await
+    .expect("读取 SENT 指纹及其成功任务来源失败");
+    let (stored, event_id, sender_id, matched_keywords, text, caption, content_hash) = source;
+    assert_eq!(event_id, canonical_event_id);
+    assert_eq!(content_hash.as_deref(), Some("synthetic-content-hash"));
+    let matched_keywords = matched_keywords.expect("已处理事件应保留关键词命中结果");
+    assert_eq!(
+        notification_fingerprint(
+            sender_id,
+            &matched_keywords,
+            text.as_deref(),
+            caption.as_deref()
+        ),
+        stored,
+        "沿任务关联从 tenant_events 与 canonical_events 重算的指纹应一致"
+    );
+
+    sqlx::query(
+        "UPDATE canonical_events
+            SET sender_id = NULL, text = NULL, caption = NULL, content_hash = NULL
+          WHERE id = (
+              SELECT canonical_event_id
+                FROM tenant_events
+               WHERE tenant_id = $1 AND id = $2
+          )",
+    )
+    .bind(fixture.tenant)
+    .bind(fixture.event)
+    .execute(admin.raw())
+    .await
+    .expect("脱敏测试事件失败");
+
+    let (event_id, sender_id, matched_keywords, text, caption, content_hash):
+        ScrubbedFingerprintSource = sqlx::query_as(
+        r#"
+        SELECT event.id,
+               event.sender_id,
+               tenant_event.matched_keywords,
+               event.text,
+               event.caption,
+               event.content_hash
+          FROM notify_dedup AS dedup
+          JOIN LATERAL (
+              SELECT tenant_event_id
+                FROM delivery_tasks
+               WHERE tenant_id = dedup.tenant_id
+                 AND notification_fingerprint = dedup.fingerprint
+                 AND notification_target_ref = dedup.target_ref
+                 AND status = 'DONE'
+                 AND completed_at <= dedup.last_sent_at
+               ORDER BY completed_at DESC, id DESC
+               LIMIT 1
+          ) AS task ON TRUE
+          JOIN tenant_events AS tenant_event
+            ON tenant_event.tenant_id = dedup.tenant_id
+           AND tenant_event.id = task.tenant_event_id
+          JOIN canonical_events AS event
+            ON event.id = tenant_event.canonical_event_id
+         WHERE dedup.tenant_id = $1
+           AND dedup.fingerprint = $2
+           AND dedup.target_ref = $3
+           AND dedup.status = 'SENT'
+        "#,
+    )
+    .bind(fixture.tenant)
+    .bind(&fingerprint)
+    .bind(fixture.target)
+    .fetch_one(admin.raw())
+    .await
+    .expect("读取脱敏后的指纹来源失败");
+    assert_eq!(event_id, canonical_event_id);
+    assert!(sender_id.is_none());
+    assert!(text.is_none());
+    assert!(caption.is_none());
+    assert!(content_hash.is_none());
+    let matched_keywords = matched_keywords.expect("脱敏不应清除租户侧命中关键词");
+    assert_ne!(
+        notification_fingerprint(
+            sender_id,
+            &matched_keywords,
+            text.as_deref(),
+            caption.as_deref()
+        ),
+        stored,
+        "脱敏后的输入不得误报为原指纹可重算"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]
