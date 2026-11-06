@@ -26,7 +26,7 @@
 | 验证 | 结果 | 记录 |
 |---|---|---|
 | 指纹 L1 | `pass` | `cargo test -p tgm-core notification --lib`：3 passed / 0 failed |
-| L3 claim 生命周期 | `pass` | `cargo test -p tgm-db --test notify_dedup -- --nocapture`：2 passed / 0 failed |
+| L3 claim 生命周期 | `pass` | `cargo test -p tgm-db --test notify_dedup -- --nocapture`：3 passed / 0 failed；含保留事件重算与脱敏不可重算反证 |
 | 相关回归 | `pass` | `tgm-app` pipeline：6 passed；rule version retention：6 passed；unmatched retention：11 passed |
 | 迁移重入 | `pass` | `scripts/migrate-idempotent.sh`：57 个迁移文件强制重跑，库状态逐字节一致；最终使用隔离克隆的非生产审计库 |
 | 静态门禁 | `pass` | `scripts/ai-driver/ai-gates.sh --static-only`：fmt、clippy、offline-build、deny、newtype、openapi-check、driver-regressions 全部通过；数据库卡口按模式未运行 |
@@ -35,7 +35,9 @@
 
 L3 测试覆盖：同一租户/同一目标的 claim 抑制与发送确认、死信释放后人工重试重新 claim、
 不同目标不互相抑制。指纹测试覆盖关键词顺序与重复项、text/caption 回退、Unicode 标量截取、
-sender 输入和版本前缀。
+sender 输入和版本前缀。新增隔离数据库验证沿 `notify_dedup.SENT → delivery_tasks.DONE →
+tenant_events → canonical_events` 关联重算指纹；对 sender、正文、caption 和 content_hash
+脱敏后的同一记录，明确归类为不可重算，而不是伪造一致。
 
 ## 三、边界与未运行项
 
