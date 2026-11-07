@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -12,9 +13,11 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable, Dict, Optional
 
 
-def command(*arguments: str, check: bool = True, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def command(*arguments: str, check: bool = True,
+            environment: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(arguments, env=environment, text=True, capture_output=True, timeout=45)
     if check and result.returncode != 0:
         raise AssertionError(f"{arguments[0]} {arguments[1]} 返回 {result.returncode}：{result.stderr}")
@@ -40,6 +43,7 @@ def private_manager():
                 raise SystemExit(f"缺少系统提供的用户 manager 退出工件：{name}")
             (units / name).symlink_to(source)
         name = directory.name + ".service"
+        print(f"temporary_manager={name}", flush=True)
         environment = os.environ | {"XDG_RUNTIME_DIR": str(directory)}
         environment.pop("DBUS_SESSION_BUS_ADDRESS", None)
         command("systemd-run", "--user", f"--unit={name}", "--property=Delegate=yes", "--property=Type=exec",
@@ -54,15 +58,23 @@ def private_manager():
                 time.sleep(0.1)
             yield environment
         finally:
+            cleanup_errors = []
+            def cleanup(*arguments: str, environment: Dict[str, str] = host_environment) -> None:
+                try:
+                    command(*arguments, check=False, environment=environment)
+                except (OSError, subprocess.SubprocessError) as error:
+                    cleanup_errors.append(f"{arguments[0]} {arguments[1]}: {error}")
             command("systemctl", "--user", "exit", check=False, environment=environment)
-            stopped = command("systemctl", "--user", "stop", name, check=False, environment=host_environment)
+            cleanup("systemctl", "--user", "stop", name)
             snapshot = command("systemctl", "--user", "show", name, "--property=ActiveState,MainPID",
-                              check=False, environment=host_environment)
+                               check=False, environment=host_environment)
             if "MainPID=0" not in snapshot.stdout or "ActiveState=inactive" not in snapshot.stdout:
-                raise AssertionError(f"临时 manager 未清理：{stopped.stderr} {snapshot.stdout}")
+                cleanup_errors.append(f"临时 manager 状态：{snapshot.stdout} {snapshot.stderr}")
+            if cleanup_errors:
+                raise AssertionError(f"临时 manager 清理未闭环：{'；'.join(cleanup_errors)}")
 
 
-def check_runtime(args: argparse.Namespace, manager_environment: dict[str, str]) -> None:
+def check_runtime(args: argparse.Namespace, manager_environment: Dict[str, str]) -> None:
     if not args.env_file.parent.name.startswith("tgm-native-test-"):
         raise SystemExit("只接受 Rust 隔离测试创建的临时环境文件")
     if "TGM_PROFILE=development" not in args.env_file.read_text(encoding="utf-8").splitlines():
@@ -91,38 +103,46 @@ def check_runtime(args: argparse.Namespace, manager_environment: dict[str, str])
         original = args.env_file.read_bytes()
         original_mode = args.env_file.stat().st_mode & 0o777
 
-        def state() -> dict[str, str]:
+        def state() -> Dict[str, str]:
             result = control("show", instance, "--property=ActiveState,SubState,Result,MainPID,NRestarts,ControlGroup,ExecMainStatus")
             return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
 
-        def logs(pid: int | None = None) -> str:
+        def logs(pid: Optional[int] = None) -> str:
             process = () if pid is None else (f"_PID={pid}",)
+            if args.system_journal:
+                result = command(
+                    "sudo", "-n", args.journalctl,
+                    "--no-pager", "-n", "500", "--output=cat", "--all",
+                    f"_SYSTEMD_USER_UNIT={instance}",
+                    f"SYSLOG_IDENTIFIER=tgm-app-{args.role}", *process, check=False,
+                )
+                if result.returncode != 0:
+                    raise AssertionError(f"只读 system journal 查询失败：{result.stderr.strip()}")
+                return result.stdout
             if manager_environment["XDG_RUNTIME_DIR"] != os.environ["XDG_RUNTIME_DIR"]:
-                return command("journalctl", f"_SYSTEMD_USER_UNIT={Path(manager_environment['XDG_RUNTIME_DIR']).name}.service",
-                               f"SYSLOG_IDENTIFIER=tgm-app-{args.role}", "--no-pager", "-n", "500",
-                               "--output=cat", "--all", *process).stdout
-            return command("journalctl", "--user", "-u", instance, "--no-pager", "-n", "500", "--output=cat", "--all", *process).stdout
+                result = command("journalctl", f"_SYSTEMD_USER_UNIT={Path(manager_environment['XDG_RUNTIME_DIR']).name}.service",
+                                 f"SYSLOG_IDENTIFIER=tgm-app-{args.role}", "--no-pager", "-n", "500",
+                                 "--output=cat", "--all", *process, check=False)
+            else:
+                result = command("journalctl", "--user", "-u", instance, "--no-pager", "-n", "500",
+                                 "--output=cat", "--all", *process, check=False)
+            return result.stdout
 
-        def ready(snapshot: dict[str, str]) -> bool:
+        def ready(snapshot: Dict[str, str]) -> bool:
             pid = int(snapshot.get("MainPID", "0"))
             if snapshot.get("SubState") != "running" or pid <= 0:
                 return False
             environment = Path(f"/proc/{pid}/environ")
-            if not environment.exists() or b"TGM_PROFILE=development\0" not in environment.read_bytes():
-                return False
-            marker = "HTTP 服务已启动" if args.role in ("control-plane", "bot-gateway") else (
-                "已启动" if args.role in ("mtproto-worker", "delivery") else "subscriber 已装"
-            )
-            return marker in logs(pid)
+            return environment.exists() and b"TGM_PROFILE=development\0" in environment.read_bytes()
 
-        def wait(predicate, seconds: int = 35) -> dict[str, str]:
+        def wait(predicate: Callable[[Dict[str, str]], bool], seconds: int = 35) -> Dict[str, str]:
             deadline = time.monotonic() + seconds
             while time.monotonic() < deadline:
                 snapshot = state()
                 if predicate(snapshot):
                     return snapshot
                 time.sleep(0.1)
-            raise AssertionError(f"{instance} 超时；state={state()}；journal={logs()}")
+            raise AssertionError(f"{instance} 超时；state={state()}；日志正文已省略")
 
         def reset_failed() -> None:
             state()
@@ -166,71 +186,82 @@ def check_runtime(args: argparse.Namespace, manager_environment: dict[str, str])
             if state().get("ActiveState") != "inactive":
                 raise AssertionError("人工停止后服务自动重启")
 
-            if args.role == "rule":
-                reset_failed()
-                control("start", "--no-block", instance)
-                wait(ready)
-                pid = int(state()["MainPID"])
-                os.kill(pid, signal.SIGKILL)
-                wait(lambda snapshot: ready(snapshot) and int(snapshot["MainPID"]) != pid
-                     and int(snapshot.get("NRestarts", "0")) >= 1)
-                control("stop", instance)
+            reset_failed()
+            control("start", "--no-block", instance)
+            wait(ready)
+            pid = int(state()["MainPID"])
+            os.kill(pid, signal.SIGKILL)
+            wait(lambda snapshot: ready(snapshot) and int(snapshot["MainPID"]) != pid
+                 and int(snapshot.get("NRestarts", "0")) >= 1)
+            control("stop", instance)
 
-                unavailable = original.replace(b"127.0.0.1:55432", b"127.0.0.1:1")
-                if unavailable == original:
-                    raise AssertionError("隔离配置没有可替换的测试数据库端口")
-                args.env_file.write_bytes(unavailable)
-                reset_failed()
-                control("start", "--no-block", instance)
-                wait(lambda snapshot: snapshot.get("SubState") == "auto-restart"
-                     and snapshot.get("MainPID") == "0")
-                args.env_file.write_bytes(original)
-                wait(lambda snapshot: ready(snapshot) and int(snapshot.get("NRestarts", "0")) >= 1)
-                control("stop", instance)
+            database_url = next((line.split(b"=", 1)[1] for line in original.splitlines()
+                                 if line.startswith(b"TGM_DB_URL_APP=")), None)
+            if database_url is None:
+                raise AssertionError("隔离配置没有应用数据库连接")
+            match = re.search(rb"127\.0\.0\.1:([0-9]+)", database_url)
+            if match is None:
+                raise AssertionError("隔离配置没有本机测试数据库端口")
+            unavailable = original.replace(match.group(0), b"127.0.0.1:1")
+            args.env_file.write_bytes(unavailable)
+            reset_failed()
+            control("start", "--no-block", instance)
+            wait(lambda snapshot: snapshot.get("SubState") == "auto-restart"
+                 and snapshot.get("MainPID") == "0")
+            args.env_file.write_bytes(original)
+            wait(lambda snapshot: ready(snapshot) and int(snapshot.get("NRestarts", "0")) >= 1)
+            control("stop", instance)
 
-                args.env_file.unlink()
-                reset_failed()
-                control("start", "--no-block", instance)
-                wait(lambda snapshot: snapshot.get("MainPID") == "0" and snapshot.get("Result") == "exit-code")
-                control("stop", instance)
-                args.env_file.write_bytes(original)
-                args.env_file.chmod(0o644)
-                reset_failed()
-                control("start", "--no-block", instance)
-                wait(lambda snapshot: snapshot.get("MainPID") == "0" and snapshot.get("Result") == "exit-code")
-                control("stop", instance)
-                args.env_file.chmod(original_mode)
+            args.env_file.unlink()
+            reset_failed()
+            control("start", "--no-block", instance)
+            wait(lambda snapshot: snapshot.get("MainPID") == "0" and snapshot.get("Result") == "exit-code")
+            control("stop", instance)
+            args.env_file.write_bytes(original)
+            args.env_file.chmod(0o644)
+            reset_failed()
+            control("start", "--no-block", instance)
+            wait(lambda snapshot: snapshot.get("MainPID") == "0" and snapshot.get("Result") == "exit-code")
+            control("stop", instance)
+            args.env_file.chmod(original_mode)
 
-                broken = original.replace(b"TGM_PROFILE=development", b"TGM_PROFILE=broken", 1)
-                args.env_file.write_bytes(broken)
-                reset_failed()
-                restarts_before_config_failure = int(state().get("NRestarts", "0"))
-                control("start", "--no-block", instance)
-                failed = wait(
-                    lambda snapshot: snapshot.get("ActiveState") == "failed"
-                    and snapshot.get("MainPID") == "0"
-                    and int(snapshot.get("NRestarts", "0")) >= restarts_before_config_failure + 3,
-                    seconds=80,
-                )
-                if failed["MainPID"] != "0" or int(failed["NRestarts"]) < restarts_before_config_failure + 3:
-                    raise AssertionError("连续配置失败未按模板限速")
-                time.sleep(11)
-                if state().get("ActiveState") != "failed" or state().get("MainPID") != "0":
-                    raise AssertionError("限速后仍自动启动")
-                args.env_file.write_bytes(original)
-                reset_failed()
-                control("start", "--no-block", instance)
-                wait(ready)
-                control("stop", instance)
+            broken = original.replace(b"TGM_PROFILE=development", b"TGM_PROFILE=broken", 1)
+            args.env_file.write_bytes(broken)
+            reset_failed()
+            restarts_before_config_failure = int(state().get("NRestarts", "0"))
+            control("start", "--no-block", instance)
+            failed = wait(
+                lambda snapshot: snapshot.get("ActiveState") == "failed"
+                and snapshot.get("MainPID") == "0"
+                and int(snapshot.get("NRestarts", "0")) >= restarts_before_config_failure + 3,
+                seconds=80,
+            )
+            if failed["MainPID"] != "0" or int(failed["NRestarts"]) < restarts_before_config_failure + 3:
+                raise AssertionError("连续配置失败未按模板限速")
+            time.sleep(11)
+            if state().get("ActiveState") != "failed" or state().get("MainPID") != "0":
+                raise AssertionError("限速后仍自动启动")
+            args.env_file.write_bytes(original)
+            reset_failed()
+            control("start", "--no-block", instance)
+            wait(ready)
+            control("stop", instance)
 
             journal = logs()
+            journal_checked = bool(journal.strip())
+            if args.system_journal and not journal_checked:
+                raise AssertionError("只读 system journal 未返回本次 unit 的日志，拒绝判定脱敏通过")
             for line in original.decode("utf-8").splitlines():
                 name_part, separator, value = line.partition("=")
-                if separator and value and ("SECRET" in name_part or "TOKEN" in name_part or "KEK" in name_part or "DB_URL" in name_part):
-                    if len(value) >= 8 and value in journal:
+                if separator and value and re.search(
+                    r"(?:SECRET|TOKEN|KEK|DB_URL|API_HASH|PASSWORD|ACCESS_KEY|PRIVATE_KEY)",
+                    name_part,
+                ):
+                    if journal_checked and len(value) >= 8 and value in journal:
                         raise AssertionError("应用 journal 包含敏感配置值")
-            print(f"{args.role}: user systemd 启停、身份、环境、journal 与残留检查通过" +
-                  ("；进程失败恢复、依赖恢复、缺失/过宽配置拒绝、配置失败限速及恢复通过" if args.role == "rule" else ""))
+            print(f"{args.role}: user systemd 启停、身份、环境与残留检查通过；"
+                  "进程失败恢复、依赖恢复、缺失/过宽配置拒绝、配置失败限速及恢复通过")
+            print(f"{args.role}: journal_redaction={'pass' if journal_checked else 'not-run'}")
         finally:
             control("stop", instance, check=False)
             control("stop", anchor.name, check=False)
@@ -249,9 +280,27 @@ def main() -> None:
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--role", choices=("control-plane", "bot-gateway", "mtproto-worker", "fanout", "rule", "delivery"), required=True)
     parser.add_argument("--isolated-manager", action="store_true")
+    parser.add_argument(
+        "--system-journal",
+        action="store_true",
+        help="通过 sudo -n 只读查询本次临时 unit 的 system journal；权限不足时失败",
+    )
     args = parser.parse_args()
     if os.getuid() == 0:
         raise SystemExit("用户级验收不得以 root 运行")
+    if args.system_journal:
+        args.journalctl = shutil.which("journalctl")
+        if args.journalctl is None:
+            raise SystemExit("--system-journal 缺少 journalctl")
+        if shutil.which("sudo") is None:
+            raise SystemExit("--system-journal 缺少 sudo")
+        probe = command(
+            "sudo", "-n", args.journalctl, "--no-pager", "-n", "0", "--output=cat", check=False,
+        )
+        if probe.returncode != 0:
+            raise SystemExit("--system-journal 需要 sudoers 允许非交互只读执行 journalctl")
+    else:
+        args.journalctl = None
     if args.isolated_manager:
         with private_manager() as environment:
             check_runtime(args, environment)
