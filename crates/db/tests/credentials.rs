@@ -154,6 +154,21 @@ async fn stores_ciphertext_only_and_roundtrips_as_app_user(admin: PgPool) {
         .expect("应当读到凭据");
     assert_eq!(back.expose().as_slice(), b"123456:bot-token-a");
 
+    let dumped: String = sqlx::query_scalar(
+        "SELECT concat_ws('|', encode(secret_ciphertext, 'hex'), encode(nonce, 'hex'),
+                           encode(dek_ciphertext, 'hex'), kek_id,
+                           coalesce(encode(api_hash_ciphertext, 'hex'), ''),
+                           coalesce(encode(bot_session_ciphertext, 'hex'), ''),
+                           coalesce(encode(bot_session_nonce, 'hex'), ''))
+           FROM identity_secrets WHERE identity_id = $1",
+    )
+    .bind(identity)
+    .fetch_one(admin.raw())
+    .await
+    .expect("读取凭据列诊断串失败");
+    assert!(!dumped.contains("bot-token-a"), "凭据列诊断串出现明文");
+    assert!(!format!("{back:?}").contains("bot-token-a"));
+
     store_identity_secret(&app, &kek, tenant, identity, &secret(b"rotated-token"))
         .await
         .expect("覆盖写入失败");
@@ -480,6 +495,8 @@ async fn bot_session_roundtrips_and_is_cleared_when_token_is_replaced(admin: PgP
         !ciphertext.windows(4).any(|window| window == b"TGMS"),
         "session 以明文落库"
     );
+    assert!(!format!("{first:?}").contains("123456:token-a"));
+    assert!(!format!("{first:?}").contains("TGMS-session"));
 
     let second = load_bot_credentials(&app, &kek, tenant, identity)
         .await
@@ -654,6 +671,22 @@ async fn create_mtproto_identity_is_encrypt_only_audited_and_deduplicated(admin:
     .expect("应当有一条 identity.create 审计");
     assert_eq!(after["kind"], "mtproto");
     assert!(!after.to_string().contains("grammers-session"), "{after}");
+    let stored_secret: (Vec<u8>, Vec<u8>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT secret_ciphertext, nonce, api_hash_ciphertext
+           FROM identity_secrets WHERE identity_id = $1",
+    )
+    .bind(identity)
+    .fetch_one(admin.raw())
+    .await
+    .expect("读取 MTProto 凭据列失败");
+    assert!(stored_secret.2.is_none(), "api_hash 不应落库");
+    assert!(
+        !stored_secret
+            .0
+            .windows(b"grammers-session".len())
+            .any(|window| window == b"grammers-session"),
+        "MTProto session 以明文落库"
+    );
 
     let err = create_mtproto_identity(&app, &writer, tenant, new_user(42, 31001), &session)
         .await

@@ -73,7 +73,7 @@ pub fn classify(
         TelegramBotApiError::Request => "REQUEST".to_owned(),
         TelegramBotApiError::ResponseTooLarge => "RESPONSE_TOO_LARGE".to_owned(),
         TelegramBotApiError::Response(_) => "RESPONSE".to_owned(),
-        TelegramBotApiError::Api(_) => "API".to_owned(),
+        TelegramBotApiError::Missing(_) | TelegramBotApiError::Server(_) => "API".to_owned(),
         TelegramBotApiError::EmptyToken | TelegramBotApiError::InvalidBaseUrl => {
             "CONFIG".to_owned()
         }
@@ -181,7 +181,6 @@ mod tests {
     fn rejected(status: u16) -> Result<(), TelegramBotApiError> {
         Err(TelegramBotApiError::Rejected {
             status,
-            description: "x".to_owned(),
             retry_after: None,
         })
     }
@@ -216,6 +215,18 @@ mod tests {
                 retry_after_seconds: 240
             }
         );
+        for error in [
+            TelegramBotApiError::Missing("response result"),
+            TelegramBotApiError::Server(503),
+        ] {
+            assert_eq!(
+                classify(Err(error), 0),
+                TenantNotificationOutcome::Retry {
+                    error_code: "API".to_owned(),
+                    retry_after_seconds: 60
+                }
+            );
+        }
         assert!(matches!(
             classify(Err(TelegramBotApiError::Request), MAX_ATTEMPTS - 1),
             TenantNotificationOutcome::Dead { .. }

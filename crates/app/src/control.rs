@@ -2011,7 +2011,8 @@ async fn create_bot_identity(
         crate::bot_console::TelegramBotApiClient::new(Arc::clone(&token), &intake.bot_api_base_url)
             .map_err(AppError::internal)?;
     let me = client.get_me().await.map_err(|error| match error {
-        crate::bot_console::TelegramBotApiError::Api(_)
+        crate::bot_console::TelegramBotApiError::Missing(_)
+        | crate::bot_console::TelegramBotApiError::Server(_)
         | crate::bot_console::TelegramBotApiError::Rejected { .. } => {
             AppError::ConditionInvalid("Telegram 拒绝了该 Bot Token".to_owned())
         }
@@ -5344,6 +5345,7 @@ mod tests {
     };
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
+    use axum::response::IntoResponse;
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use josekit::jwk::alg::rsa::RsaKeyPair;
@@ -5576,15 +5578,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn internal_error_response_is_opaque_but_input_details_survive() {
-        let internal = ApiError::from(AppError::internal(sqlx::Error::ColumnNotFound(
-            "private_constraint".into(),
-        )))
-        .response_body();
+    #[tokio::test]
+    async fn internal_error_response_is_opaque_but_input_details_survive() {
+        const SENTINEL: &str = "credential-response-sentinel";
+        let api_error = ApiError::from(AppError::internal(sqlx::Error::ColumnNotFound(
+            SENTINEL.into(),
+        )));
+        let internal = api_error.response_body();
         assert_eq!(internal.error.code, "INTERNAL");
         assert_eq!(internal.error.message, "internal error");
         assert!(internal.error.details.is_none());
+
+        let response = ApiError::from(AppError::internal(sqlx::Error::ColumnNotFound(
+            SENTINEL.into(),
+        )))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-tgm-error-code")
+                .and_then(|value| value.to_str().ok()),
+            Some("INTERNAL")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("读取内部错误响应失败");
+        let encoded = String::from_utf8(bytes.to_vec()).expect("内部错误响应不是 UTF-8");
+        assert!(
+            !encoded.contains(SENTINEL),
+            "内部错误细节泄漏到响应：{encoded}"
+        );
+        assert!(!encoded.contains("identity_secrets"));
 
         let invalid =
             ApiError::from(AppError::RegexInvalid("unclosed group".into())).response_body();
