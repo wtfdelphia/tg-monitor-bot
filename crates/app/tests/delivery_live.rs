@@ -36,9 +36,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use sqlx::PgPool;
+use sqlx::types::chrono::Utc;
 use tgm_app::delivery::{
-    DeliveryPayload, DeliverySendError, DeliveryTransport, TelegramDeliveryTransport,
-    run_delivery_once,
+    DeliveryPayload, DeliveryRunOutcome, DeliverySendError, DeliveryTransport,
+    TelegramDeliveryTransport, run_delivery_once,
 };
 use tgm_app::delivery_runtime::{
     DeliveryRuntimeConfig, PlatformApp, SenderExit, bot_id_from_token, load_bot_token, run_sender,
@@ -48,6 +49,10 @@ use tgm_core::kek::EnvKek;
 use tgm_core::profile::Profile;
 use tgm_core::secret::Secret;
 use tgm_db::credentials::store_identity_secret;
+use tgm_db::repo::{
+    CanonicalAdapter, CanonicalEventInput, CanonicalEventType, fanout_canonical_event,
+    insert_canonical_event,
+};
 use tgm_tg::client::TelegramClientConfig;
 use tgm_tg::{StoredSession, TelegramClient};
 use tokio::sync::watch;
@@ -164,9 +169,16 @@ async fn live_bot_login_repeat() {
                 client.shutdown().await.expect("关闭客户端失败");
             }
             Err(error) => {
-                let code = error.delivery_error().code;
-                println!("[V1] round={round} login=err code={code}");
-                failures.push(format!("round {round}: {code}"));
+                let delivery = error.delivery_error();
+                println!(
+                    "[V1] round={round} login=err code={} flood_wait_seconds={:?}",
+                    delivery.code, delivery.flood_wait_seconds
+                );
+                failures.push(format!("round {round}: {}", delivery.code));
+                if delivery.code == "FLOOD_WAIT" {
+                    println!("[V1] stop=first-flood-wait");
+                    break;
+                }
             }
         }
     }
@@ -214,6 +226,8 @@ async fn live_delivery_child() {
     let Ok(url) = std::env::var("TGM_LIVE_CHILD_URL") else {
         return;
     };
+    required("TGM_LIVE_TARGET_CHAT");
+    eprintln!("[V2-child] stage=connect-database");
     let pool = PgPool::connect(&url).await.expect("连接测试库失败");
     let role: String = sqlx::query_scalar("SELECT current_user")
         .fetch_one(&pool)
@@ -248,9 +262,14 @@ async fn live_delivery_child() {
         .expect("库里没有可用 Token");
     let app = platform_app();
     let config = TelegramClientConfig::new(app.api_id).expect("api_id 无效");
-    let (client, _) = TelegramClient::connect_bot_sender(config, &app.api_hash, &token)
-        .await
-        .expect("bot_sign_in 失败");
+    eprintln!("[V2-child] stage=bot-sign-in");
+    let (client, _) = tokio::time::timeout(
+        Duration::from_secs(20),
+        TelegramClient::connect_bot_sender(config, &app.api_hash, &token),
+    )
+    .await
+    .expect("bot_sign_in 超时")
+    .expect("bot_sign_in 失败");
     drop(token);
     let directory = PathBuf::from(required("TGM_LIVE_CHILD_DIR"));
     let transport = GateTransport {
@@ -263,10 +282,19 @@ async fn live_delivery_child() {
         directory,
         phase: required("TGM_LIVE_CHILD_PHASE"),
     };
-    let outcome = run_delivery_once(&pool, tenant, sender, &transport)
-        .await
-        .expect("运行投递失败");
+    eprintln!("[V2-child] stage=run-delivery");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_delivery_once(&pool, tenant, sender, &transport),
+    )
+    .await
+    .expect("运行投递超时")
+    .expect("运行投递失败");
     println!("[V2-child] outcome={outcome:?}");
+    assert!(
+        !matches!(outcome, DeliveryRunOutcome::Idle),
+        "子进程没有领取投递任务"
+    );
 }
 
 struct LiveChild(Child);
@@ -279,9 +307,15 @@ impl LiveChild {
             .env("TGM_LIVE_CHILD_URL", url)
             .env("TGM_LIVE_CHILD_TENANT", tenant.get().to_string())
             .env("TGM_LIVE_CHILD_DIR", directory)
+            .env("TGM_LIVE_TARGET_CHAT", required("TGM_LIVE_TARGET_CHAT"))
             .env("TGM_LIVE_CHILD_PHASE", phase)
             .env("TGM_PLATFORM_API_ID", required("TGM_PLATFORM_API_ID"))
             .env("TGM_PLATFORM_API_HASH", required("TGM_PLATFORM_API_HASH"))
+            .env("TGM_S3_ENDPOINT", "http://127.0.0.1:59000")
+            .env("TGM_S3_BUCKET", "tgm-live")
+            .env("TGM_S3_REGION", "us-east-1")
+            .env("TGM_S3_ACCESS_KEY_ID", "minioadmin")
+            .env("TGM_S3_SECRET_ACCESS_KEY", "minioadmin")
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -355,6 +389,17 @@ async fn live_delivery_g4_kill_restart(admin: PgPool) {
     let tenant = support::seed_tenant(&admin, "delivery-live", 9101).await;
     let bot = seed_bot(&app, &admin, tenant, &token).await;
     drop(token);
+    sqlx::query(
+        "INSERT INTO source_subscriptions
+            (tenant_id, tg_chat_id, title, receiver_identity_id, enabled)
+         VALUES ($1, $2, 'V2 synthetic source', $3, TRUE) RETURNING id",
+    )
+    .bind(tenant)
+    .bind(target)
+    .bind(bot)
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建临时来源失败");
 
     let mut verdicts = Vec::new();
     for phase in ["before-send", "after-send"] {
@@ -366,15 +411,47 @@ async fn live_delivery_g4_kill_restart(admin: PgPool) {
             now_nanos()
         )));
         std::fs::create_dir(&directory.0).expect("创建检查点目录失败");
+        let canonical = insert_canonical_event(
+            &app,
+            &CanonicalEventInput {
+                receiver_tenant_id: Some(tenant),
+                adapter: CanonicalAdapter::Bot,
+                receiver_identity_id: bot,
+                tg_chat_id: target,
+                tg_message_id: random_id,
+                event_type: CanonicalEventType::MessageCreated,
+                edit_version: 0,
+                update_id: None,
+                media_group_id: None,
+                sender_id: None,
+                message_date: Utc::now(),
+                text: Some(label.clone()),
+                caption: None,
+                media_type: None,
+                content_hash: None,
+                file_unique_id: None,
+                file_name: None,
+                file_size: None,
+                mime_type: None,
+                raw_file_id: None,
+            },
+        )
+        .await
+        .expect("创建临时规范事件失败");
+        let tenant_event = fanout_canonical_event(&app, tenant, canonical.id)
+            .await
+            .expect("扇出临时事件失败")
+            .expect("临时事件应匹配来源");
         let task_id: i64 = sqlx::query_scalar(
             "INSERT INTO delivery_tasks
-                (tenant_id, sender_identity_id, target_tg_chat_id, action, telegram_random_id, payload_snapshot)
-             VALUES ($1, $2, $3, 'COPY', $4, $5) RETURNING id",
+                (tenant_id, tenant_event_id, sender_identity_id, target_tg_chat_id, action, telegram_random_id, payload_snapshot)
+             VALUES ($1, $5, $2, $3, 'COPY', $4, $6) RETURNING id",
         )
         .bind(tenant)
         .bind(bot)
         .bind(target)
         .bind(random_id)
+        .bind(tenant_event.id)
         .bind(json!({
             "source": {"tg_chat_id": target, "tg_message_id": 1, "media_type": "TEXT"},
             "message": {"text": label, "parse_mode": "HTML"}
@@ -432,11 +509,24 @@ async fn live_delivery_g4_kill_restart(admin: PgPool) {
              task_status={status} telegram_message_id={message_id:?} dedupe={dedupe}",
             first_result.as_deref().unwrap_or("-"),
         );
-        verdicts.push((phase, dedupe, status));
+        verdicts.push((phase, dedupe, status, message_id));
     }
 
-    println!("[V2] 人工核对：测试频道里每个 label 应当只出现一次。");
-    for (phase, dedupe, status) in &verdicts {
+    println!("[V2] 使用第二个 Bot 只读核对本轮两条消息，再删除对应消息。");
+    let observer = TelegramClient::connect_bot_sender(
+        TelegramClientConfig::new(
+            required("TGM_PLATFORM_API_ID")
+                .parse()
+                .expect("api_id 无效"),
+        )
+        .expect("api_id 无效"),
+        &Secret::new(required("TGM_PLATFORM_API_HASH")),
+        &Secret::new(required("TGM_LIVE_BOT2_TOKEN")),
+    )
+    .await
+    .expect("只读核对 Bot 建连失败")
+    .0;
+    for (phase, dedupe, status, _) in &verdicts {
         assert_ne!(
             *dedupe, "DUPLICATE-SENT",
             "[V2] {phase}：同一 random_id 发出了两条消息，G4 不成立"
@@ -450,6 +540,44 @@ async fn live_delivery_g4_kill_restart(admin: PgPool) {
             "[V2] {phase}：未重复发送（{dedupe}），但任务没到 DONE —— 去重结果需要应用层收口"
         );
     }
+    let ids: Vec<i64> = verdicts
+        .iter()
+        .map(|(_, _, _, id)| id.expect("DONE 任务缺 message id"))
+        .collect();
+    let messages = observer
+        .media_reader()
+        .read_messages(target, &ids)
+        .await
+        .expect("读取 V2 消息失败");
+    assert_eq!(messages.len(), 2);
+    for ((phase, _, _, _), message) in verdicts.iter().zip(messages) {
+        let marker = format!("tgm-g4 {phase} ");
+        assert!(
+            message
+                .text
+                .as_deref()
+                .is_some_and(|text| text.starts_with(&marker))
+        );
+        println!("[V2] phase={phase} readback_count=1 label_present=true");
+    }
+    observer.shutdown().await.expect("关闭只读核对 Bot 失败");
+    let http = reqwest::Client::new();
+    for id in ids {
+        let response = http
+            .post(format!(
+                "https://api.telegram.org/bot{}/deleteMessage",
+                required("TGM_LIVE_BOT_TOKEN")
+            ))
+            .json(&json!({"chat_id": target, "message_id": id}))
+            .send()
+            .await
+            .expect("清理 V2 消息网络失败")
+            .json::<serde_json::Value>()
+            .await
+            .expect("清理 V2 消息响应无效");
+        assert_eq!(response["ok"], true, "清理 V2 消息被拒绝");
+    }
+    println!("[V2] cleanup_count=2 cleanup=true");
 }
 
 // ───────────────────────── V3 ─────────────────────────
