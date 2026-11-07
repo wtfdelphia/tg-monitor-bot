@@ -88,7 +88,7 @@ impl TelegramBotApiClient {
         let chat = self
             .request("getChat", &serde_json::json!({"chat_id": chat_id}))
             .await?
-            .ok_or_else(|| TelegramBotApiError::Api("result missing".to_owned()))?;
+            .ok_or(TelegramBotApiError::Missing("getChat result"))?;
         let chat: ProbeChat =
             serde_json::from_value(chat).map_err(TelegramBotApiError::Response)?;
         if chat.id != chat_id || !matches!(chat.kind.as_str(), "channel" | "group" | "supergroup") {
@@ -101,7 +101,7 @@ impl TelegramBotApiClient {
                 &serde_json::json!({"chat_id": chat_id, "user_id": bot_id}),
             )
             .await?
-            .ok_or_else(|| TelegramBotApiError::Api("result missing".to_owned()))?;
+            .ok_or(TelegramBotApiError::Missing("getChatMember result"))?;
         let member = serde_json::from_value(member).map_err(TelegramBotApiError::Response)?;
         Ok(evaluate(chat, member, chat_id, bot_id))
     }
@@ -115,9 +115,9 @@ async fn probe_admission(
     };
     tgm_db::lifecycle::WorkerGuard::acquire(pool, tenant)
         .await
-        .map_err(|_| TelegramBotApiError::Api("tenant admission unavailable".to_owned()))?
+        .map_err(|_| TelegramBotApiError::Missing("tenant admission"))?
         .map(Some)
-        .ok_or_else(|| TelegramBotApiError::Api("tenant inactive".to_owned()))
+        .ok_or(TelegramBotApiError::Missing("active tenant"))
 }
 
 fn failure(code: &'static str) -> ProbeOutcome {
@@ -125,6 +125,37 @@ fn failure(code: &'static str) -> ProbeOutcome {
         code,
         retry_seconds: None,
         rate_limited: false,
+    }
+}
+
+fn map_result(result: Result<Option<ProbeSuccess>, TelegramBotApiError>) -> ProbeOutcome {
+    match result {
+        Ok(Some(result)) => ProbeOutcome::Success(result),
+        Ok(None) => failure("UNSUPPORTED_RESPONSE"),
+        Err(TelegramBotApiError::Rejected {
+            status: 429,
+            retry_after,
+            ..
+        }) => ProbeOutcome::Failure {
+            code: "RATE_LIMITED",
+            retry_seconds: Some(
+                i32::try_from(retry_after.unwrap_or(60))
+                    .unwrap_or(i32::MAX)
+                    .max(1),
+            ),
+            rate_limited: true,
+        },
+        Err(TelegramBotApiError::Rejected { .. }) => failure("TELEGRAM_REJECTED"),
+        Err(
+            TelegramBotApiError::Request
+            | TelegramBotApiError::Missing(_)
+            | TelegramBotApiError::Server(_),
+        ) => ProbeOutcome::Failure {
+            code: "TELEGRAM_UNAVAILABLE",
+            retry_seconds: Some(30),
+            rate_limited: false,
+        },
+        Err(_) => failure("INVALID_RESPONSE"),
     }
 }
 
@@ -167,33 +198,11 @@ pub async fn execute(
         Ok(client) => client,
         Err(_) => return failure("CLIENT_UNAVAILABLE"),
     };
-    match client
-        .probe_target_admitted(claim.tg_chat_id, bot_id, Some((pool, tenant)))
-        .await
-    {
-        Ok(Some(result)) => ProbeOutcome::Success(result),
-        Ok(None) => failure("UNSUPPORTED_RESPONSE"),
-        Err(TelegramBotApiError::Rejected {
-            status: 429,
-            retry_after,
-            ..
-        }) => ProbeOutcome::Failure {
-            code: "RATE_LIMITED",
-            retry_seconds: Some(
-                i32::try_from(retry_after.unwrap_or(60))
-                    .unwrap_or(i32::MAX)
-                    .max(1),
-            ),
-            rate_limited: true,
-        },
-        Err(TelegramBotApiError::Rejected { .. }) => failure("TELEGRAM_REJECTED"),
-        Err(TelegramBotApiError::Request | TelegramBotApiError::Api(_)) => ProbeOutcome::Failure {
-            code: "TELEGRAM_UNAVAILABLE",
-            retry_seconds: Some(30),
-            rate_limited: false,
-        },
-        Err(_) => failure("INVALID_RESPONSE"),
-    }
+    map_result(
+        client
+            .probe_target_admitted(claim.tg_chat_id, bot_id, Some((pool, tenant)))
+            .await,
+    )
 }
 
 pub async fn run(pool: PgPool, kek: Arc<dyn Kek>, mut shutdown: watch::Receiver<bool>) {
@@ -237,6 +246,30 @@ pub async fn run(pool: PgPool, kek: Arc<dyn Kek>, mut shutdown: watch::Receiver<
             if finish_probe(&pool, tenant, claim, outcome).await.is_err() {
                 tracing::warn!("目标自检回写失败，等待租约恢复");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TelegramBotApiError, map_result};
+    use tgm_db::target_probe::ProbeOutcome;
+
+    #[test]
+    fn missing_result_and_server_failure_remain_retryable() {
+        for error in [
+            TelegramBotApiError::Missing("response result"),
+            TelegramBotApiError::Server(503),
+        ] {
+            let outcome = map_result(Err(error));
+            assert!(matches!(
+                outcome,
+                ProbeOutcome::Failure {
+                    code: "TELEGRAM_UNAVAILABLE",
+                    retry_seconds: Some(30),
+                    rate_limited: false
+                }
+            ));
         }
     }
 }

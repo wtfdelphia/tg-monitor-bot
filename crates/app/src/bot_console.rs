@@ -56,14 +56,15 @@ pub enum TelegramBotApiError {
     Response(#[source] serde_json::Error),
     #[error("Telegram Bot API 响应过大")]
     ResponseTooLarge,
-    #[error("Telegram Bot API 调用失败：{0}")]
-    Api(String),
+    #[error("Telegram Bot API 响应缺少 {0}")]
+    Missing(&'static str),
+    #[error("Telegram Bot API 服务失败（HTTP {0}）")]
+    Server(u16),
     /// Telegram 明确拒绝了请求（HTTP 4xx，`ok=false`）。`status` 用于区分可重试的 429
     /// 与不可恢复的 403（收件人没私聊过 Bot 或已拉黑）。
-    #[error("Telegram Bot API 拒绝请求（HTTP {status}）：{description}")]
+    #[error("Telegram Bot API 拒绝请求（HTTP {status}）")]
     Rejected {
         status: u16,
-        description: String,
         retry_after: Option<u32>,
     },
 }
@@ -176,7 +177,7 @@ impl TelegramBotApiClient {
         let result = self
             .request("getMe", &serde_json::json!({}))
             .await?
-            .ok_or_else(|| TelegramBotApiError::Api("getMe 缺少 result".to_owned()))?;
+            .ok_or(TelegramBotApiError::Missing("getMe result"))?;
         serde_json::from_value(result).map_err(TelegramBotApiError::Response)
     }
 
@@ -230,33 +231,25 @@ impl TelegramBotApiClient {
             Err(_) if status.is_client_error() => {
                 return Err(TelegramBotApiError::Rejected {
                     status: status.as_u16(),
-                    description: "Telegram 拒绝请求".to_owned(),
                     retry_after: None,
                 });
             }
             Err(_) if !status.is_success() => {
-                return Err(TelegramBotApiError::Api(format!(
-                    "HTTP {}",
-                    status.as_u16()
-                )));
+                return Err(TelegramBotApiError::Server(status.as_u16()));
             }
             Err(error) => return Err(TelegramBotApiError::Response(error)),
         };
         if !status.is_success() || !envelope.ok {
-            let description = envelope
-                .description
-                .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
             let error_status = envelope.error_code.unwrap_or(status.as_u16());
             if (400..500).contains(&error_status) {
                 return Err(TelegramBotApiError::Rejected {
                     status: error_status,
-                    description,
                     retry_after: envelope
                         .parameters
                         .and_then(|parameters| parameters.retry_after),
                 });
             }
-            return Err(TelegramBotApiError::Api(description));
+            return Err(TelegramBotApiError::Server(error_status));
         }
         Ok(envelope.result)
     }
@@ -265,7 +258,6 @@ impl TelegramBotApiClient {
 #[derive(Debug, Deserialize)]
 struct BotApiResponse {
     ok: bool,
-    description: Option<String>,
     result: Option<serde_json::Value>,
     error_code: Option<u16>,
     parameters: Option<BotApiParameters>,
@@ -877,9 +869,53 @@ mod tests {
             .expect_err("Bot API 失败响应不应被视为成功");
         assert!(matches!(
             error,
-            TelegramBotApiError::Rejected { status: 429, description, .. } if description == "retry"
+            TelegramBotApiError::Rejected {
+                status: 429,
+                retry_after: None
+            }
         ));
         let _ = server.await.expect("等待 Bot API mock 失败");
+    }
+
+    #[tokio::test]
+    async fn bot_api_errors_do_not_format_remote_body_or_token() {
+        const TOKEN: &str = "123456:credential-no-dump-sentinel";
+        const DESCRIPTION: &str = "/bot123456:credential-no-dump-sentinel/getMe";
+
+        for (status, error_code) in [(403, 403), (503, 503)] {
+            let body = format!(
+                r#"{{"ok":false,"error_code":{error_code},"description":"{DESCRIPTION}"}}"#
+            );
+            let response: &'static str = Box::leak(
+                format!(
+                    "HTTP/1.1 {status} failure\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_boxed_str(),
+            );
+            let (base_url, server) = mock_bot_api(response).await;
+            let client =
+                TelegramBotApiClient::new(Arc::new(Secret::new(TOKEN.to_owned())), base_url)
+                    .expect("创建 Bot API client 失败");
+            let error = client
+                .get_me()
+                .await
+                .expect_err("Bot API 失败响应不应被视为成功");
+            let direct = format!("{error} {error:?}");
+            let wrapped = format!(
+                "{} {:?}",
+                super::ConsoleLoginReplyError::from(error),
+                super::ConsoleLoginReplyError::from(TelegramBotApiError::Request)
+            );
+            for output in [direct, wrapped] {
+                assert!(!output.contains(TOKEN), "错误格式化泄漏 Token：{output}");
+                assert!(
+                    !output.contains(DESCRIPTION),
+                    "错误格式化泄漏远端响应正文：{output}"
+                );
+            }
+            let _ = server.await.expect("等待 Bot API mock 失败");
+        }
     }
 
     #[tokio::test]
