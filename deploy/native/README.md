@@ -51,6 +51,65 @@ SHA256SUMS.sigstore.json
 timer，并核对解析诊断。缺少或为空的 `OnCalendar`、非法日历、未知或忽略的本任务
 unit/timer 配置都会失败。上述检查不安装或启用任何服务，也不代替目标机实际沙箱验证。
 
+## 统一目标机验收入口
+
+候选 Release 的下载、验签、来源证明、候选隔离安装和平台分流可由仓库中的统一脚本完成：
+
+```bash
+bash scripts/tgm-native-target-acceptance.sh auto \
+  --tag candidate-<run>-a<attempt>-<commit12>
+```
+
+`auto` 根据 `/etc/os-release` 识别 Rocky 9 或 CentOS 7；也可显式使用 `rocky` 或 `centos7`。
+脚本内置当前候选 tag，也可通过 `--tag` 或 `TGM_CANDIDATE_TAG` 覆盖；切换候选时应显式指定，避免误验收过期候选。材料目录默认保留在
+`$HOME/tgm-candidate.XXXXXX`，
+便于将验收证据单独归档；也可用 `--materials <目录> --no-download` 复用已下载材料。
+
+例如：
+
+```bash
+bash scripts/tgm-native-target-acceptance.sh auto \
+  --tag candidate-42399939250-a1-eb973d62f24d \
+  --helpers-dir "$PWD"
+```
+
+下载模式不会覆盖材料目录中已有的文件；复用已有材料时必须使用 `--no-download`，且所有材料
+必须是当前用户拥有的普通文件，不能是符号链接。
+
+Rocky 模式在候选隔离安装后执行 `native-release-preflight.sh --app-services`，并调用来源一致的
+`scripts/wp8-rocky-app-acceptance.py` 完成六角色非生产 user systemd 验收。若要把日志脱敏计为
+通过，目标机必须临时允许 `sudo -n journalctl` 只读查询；没有该权限时脚本应失败，不会把日志检查
+伪装成通过。CentOS 7 模式要求原生应用预检按 `systemd 219 -SECCOMP` 能力缺失拒绝，拒绝结果
+是预期的安全结论，不得删除 `RestrictAddressFamilies` 或放宽预检。
+
+仓库脚本本身只负责下载和验证候选材料；Rocky 六角色辅助脚本及 `scripts/init/01-roles.sql`
+需从同一来源 `dev` 单独提供。可在已核对的 `dev` 工作树中生成辅助包：
+
+```bash
+git archive --format=tar.gz --output=wp8-target-acceptance-helpers.tar.gz dev \
+  scripts/tgm-native-target-acceptance.sh \
+  scripts/wp8-rocky-app-acceptance.py \
+  scripts/check-native-service-runtime.py \
+  scripts/init/01-roles.sql deploy/systemd/app
+sha256sum wp8-target-acceptance-helpers.tar.gz
+```
+
+目标机解压后，在辅助包根目录执行：
+
+```bash
+bash scripts/tgm-native-target-acceptance.sh auto \
+  --tag candidate-<run>-a<attempt>-<commit12> \
+  --helpers-dir "$PWD"
+```
+
+如果只想复用已下载材料，使用 `--materials <目录> --no-download`；如果切换到新的候选 Release，
+使用 `--tag candidate-<run>-a<attempt>-<commit12>`。不要手工拼接归档名或版本号，脚本会从
+`candidate-BUILDINFO.json` 派生并核对归档名、候选 tag、来源提交与 provenance。
+
+脚本不会连接生产 Telegram、KMS 或对象存储，也不会启用 cleanup timer、执行生产迁移或删除真实
+生产数据。Rocky 模式中的迁移和 RLS 审计仅运行在脚本创建的本机临时 PostgreSQL 中；完成后只清理
+本次随机命名的 Compose project、容器、网络、卷、临时 unit 与验收目录。
+
 ## root 安装
 
 root 模式安装到 `/opt/tgm/releases/@VERSION@`，并原子更新 `/usr/local/bin/tgm`。它还会
