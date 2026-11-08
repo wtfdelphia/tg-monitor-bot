@@ -63,7 +63,7 @@ bash scripts/tgm-native-target-acceptance.sh auto \
 `auto` 根据 `/etc/os-release` 识别 Rocky 9 或 CentOS 7；也可显式使用 `rocky` 或 `centos7`。
 脚本内置当前候选 tag，也可通过 `--tag` 或 `TGM_CANDIDATE_TAG` 覆盖；切换候选时应显式指定，避免误验收过期候选。材料目录默认保留在
 `$HOME/tgm-candidate.XXXXXX`，
-便于将验收证据单独归档；也可用 `--materials <目录> --no-download` 复用已下载材料。
+便于将验收证据单独归档；也可用 `--materials <目录> --no-download` 完全离线复用已下载材料。
 
 例如：
 
@@ -73,8 +73,16 @@ bash scripts/tgm-native-target-acceptance.sh auto \
   --helpers-dir "$PWD"
 ```
 
-下载模式不会覆盖材料目录中已有的文件；复用已有材料时必须使用 `--no-download`，且所有材料
-必须是当前用户拥有的普通文件，不能是符号链接。
+默认下载不会覆盖材料目录中已有的文件；需要只补齐缺失文件时使用
+`--materials <目录> --reuse-materials`，完全离线复用现有材料时使用
+`--materials <目录> --no-download`。两种复用方式都要求材料是当前用户拥有的非空普通文件，
+不能是符号链接，且最终仍会执行完整的签名、provenance、SHA-256 和包内容验证。
+
+下载默认按 Release 直链、GitHub API 资产端点、已登录 `gh` 顺序回退，并对每个文件执行有限轮次
+重试。可用 `--download-source direct|api|gh` 固定来源，或用
+`TGM_DOWNLOAD_ATTEMPTS`、`TGM_DOWNLOAD_BACKOFF`、`TGM_CONNECT_TIMEOUT` 调整重试参数。
+脚本沿用 `https_proxy`/`HTTPS_PROXY` 等代理变量；这只影响目标机下载，不会自动配置 Docker
+daemon。Rocky 六角色验收拉取依赖镜像时，Docker daemon 需要单独配置代理。
 
 Rocky 模式在候选隔离安装后执行 `native-release-preflight.sh --app-services`，并调用来源一致的
 `scripts/wp8-rocky-app-acceptance.py` 完成六角色非生产 user systemd 验收。若要把日志脱敏计为
@@ -102,7 +110,8 @@ bash scripts/tgm-native-target-acceptance.sh auto \
   --helpers-dir "$PWD"
 ```
 
-如果只想复用已下载材料，使用 `--materials <目录> --no-download`；如果切换到新的候选 Release，
+如果只想补下材料目录中缺失的文件，使用 `--materials <目录> --reuse-materials`；如果完全离线
+复用已下载材料，使用 `--materials <目录> --no-download`。如果切换到新的候选 Release，
 使用 `--tag candidate-<run>-a<attempt>-<commit12>`。不要手工拼接归档名或版本号，脚本会从
 `candidate-BUILDINFO.json` 派生并核对归档名、候选 tag、来源提交与 provenance。
 
