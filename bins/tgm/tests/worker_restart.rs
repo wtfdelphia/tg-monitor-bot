@@ -1,3 +1,5 @@
+mod support;
+
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -190,9 +192,10 @@ async fn fanout_process_recovers_partial_work_after_hard_kill(admin: PgPool) -> 
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&admin)
         .await?;
+    let port = support::pg_port()?;
     let app_options = PgConnectOptions::new()
         .host("127.0.0.1")
-        .port(55432)
+        .port(port)
         .username("app_user")
         .password("apw")
         .database(&database);
@@ -202,7 +205,7 @@ async fn fanout_process_recovers_partial_work_after_hard_kill(admin: PgPool) -> 
         .await?;
     assert_eq!(current_user, "app_user");
     let app_url = format!(
-        "postgres://app_user:apw@127.0.0.1:55432/{database}?application_name=tgm-restart-regression&options=-c%20client_connection_check_interval%3D100ms"
+        "postgres://app_user:apw@127.0.0.1:{port}/{database}?application_name=tgm-restart-regression&options=-c%20client_connection_check_interval%3D100ms"
     );
     let tenant = sqlx::query_scalar::<_, TenantId>(
         "INSERT INTO tenants (name, owner_user_id)
@@ -380,10 +383,11 @@ async fn rule_process_rolls_back_uncommitted_tasks_and_recovers_after_hard_kill(
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&admin)
         .await?;
+    let port = support::pg_port()?;
     let app = PgPool::connect_with(
         PgConnectOptions::new()
             .host("127.0.0.1")
-            .port(55432)
+            .port(port)
             .username("app_user")
             .password("apw")
             .database(&database),
@@ -400,7 +404,7 @@ async fn rule_process_rolls_back_uncommitted_tasks_and_recovers_after_hard_kill(
     .await?;
     assert!(!bypasses_rls);
     let app_url = format!(
-        "postgres://app_user:apw@127.0.0.1:55432/{database}?application_name=tgm-rule-restart-regression&options=-c%20client_connection_check_interval%3D100ms"
+        "postgres://app_user:apw@127.0.0.1:{port}/{database}?application_name=tgm-rule-restart-regression&options=-c%20client_connection_check_interval%3D100ms"
     );
     let tenant = sqlx::query_scalar::<_, TenantId>(
         "INSERT INTO tenants (name, owner_user_id)
@@ -576,6 +580,7 @@ async fn worker_processes_exit_cleanly_on_sigterm(admin: PgPool) -> Result<()> {
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&admin)
         .await?;
+    let port = support::pg_port()?;
     let kek_env: &[(&str, &str)] = &[
         ("TGM_KEK_BACKEND", "env"),
         (
@@ -604,7 +609,7 @@ async fn worker_processes_exit_cleanly_on_sigterm(admin: PgPool) -> Result<()> {
     for (role, extra_env) in cases {
         let application_name = format!("tgm-sigterm-{role}");
         let app_url = format!(
-            "postgres://app_user:apw@127.0.0.1:55432/{database}?application_name={application_name}"
+            "postgres://app_user:apw@127.0.0.1:{port}/{database}?application_name={application_name}"
         );
         let mut worker = WorkerProcess::start_role_with_env(&app_url, role, extra_env)?;
         wait_for_worker_connect(&admin, &application_name).await?;

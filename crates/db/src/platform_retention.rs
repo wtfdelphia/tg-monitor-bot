@@ -105,8 +105,9 @@ mod tests {
         let database: String = sqlx::query_scalar("SELECT current_database()")
             .fetch_one(&admin)
             .await?;
+        let port = std::env::var("TGM_TEST_PG_PORT").unwrap_or_else(|_| "55432".to_owned());
         let pool = PgPool::connect(&format!(
-            "postgres://platform_cleanup:pcpw@127.0.0.1:55432/{database}"
+            "postgres://platform_cleanup:pcpw@127.0.0.1:{port}/{database}"
         ))
         .await?;
         check_connection(&pool).await?;

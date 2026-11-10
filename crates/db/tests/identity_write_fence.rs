@@ -114,6 +114,47 @@ async fn audit_detects_and_restores_each_fence_mutation(injected: PgPool) -> Tes
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]
+async fn c2_requires_flood_wait_column_update_only_for_app_user(injected: PgPool) -> TestResult {
+    let (app, admin) = support::pools(injected).await;
+    support::assert_role(&app, "app_user").await;
+    async fn run_c2(pool: &PgPool, sql: String) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
+            .fetch_all(pool)
+            .await
+    }
+    let c2 = tgm_db::audit::parse(include_str!("../src/audit/queries.sql"))
+        .into_iter()
+        .find(|assertion| assertion.id == "C2")
+        .ok_or("C2 missing")?;
+    let baseline = run_c2(&app, c2.sql.clone()).await?;
+    assert!(
+        baseline.is_empty(),
+        "unexpected C2 baseline violations: {baseline:?}"
+    );
+    for mutation in [
+        "REVOKE UPDATE (flood_wait_until) ON public.identities FROM app_user",
+        "GRANT UPDATE (flood_wait_until) ON public.identities TO platform_ops",
+    ] {
+        let mut transaction = admin.raw().begin().await?;
+        sqlx::query("SET LOCAL ROLE tgm_owner")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(mutation).execute(&mut *transaction).await?;
+        let violations: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(c2.sql.clone()))
+            .fetch_all(&mut *transaction)
+            .await?;
+        assert_eq!(
+            violations.len(),
+            1,
+            "C2 must identify only the bad column grant"
+        );
+        transaction.rollback().await?;
+        assert!(run_c2(&app, c2.sql.clone()).await?.is_empty());
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
 async fn direct_writes_require_active_tenant_and_matching_context(injected: PgPool) -> TestResult {
     let (app, admin) = support::pools(injected).await;
     support::assert_role(&app, "app_user").await;

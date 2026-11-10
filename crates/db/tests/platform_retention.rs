@@ -14,7 +14,8 @@ async fn setup(
     let cleanup = PgPoolOptions::new()
         .max_connections(2)
         .connect(&format!(
-            "postgres://platform_cleanup:pcpw@127.0.0.1:55432/{database}"
+            "postgres://platform_cleanup:pcpw@127.0.0.1:{}/{database}",
+            support::direct_port()
         ))
         .await?;
     support::assert_role(&cleanup, "platform_cleanup").await;
@@ -228,7 +229,8 @@ async fn log_policy_refuses_forgery_and_unrelated_writers(
         ("auth_lookup", "lpw"),
     ] {
         let pool = PgPool::connect(&format!(
-            "postgres://{role}:{password}@127.0.0.1:55432/{database}"
+            "postgres://{role}:{password}@127.0.0.1:{}/{database}",
+            support::direct_port()
         ))
         .await?;
         assert!(check_connection(&pool).await.is_err());
@@ -318,7 +320,8 @@ async fn unsupported_isolation_and_changed_privileges_are_rejected(
             })
         })
         .connect(&format!(
-            "postgres://platform_cleanup:pcpw@127.0.0.1:55432/{database}"
+            "postgres://platform_cleanup:pcpw@127.0.0.1:{}/{database}",
+            support::direct_port()
         ))
         .await?;
     assert!(matches!(

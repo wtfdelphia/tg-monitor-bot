@@ -29,6 +29,8 @@
 //! ```
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -233,7 +235,10 @@ async fn live_delivery_soak(admin: PgPool) {
         .fetch_one(&admin)
         .await
         .expect("读取库名失败");
-    let app_url = format!("postgres://app_user:apw@127.0.0.1:55432/{database}");
+    let app_url = format!(
+        "postgres://app_user:apw@127.0.0.1:{}/{database}",
+        support::pg_port().expect("读取测试 PostgreSQL 端口失败")
+    );
     let app = PgPoolOptions::new()
         .max_connections(2)
         .connect(&app_url)

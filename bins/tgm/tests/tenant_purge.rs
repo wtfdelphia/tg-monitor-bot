@@ -1,13 +1,8 @@
+mod support;
+
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use std::process::{Command, Output};
-
-fn direct_port() -> u16 {
-    std::env::var("TGM_TEST_PG_PORT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(55432)
-}
 
 fn command(url: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tgm"));
@@ -34,7 +29,7 @@ async fn cli_empty_scan_and_explicit_tenant_recheck(admin: PgPool) -> Result<()>
         .await?;
     let url = format!(
         "postgres://tenant_purge:pupw@127.0.0.1:{}/{database}?application_name=ignored",
-        direct_port()
+        support::pg_port()?
     );
     let output = command(&url).output()?;
     assert!(
@@ -76,7 +71,7 @@ async fn cli_purges_empty_due_tenant_and_is_idempotent(admin: PgPool) -> Result<
         .await?;
     let url = format!(
         "postgres://tenant_purge:pupw@127.0.0.1:{}/{database}",
-        direct_port()
+        support::pg_port()?
     );
     let tenant: i64 = sqlx::query_scalar(
         "INSERT INTO tenants(name,owner_user_id,status,deleted_at)
@@ -124,7 +119,7 @@ async fn cli_stops_after_inflight_block_and_does_not_run_later_categories(
         .await?;
     let url = format!(
         "postgres://tenant_purge:pupw@127.0.0.1:{}/{database}",
-        direct_port()
+        support::pg_port()?
     );
     let tenant: i64 = sqlx::query_scalar(
         "INSERT INTO tenants(name,owner_user_id,status,deleted_at)

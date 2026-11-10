@@ -9,8 +9,8 @@ use sqlx::types::chrono::{DateTime, Utc};
 use tgm_core::ids::{IdentityId, TenantId};
 use tgm_db::repo::{
     DeliveryTaskFailureInput, DeliveryTaskFailureStatus, claim_due_delivery_task,
-    complete_delivery_task, load_delivery_task_payload, record_delivery_failure,
-    recover_stale_delivery_tasks,
+    complete_delivery_task, list_delivery_sender_candidates, load_delivery_task_payload,
+    record_delivery_failure, recover_stale_delivery_tasks,
 };
 
 async fn seed_tenant(admin: &support::AdminOnlyPool, name: &str) -> TenantId {
@@ -105,7 +105,7 @@ async fn seed_task(
     .bind(-30_000 - tenant.get())
     .bind(sender_identity_id)
     .bind(key)
-    .bind(tenant.get() * 1_000_000 + 1)
+    .bind(1_000_000_000_000_i64 + canonical_event_id)
     .bind(serde_json::json!({
         "source": {"tg_chat_id": -1001, "tg_message_id": 42, "media_type": "TEXT"},
         "message": {"text": "frozen message", "parse_mode": "HTML"}
@@ -201,11 +201,6 @@ async fn delivery_failures_retry_then_enter_dead_letter_and_log_each_attempt(adm
         .await
         .expect("首次领取投递任务失败")
         .expect("首次应领取到投递任务");
-    let flood_wait_until: DateTime<Utc> =
-        sqlx::query_scalar("SELECT clock_timestamp() + interval '90 seconds'")
-            .fetch_one(admin.raw())
-            .await
-            .expect("构造 FloodWait 截止时间失败");
     let first_failure = record_delivery_failure(
         &app,
         tenant,
@@ -213,9 +208,9 @@ async fn delivery_failures_retry_then_enter_dead_letter_and_log_each_attempt(adm
         DeliveryTaskFailureInput {
             status: DeliveryTaskFailureStatus::Pending,
             attempt_count: claimed.attempt_count + 1,
-            next_retry_at: Some(flood_wait_until),
-            error_code: "FLOOD_WAIT".to_owned(),
-            error_message: Some("retry after server delay".to_owned()),
+            next_retry_at: Some(Utc::now()),
+            error_code: "TIMEOUT".to_owned(),
+            error_message: Some("temporary delivery failure".to_owned()),
             latency_ms: Some(12),
         },
     )
@@ -287,6 +282,221 @@ async fn delivery_failures_retry_then_enter_dead_letter_and_log_each_attempt(adm
             .expect("死信领取查询失败")
             .is_none()
     );
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn flood_wait_pauses_one_bot_and_expiry_recovers_once(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let tenant = seed_tenant(&admin, "delivery-flood-wait").await;
+    let sender = seed_identity(&admin, tenant, "cooling").await;
+    let other_sender = seed_identity(&admin, tenant, "available").await;
+    let first_task = seed_task(&admin, tenant, sender, "delivery-flood-first").await;
+    let second_task = seed_task(&admin, tenant, sender, "delivery-flood-second").await;
+    let other_task = seed_task(&admin, tenant, other_sender, "delivery-flood-other").await;
+    for identity in [sender, other_sender] {
+        sqlx::query(
+            "INSERT INTO identity_secrets
+                (identity_id, secret_ciphertext, nonce, dek_ciphertext, kek_id)
+             VALUES ($1, $2, $3, $4, 'local:env:v1')",
+        )
+        .bind(identity.get())
+        .bind(vec![1_u8, 2, 3])
+        .bind(vec![4_u8, 5, 6])
+        .bind(vec![7_u8, 8, 9])
+        .execute(admin.raw())
+        .await
+        .expect("创建投递候选身份凭据失败");
+    }
+
+    let claimed = claim_due_delivery_task(&app, tenant, sender)
+        .await
+        .expect("领取限流测试任务失败")
+        .expect("限流前应领取首个任务");
+    assert_eq!(claimed.id, first_task);
+    let until: DateTime<Utc> =
+        sqlx::query_scalar("SELECT clock_timestamp() + interval '30 seconds'")
+            .fetch_one(admin.raw())
+            .await
+            .expect("构造身份冷却截止时间失败");
+    record_delivery_failure(
+        &app,
+        tenant,
+        first_task,
+        DeliveryTaskFailureInput {
+            status: DeliveryTaskFailureStatus::Pending,
+            attempt_count: 1,
+            next_retry_at: Some(until),
+            error_code: "FLOOD_WAIT".to_owned(),
+            error_message: Some("server requested a delay".to_owned()),
+            latency_ms: Some(2),
+        },
+    )
+    .await
+    .expect("原子持久化 FloodWait 失败");
+
+    let state: (String, DateTime<Utc>) =
+        sqlx::query_as("SELECT status, flood_wait_until FROM identities WHERE id = $1")
+            .bind(sender.get())
+            .fetch_one(admin.raw())
+            .await
+            .expect("读取发送身份冷却状态失败");
+    assert_eq!(state.0, "flood_wait");
+    assert!(state.1 >= until);
+    assert_eq!(
+        list_delivery_sender_candidates(&app, tenant)
+            .await
+            .expect("冷却期发送候选查询失败"),
+        vec![other_sender]
+    );
+    assert_eq!(task_status(&admin, second_task).await.0, "PENDING");
+    assert!(
+        claim_due_delivery_task(&app, tenant, sender)
+            .await
+            .expect("冷却期间领取查询失败")
+            .is_none()
+    );
+    assert_eq!(task_status(&admin, second_task).await.0, "PENDING");
+    assert_eq!(
+        claim_due_delivery_task(&app, tenant, other_sender)
+            .await
+            .expect("另一 Bot 领取查询失败")
+            .expect("冷却不应影响租户内另一 Bot")
+            .id,
+        other_task
+    );
+    let start_audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_logs
+          WHERE tenant_id = $1 AND resource_id = $2 AND action = 'identity.flood_wait'",
+    )
+    .bind(tenant)
+    .bind(sender.get())
+    .fetch_one(admin.raw())
+    .await
+    .expect("读取限流审计计数失败");
+    assert_eq!(start_audit_count, 1);
+
+    sqlx::query("UPDATE identities SET flood_wait_until = clock_timestamp() - interval '1 second' WHERE id = $1")
+        .bind(sender.get())
+        .execute(admin.raw())
+        .await
+        .expect("推进冷却到期时间失败");
+    let candidates = list_delivery_sender_candidates(&app, tenant)
+        .await
+        .expect("到期后发送候选查询失败");
+    assert!(candidates.contains(&sender));
+    let recovered_status: String =
+        sqlx::query_scalar("SELECT status FROM identities WHERE id = $1")
+            .bind(sender.get())
+            .fetch_one(admin.raw())
+            .await
+            .expect("读取候选扫描后的身份状态失败");
+    assert_eq!(recovered_status, "offline");
+    assert_eq!(
+        claim_due_delivery_task(&app, tenant, sender)
+            .await
+            .expect("到期后领取查询失败")
+            .expect("到期后应恢复并领取剩余任务")
+            .id,
+        second_task
+    );
+    let recovered_status: String =
+        sqlx::query_scalar("SELECT status FROM identities WHERE id = $1")
+            .bind(sender.get())
+            .fetch_one(admin.raw())
+            .await
+            .expect("读取冷却恢复状态失败");
+    assert_eq!(recovered_status, "offline");
+    let recovery_audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_logs WHERE tenant_id = $1 AND resource_id = $2
+          AND action = 'identity.flood_wait_recovered'",
+    )
+    .bind(tenant)
+    .bind(sender.get())
+    .fetch_one(admin.raw())
+    .await
+    .expect("读取冷却恢复审计计数失败");
+    assert_eq!(recovery_audit_count, 1);
+    let _ = claim_due_delivery_task(&app, tenant, sender)
+        .await
+        .expect("重复调度扫描失败");
+    let recovery_audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_logs WHERE tenant_id = $1 AND resource_id = $2
+          AND action = 'identity.flood_wait_recovered'",
+    )
+    .bind(tenant)
+    .bind(sender.get())
+    .fetch_one(admin.raw())
+    .await
+    .expect("复核冷却恢复审计计数失败");
+    assert_eq!(recovery_audit_count, 1);
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn flood_wait_audit_failure_rolls_back_task_identity_and_delivery_log(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let tenant = seed_tenant(&admin, "delivery-flood-rollback").await;
+    let sender = seed_identity(&admin, tenant, "rollback").await;
+    let task = seed_task(&admin, tenant, sender, "delivery-flood-rollback").await;
+    claim_due_delivery_task(&app, tenant, sender)
+        .await
+        .expect("领取回滚测试任务失败")
+        .expect("回滚测试任务应可领取");
+    sqlx::raw_sql(
+        "SET ROLE tgm_owner;
+         CREATE FUNCTION reject_delivery_flood_wait_audit() RETURNS trigger LANGUAGE plpgsql
+           AS $$ BEGIN IF NEW.action = 'identity.flood_wait' THEN RAISE EXCEPTION 'audit rejected'; END IF; RETURN NEW; END $$;
+         CREATE TRIGGER reject_delivery_flood_wait_audit BEFORE INSERT ON audit_logs
+           FOR EACH ROW EXECUTE FUNCTION reject_delivery_flood_wait_audit();
+         RESET ROLE;",
+    )
+    .execute(admin.raw())
+    .await
+    .expect("安装审计失败探针失败");
+    let until: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp() + interval '1 minute'")
+        .fetch_one(admin.raw())
+        .await
+        .expect("构造回滚测试截止时间失败");
+    assert!(
+        record_delivery_failure(
+            &app,
+            tenant,
+            task,
+            DeliveryTaskFailureInput {
+                status: DeliveryTaskFailureStatus::Pending,
+                attempt_count: 1,
+                next_retry_at: Some(until),
+                error_code: "FLOOD_WAIT".to_owned(),
+                error_message: Some("redacted in audit".to_owned()),
+                latency_ms: None,
+            },
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(task_status(&admin, task).await, ("SENDING".to_owned(), 0));
+    let identity_status: String = sqlx::query_scalar("SELECT status FROM identities WHERE id = $1")
+        .bind(sender.get())
+        .fetch_one(admin.raw())
+        .await
+        .expect("核对回滚后的身份状态失败");
+    assert_eq!(identity_status, "offline");
+    let log_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM delivery_logs WHERE task_id = $1")
+            .bind(task)
+            .fetch_one(admin.raw())
+            .await
+            .expect("核对回滚后的投递日志失败");
+    assert_eq!(log_count, 0);
+    sqlx::raw_sql(
+        "SET ROLE tgm_owner;
+         DROP TRIGGER reject_delivery_flood_wait_audit ON audit_logs;
+         DROP FUNCTION reject_delivery_flood_wait_audit();
+         RESET ROLE;",
+    )
+    .execute(admin.raw())
+    .await
+    .expect("清理审计失败探针失败");
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]

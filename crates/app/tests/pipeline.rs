@@ -1,5 +1,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::chrono::{TimeZone, Utc};
@@ -74,7 +76,8 @@ async fn app_pool(admin: &PgPool) -> PgPool {
     PgPoolOptions::new()
         .max_connections(3)
         .connect(&format!(
-            "postgres://app_user:apw@127.0.0.1:55432/{database}"
+            "postgres://app_user:apw@127.0.0.1:{}/{database}",
+            support::pg_port()
         ))
         .await
         .expect("连接 app_user 测试池失败")
@@ -89,10 +92,11 @@ async fn seed_tenant(admin: &PgPool) -> TenantId {
     .expect("创建测试租户失败")
 }
 
-async fn seed_identity(admin: &PgPool, tenant: TenantId) -> IdentityId {
+async fn seed_identity(admin: &PgPool, tenant: TenantId, kind: &str) -> IdentityId {
     sqlx::query_scalar::<_, IdentityId>(
-        "INSERT INTO identities (kind, tenant_id, status) VALUES ('mtproto', $1, 'offline') RETURNING id",
+        "INSERT INTO identities (kind, tenant_id, status) VALUES ($1, $2, 'offline') RETURNING id",
     )
+    .bind(kind)
     .bind(tenant)
     .fetch_one(admin)
     .await
@@ -108,8 +112,8 @@ async fn pipeline_fanout_rule_match_and_delivery_outbox_are_idempotent(admin: Pg
         .expect("读取测试角色失败");
     assert_eq!(current_user, "app_user", "规则链路测试必须使用受限角色");
     let tenant = seed_tenant(&admin).await;
-    let receiver_identity = seed_identity(&admin, tenant).await;
-    let sender_identity = seed_identity(&admin, tenant).await;
+    let receiver_identity = seed_identity(&admin, tenant, "mtproto").await;
+    let sender_identity = seed_identity(&admin, tenant, "bot").await;
 
     let source_ref: i64 = sqlx::query_scalar(
         "INSERT INTO source_subscriptions
@@ -427,7 +431,7 @@ async fn reclaimed_projection_remains_not_found_and_new_events_continue(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app = app_pool(&admin).await;
     let tenant = seed_tenant(&admin).await;
-    let identity = seed_identity(&admin, tenant).await;
+    let identity = seed_identity(&admin, tenant, "mtproto").await;
     sqlx::query("INSERT INTO source_subscriptions (tenant_id,tg_chat_id,receiver_identity_id) VALUES ($1,-1001,$2)")
         .bind(tenant).bind(identity).execute(&admin).await?;
     let event: i64 = sqlx::query_scalar("INSERT INTO canonical_events (adapter,receiver_identity_id,tg_chat_id,tg_message_id,message_date,created_at)
@@ -477,7 +481,7 @@ async fn reclaimed_projection_remains_not_found_and_new_events_continue(
 async fn delivery_worker_stops_cleanly_when_shutdown_is_requested(admin: PgPool) {
     let app = app_pool(&admin).await;
     let tenant = seed_tenant(&admin).await;
-    let sender_identity = seed_identity(&admin, tenant).await;
+    let sender_identity = seed_identity(&admin, tenant, "bot").await;
     let transport = Arc::new(ExpectingTransport {
         expected_text: String::new(),
         expected_random_id: 1,
@@ -512,7 +516,7 @@ async fn delivery_worker_stops_cleanly_when_shutdown_is_requested(admin: PgPool)
 async fn rule_worker_processes_pending_events_and_stops_cleanly(admin: PgPool) {
     let app = app_pool(&admin).await;
     let tenant = seed_tenant(&admin).await;
-    let receiver_identity = seed_identity(&admin, tenant).await;
+    let receiver_identity = seed_identity(&admin, tenant, "mtproto").await;
 
     let _source_ref: i64 = sqlx::query_scalar(
         "INSERT INTO source_subscriptions
@@ -606,7 +610,7 @@ async fn rule_worker_processes_pending_events_and_stops_cleanly(admin: PgPool) {
 async fn fanout_worker_marks_events_and_stops_cleanly(admin: PgPool) {
     let app = app_pool(&admin).await;
     let tenant = seed_tenant(&admin).await;
-    let receiver_identity = seed_identity(&admin, tenant).await;
+    let receiver_identity = seed_identity(&admin, tenant, "mtproto").await;
     let _source_ref: i64 = sqlx::query_scalar(
         "INSERT INTO source_subscriptions
             (tenant_id, tg_chat_id, receiver_identity_id, enabled)

@@ -528,7 +528,7 @@ async fn retry_budget_and_database_state_constraints_are_enforced(
         },
     )
     .await?;
-    let permission: bool = sqlx::query_scalar("SELECT has_column_privilege(current_user, 'identities', 'target_probe_not_before', 'UPDATE') AND NOT has_column_privilege(current_user, 'identities', 'tenant_id', 'UPDATE') AND NOT has_table_privilege(current_user, 'identities', 'UPDATE')").fetch_one(&app).await?;
+    let permission: bool = sqlx::query_scalar("SELECT has_column_privilege(current_user, 'identities', 'target_probe_not_before', 'UPDATE') AND has_column_privilege(current_user, 'identities', 'flood_wait_until', 'UPDATE') AND NOT has_column_privilege(current_user, 'identities', 'tenant_id', 'UPDATE') AND NOT has_table_privilege(current_user, 'identities', 'UPDATE')").fetch_one(&app).await?;
     assert!(permission);
     for attempt in 1..=3 {
         let claim = claim_probe(&app, tenant, format!("attempt-{attempt}"))

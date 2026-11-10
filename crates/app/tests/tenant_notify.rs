@@ -172,7 +172,10 @@ async fn pending_notification_survives_process_kill_before_response(admin: PgPoo
         .fetch_one(&app)
         .await
         .expect("读取通知测试库名失败");
-    let database_url = format!("postgres://app_user:apw@127.0.0.1:55432/{database}");
+    let database_url = format!(
+        "postgres://app_user:apw@127.0.0.1:{}/{database}",
+        support::pg_port()
+    );
     let tenant = support::seed_tenant(&admin, "tn-restart", 7109).await;
     let identity = seed(&admin, tenant, "mtproto").await;
     let holder = lease(&app, tenant, identity, "worker-restart").await;

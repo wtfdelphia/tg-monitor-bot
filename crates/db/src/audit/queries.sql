@@ -539,6 +539,8 @@ SELECT q::text FROM (
 -- 但拦不住「先删后建」这种等效操作。真正的保证靠 §2.5 的「写入路径只有一条」。
 --
 -- eng/04 原文只查 app_user，本实现按 A0 的派生查全部运行时角色。
+-- SQLx 临时库中 tgm_test 是测试库 owner，且 0014 为它逐表授予测试控制权限；
+-- 该实例只用于测试迁移，不是业务运行时角色，按 C15 同一身份条件从派生中排除。
 -- 实测过一处写法陷阱：**列级 REVOKE 减不掉表级 GRANT**。
 --   GRANT UPDATE ON identities → 表级，has_column_privilege 对每一列都为 t
 --   再 REVOKE UPDATE (tenant_id) → 仍然是 t
@@ -565,6 +567,20 @@ SELECT q::text FROM (
   SELECT rr.rolname AS role, 'identities.tenant_id UPDATE' AS what
   FROM runtime_role rr
   WHERE has_column_privilege(rr.oid, 'identities'::regclass, 'tenant_id', 'UPDATE')
+    AND NOT (rr.rolname = 'tgm_test' AND rr.oid =
+             (SELECT datdba FROM pg_database WHERE datname = current_database()))
+  UNION ALL
+  SELECT rr.rolname, 'identities.flood_wait_until UPDATE'
+  FROM runtime_role rr
+  WHERE rr.rolname <> 'app_user'
+    AND has_column_privilege(rr.oid, 'identities'::regclass, 'flood_wait_until', 'UPDATE')
+    AND NOT (rr.rolname = 'tgm_test' AND rr.oid =
+             (SELECT datdba FROM pg_database WHERE datname = current_database()))
+  UNION ALL
+  SELECT 'app_user', 'identities.flood_wait_until UPDATE'
+  WHERE NOT has_column_privilege(
+    'app_user'::regrole, 'identities'::regclass, 'flood_wait_until', 'UPDATE'
+  )
   ORDER BY 1
 ) q;
 

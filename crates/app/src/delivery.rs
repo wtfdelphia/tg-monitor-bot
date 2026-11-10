@@ -1058,6 +1058,19 @@ pub fn decide_failure(
     jitter_seconds: i64,
 ) -> DeliveryFailureDecision {
     let current_attempt = previous_attempt_count.saturating_add(1);
+    if let DeliveryErrorKind::FloodWait { seconds } = error {
+        let retry_after = match current_attempt {
+            1 => 30,
+            2 => 5 * 60,
+            3 => 30 * 60,
+            _ => 30 * 60,
+        };
+        return DeliveryFailureDecision {
+            status: DeliveryDecisionStatus::Pending,
+            attempt_count: current_attempt,
+            next_retry_after_seconds: Some(retry_after.max(seconds.max(0)) + jitter_seconds.max(0)),
+        };
+    }
     if matches!(error, DeliveryErrorKind::Permanent) {
         return DeliveryFailureDecision {
             status: DeliveryDecisionStatus::Dead,
@@ -1134,6 +1147,14 @@ mod tests {
         let decision = decide_failure(0, DeliveryErrorKind::FloodWait { seconds: 90 }, 3);
         assert_eq!(decision.status, DeliveryDecisionStatus::Pending);
         assert_eq!(decision.next_retry_after_seconds, Some(93));
+    }
+
+    #[test]
+    fn flood_wait_remains_retryable_after_generic_retry_limit() {
+        let decision = decide_failure(3, DeliveryErrorKind::FloodWait { seconds: 45 }, 0);
+        assert_eq!(decision.status, DeliveryDecisionStatus::Pending);
+        assert_eq!(decision.attempt_count, 4);
+        assert_eq!(decision.next_retry_after_seconds, Some(30 * 60));
     }
 
     #[test]

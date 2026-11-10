@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
+mod support;
+
 const ROLES: [&str; 6] = [
     "control-plane",
     "bot-gateway",
@@ -424,12 +426,13 @@ async fn native_roles_start_with_restricted_credentials_and_stop_cleanly(
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&admin)
         .await?;
+    let port = support::pg_port()?;
     let platform_identity: i64 = sqlx::query_scalar(
         "INSERT INTO identities (kind, tenant_id, status) VALUES ('bot', NULL, 'offline') RETURNING id",
     ).fetch_one(&admin).await?;
     for role in ROLES {
         let app_url = format!(
-            "postgres://app_user:apw@127.0.0.1:55432/{database}?application_name=tgm-native-{role}"
+            "postgres://app_user:apw@127.0.0.1:{port}/{database}?application_name=tgm-native-{role}"
         );
         let app = PgPool::connect(&app_url).await?;
         let current_user: String = sqlx::query_scalar("SELECT current_user")
@@ -454,7 +457,7 @@ async fn native_roles_start_with_restricted_credentials_and_stop_cleanly(
         if ["control-plane", "bot-gateway"].contains(&role) {
             values.push((
                 "TGM_DB_URL_AUTH",
-                format!("postgres://auth_lookup:lpw@127.0.0.1:55432/{database}"),
+                format!("postgres://auth_lookup:lpw@127.0.0.1:{port}/{database}"),
             ));
         }
         if ["fanout", "mtproto-worker", "delivery"].contains(&role) {
@@ -468,7 +471,7 @@ async fn native_roles_start_with_restricted_credentials_and_stop_cleanly(
         if role == "fanout" {
             values.push((
                 "TGM_DB_URL_MEDIA_CLEANUP",
-                format!("postgres://media_cleanup:mcpw@127.0.0.1:55432/{database}"),
+                format!("postgres://media_cleanup:mcpw@127.0.0.1:{port}/{database}"),
             ));
         }
         if role == "delivery" {
@@ -484,7 +487,7 @@ async fn native_roles_start_with_restricted_credentials_and_stop_cleanly(
             values.extend([
                 (
                     "TGM_DB_URL_OPS",
-                    format!("postgres://platform_ops:ppw@127.0.0.1:55432/{database}"),
+                    format!("postgres://platform_ops:ppw@127.0.0.1:{port}/{database}"),
                 ),
                 ("TGM_OIDC_BOT_ID", "1".to_owned()),
                 ("TGM_OIDC_ALG", "RS256".to_owned()),

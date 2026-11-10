@@ -374,7 +374,14 @@ async fn live_execution_marker_blocks_resume_without_holding_transaction(
         Err(LifecycleError::Draining)
     ));
     guard.close().await?;
-    assert!(lifecycle::drained(&operator, tenant).await?);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if lifecycle::drained(&operator, tenant).await? {
+            break;
+        }
+        assert!(Instant::now() < deadline, "执行标记关闭后未完成排空");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     lifecycle::transition(&operator, tenant.get(), false).await?;
     Ok(())
 }

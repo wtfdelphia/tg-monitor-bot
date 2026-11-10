@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use std::process::{Child, Command, Stdio};
@@ -29,8 +31,9 @@ async fn cli_uses_only_cleanup_identity_redacts_failures_and_stops_on_sigterm(
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&admin)
         .await?;
+    let port = support::pg_port()?;
     let cleanup_url = format!(
-        "postgres://tenant_cleanup:tcpw@127.0.0.1:55432/{database}?application_name=tgm-tenant-retention-cli"
+        "postgres://tenant_cleanup:tcpw@127.0.0.1:{port}/{database}?application_name=tgm-tenant-retention-cli"
     );
     sqlx::query("INSERT INTO tenants (name,owner_user_id,status) VALUES ('cli',94001,'suspended')")
         .execute(&admin)
@@ -62,7 +65,7 @@ async fn cli_uses_only_cleanup_identity_redacts_failures_and_stops_on_sigterm(
         ("postgres", "pw"),
     ] {
         let output = command(
-            &format!("postgres://{role}:{password}@127.0.0.1:55432/{database}"),
+            &format!("postgres://{role}:{password}@127.0.0.1:{port}/{database}"),
             "login-sessions",
         )
         .output()?;
@@ -198,8 +201,9 @@ async fn notification_cli_cancels_locked_batch_and_resumes(admin: PgPool) -> Res
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&admin)
         .await?;
+    let port = support::pg_port()?;
     let url = format!(
-        "postgres://tenant_cleanup:tcpw@127.0.0.1:55432/{database}?application_name=tgm-notification-retention-cli"
+        "postgres://tenant_cleanup:tcpw@127.0.0.1:{port}/{database}?application_name=tgm-notification-retention-cli"
     );
     let mut held = admin.begin().await?;
     sqlx::query("SELECT id FROM tenant_notifications FOR UPDATE")
@@ -279,7 +283,8 @@ async fn unmatched_cli_reports_protected_rows_and_refuses_incomplete_cycle(
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&admin)
         .await?;
-    let url = format!("postgres://tenant_cleanup:tcpw@127.0.0.1:55432/{database}");
+    let port = support::pg_port()?;
+    let url = format!("postgres://tenant_cleanup:tcpw@127.0.0.1:{port}/{database}");
     let output = command(&url, "unmatched-events").output()?;
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("retained=1"));

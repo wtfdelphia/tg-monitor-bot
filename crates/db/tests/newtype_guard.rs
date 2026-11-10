@@ -34,7 +34,10 @@ async fn admin_tx_is_the_usable_path(admin: sqlx::PgPool) {
         .expect("取库名失败");
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .connect(&format!("postgres://platform_ops:ppw@127.0.0.1:55432/{db}"))
+        .connect(&format!(
+            "postgres://platform_ops:ppw@127.0.0.1:{}/{db}",
+            support::direct_port()
+        ))
         .await
         .expect("以 platform_ops 连库失败");
     let admin_pool = AdminPool::new(pool);

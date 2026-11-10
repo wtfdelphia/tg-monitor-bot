@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use std::process::{Child, Command, Stdio};
@@ -29,8 +31,9 @@ async fn cli_cleans_fixed_categories_rejects_wrong_roles_and_stops_on_sigterm(
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&admin)
         .await?;
+    let port = support::pg_port()?;
     let cleanup_url = format!(
-        "postgres://auth_cleanup:cpw@127.0.0.1:55432/{database}?application_name=tgm-auth-retention-cli"
+        "postgres://auth_cleanup:cpw@127.0.0.1:{port}/{database}?application_name=tgm-auth-retention-cli"
     );
     for category in ["challenges", "web-sessions", "bot-sessions"] {
         let output = command(&cleanup_url, category).output()?;
@@ -56,7 +59,7 @@ async fn cli_cleans_fixed_categories_rejects_wrong_roles_and_stops_on_sigterm(
         ("postgres", "pw"),
     ] {
         let output = command(
-            &format!("postgres://{role}:{password}@127.0.0.1:55432/{database}"),
+            &format!("postgres://{role}:{password}@127.0.0.1:{port}/{database}"),
             "challenges",
         )
         .output()?;
