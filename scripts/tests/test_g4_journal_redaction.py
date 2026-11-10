@@ -185,6 +185,7 @@ class G4JournalRedactionTests(unittest.TestCase):
             "unit = next(arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--unit='))\n"
             "open(os.environ['G4_TEST_UNIT_FILE'], 'w').write(unit)\n"
             "open(os.environ['G4_TEST_SYSTEMD_RUN_ARGS'], 'w').write('\\n'.join(sys.argv))\n"
+            "raise SystemExit(int(os.environ.get('G4_TEST_SYSTEMD_RUN_STATUS', '0')))\n"
         )
         systemd_run.chmod(0o700)
         journalctl = fake_bin / "journalctl"
@@ -224,6 +225,62 @@ class G4JournalRedactionTests(unittest.TestCase):
             self.assertIn("journal_redaction: pass\n", report)
             self.assertIn("flood_wait_observed: not-run\n", report)
             self.assertEqual(list(temporary.iterdir()), [report_path])
+        finally:
+            report_path.unlink(missing_ok=True)
+        self.assertEqual(list(temporary.iterdir()), [])
+
+    def test_wrapper_reports_child_failure_even_when_flood_wait_is_not_run(self):
+        fake_bin = self.root / "failure-bin"
+        fake_bin.mkdir(mode=0o700)
+        temporary = self.root / "failure-tmp"
+        temporary.mkdir(mode=0o700)
+        unit_file = self.root / "failure-unit-name"
+        systemd_run = fake_bin / "systemd-run"
+        systemd_run.write_text(
+            f"#!{sys.executable}\n"
+            "import os, sys\n"
+            "unit = next(arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--unit='))\n"
+            "open(os.environ['G4_TEST_UNIT_FILE'], 'w').write(unit)\n"
+            "raise SystemExit(int(os.environ['G4_TEST_SYSTEMD_RUN_STATUS']))\n"
+        )
+        systemd_run.chmod(0o700)
+        journalctl = fake_bin / "journalctl"
+        journalctl.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os\n"
+            "unit = open(os.environ['G4_TEST_UNIT_FILE']).read()\n"
+            "print(json.dumps({'_SYSTEMD_USER_UNIT': unit, 'MESSAGE': 'safe failure record'}))\n"
+        )
+        journalctl.chmod(0o700)
+        systemctl = fake_bin / "systemctl"
+        systemctl.write_text(f"#!{sys.executable}\nraise SystemExit(0)\n")
+        systemctl.chmod(0o700)
+        environment = {
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "TMPDIR": str(temporary),
+            "TGM_G4_CONFIG_FILE": str(self.config),
+            "G4_TEST_UNIT_FILE": str(unit_file),
+            "G4_TEST_SYSTEMD_RUN_STATUS": "17",
+        }
+        result = subprocess.run(
+            ["bash", str(WRAPPER)],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            check=False,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("G4 真实限流退避闭环：partial/fail", result.stderr)
+        self.assertNotIn("本次未自然观察到 FLOOD_WAIT", result.stderr)
+        match = re.search(r"G4 报告：(.+)", result.stdout)
+        self.assertIsNotNone(match, result.stdout)
+        report_path = Path(match.group(1))
+        try:
+            report = report_path.read_text()
+            self.assertIn("flood_wait_observed: not-run\n", report)
+            self.assertIn("journal_redaction: pass\n", report)
         finally:
             report_path.unlink(missing_ok=True)
         self.assertEqual(list(temporary.iterdir()), [])

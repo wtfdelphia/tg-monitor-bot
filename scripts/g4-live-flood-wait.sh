@@ -64,13 +64,13 @@ finalize_report() {
   fi
 
   printf 'G4 报告：%s\n' "$REPORT"
-  if rg -q '^flood_wait_observed: not-run$' "$REPORT"; then
-    printf '%s\n' 'G4 真实限流退避闭环：not-run（本次未自然观察到 FLOOD_WAIT，未加压重试）' >&2
-    return 3
-  fi
   if [[ "$status" != 0 ]]; then
     printf '%s\n' 'G4 真实限流退避闭环：partial/fail；检查脱敏报告中的缺项' >&2
     return 1
+  fi
+  if rg -q '^flood_wait_observed: not-run$' "$REPORT"; then
+    printf '%s\n' 'G4 真实限流退避闭环：not-run（本次未自然观察到 FLOOD_WAIT，未加压重试）' >&2
+    return 3
   fi
 
   for field in flood_wait_observed retry_at_persisted identity_state retry_suppressed wait_expiry single_delivery_after_recovery duplicate_delivery journal_redaction cleanup; do
