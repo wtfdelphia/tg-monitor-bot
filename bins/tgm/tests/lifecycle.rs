@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::Result;
 use sqlx::PgPool;
 use std::process::Command;
@@ -20,7 +22,8 @@ async fn logical_delete_cli_enforces_state_credentials_role_and_redaction(
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&admin)
         .await?;
-    let url = format!("postgres://tenant_lifecycle:tlpw@127.0.0.1:55432/{database}");
+    let port = support::pg_port()?;
+    let url = format!("postgres://tenant_lifecycle:tlpw@127.0.0.1:{port}/{database}");
     let tenant: i64 = sqlx::query_scalar(
         "INSERT INTO tenants(name,owner_user_id) VALUES('cli-delete',97501) RETURNING id",
     )
@@ -41,7 +44,7 @@ async fn logical_delete_cli_enforces_state_credentials_role_and_redaction(
     }
     for (role, password) in [("app_user", "apw"), ("auth_lookup", "lpw")] {
         let output = command(
-            &format!("postgres://{role}:{password}@127.0.0.1:55432/{database}"),
+            &format!("postgres://{role}:{password}@127.0.0.1:{port}/{database}"),
             "delete",
             tenant,
         )

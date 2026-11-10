@@ -254,6 +254,7 @@ pub struct IdentityResponse {
     pub tg_user_id: Option<i64>,
     pub display_name: Option<String>,
     pub status: String,
+    pub flood_wait_until: Option<String>,
 }
 
 /// 提交 Bot Token。刻意不派生 `Debug`：token 明文不能经任何格式化路径出去。
@@ -2053,6 +2054,7 @@ async fn create_bot_identity(
             tg_user_id: Some(me.id),
             display_name,
             status: "offline".to_owned(),
+            flood_wait_until: None,
         }),
     ))
 }
@@ -2371,6 +2373,7 @@ async fn persist_qr_login(
                     tg_user_id: Some(authorized.tg_user_id),
                     display_name: authorized.display_name,
                     status,
+                    flood_wait_until: None,
                 }),
                 ..qr_status("confirmed")
             })
@@ -2669,6 +2672,7 @@ fn identity_response(record: tgm_db::repo::IdentityRecord) -> IdentityResponse {
         tg_user_id: record.tg_user_id,
         display_name: record.display_name,
         status: record.status,
+        flood_wait_until: record.flood_wait_until,
     }
 }
 
@@ -5363,6 +5367,11 @@ mod tests {
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
+    fn test_database_url() -> String {
+        let port = std::env::var("TGM_TEST_PG_PORT").unwrap_or_else(|_| "55432".to_owned());
+        format!("postgres://app_user:apw@127.0.0.1:{port}/tgm_test_control")
+    }
+
     #[test]
     fn metadata_patch_distinguishes_omitted_null_and_strings() {
         for (value, expected) in [
@@ -5863,7 +5872,7 @@ mod tests {
     #[tokio::test]
     async fn oidc_start_returns_server_side_pkce_redirect() {
         let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://app_user:apw@127.0.0.1:55432/tgm_test_control")
+            .connect_lazy(&test_database_url())
             .expect("构造惰性测试连接池失败");
         let state = ControlPlaneState::with_auth_pool_and_oidc(
             pool.clone(),
@@ -5946,7 +5955,7 @@ mod tests {
                 .expect("写入 OIDC 拒绝测试响应失败");
         });
         let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://app_user:apw@127.0.0.1:55432/tgm_test_control")
+            .connect_lazy(&test_database_url())
             .expect("构造惰性测试连接池失败");
         let state = ControlPlaneState::with_auth_pool_and_oidc(
             pool.clone(),
@@ -6066,7 +6075,7 @@ mod tests {
     #[tokio::test]
     async fn oidc_callback_missing_code_clears_cookie_after_consuming_state() {
         let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://app_user:apw@127.0.0.1:55432/tgm_test_control")
+            .connect_lazy(&test_database_url())
             .expect("构造惰性测试连接池失败");
         let state = ControlPlaneState::with_auth_pool_and_oidc(
             pool.clone(),

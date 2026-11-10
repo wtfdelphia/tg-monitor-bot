@@ -1,3 +1,5 @@
+mod support;
+
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::{Duration, Instant};
 
@@ -11,7 +13,8 @@ async fn batches_wait_overlap_cancel_and_resume(
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&format!(
-            "postgres://platform_cleanup:pcpw@127.0.0.1:55432/{database}"
+            "postgres://platform_cleanup:pcpw@127.0.0.1:{}/{database}",
+            support::pg_port()
         ))
         .await?;
     let role: String = sqlx::query_scalar("SELECT current_user")
@@ -76,7 +79,8 @@ async fn batches_wait_overlap_cancel_and_resume(
         1
     );
     let pool = PgPool::connect(&format!(
-        "postgres://platform_cleanup:pcpw@127.0.0.1:55432/{database}"
+        "postgres://platform_cleanup:pcpw@127.0.0.1:{}/{database}",
+        support::pg_port()
     ))
     .await?;
     let result = tgm_app::platform_retention::run(&pool, std::future::pending()).await?;

@@ -3830,6 +3830,12 @@
               "null"
             ]
           },
+          "flood_wait_until": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "integer",
             "format": "int64"

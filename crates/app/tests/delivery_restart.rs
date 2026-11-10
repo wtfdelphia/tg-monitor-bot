@@ -1,5 +1,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -181,20 +183,30 @@ async fn frozen_requests_survive_subprocess_kill_before_and_after_simulated_send
         .fetch_one(&admin)
         .await
         .expect("读取库名失败");
-    let url = format!("postgres://app_user:apw@127.0.0.1:55432/{database}");
+    let url = format!(
+        "postgres://app_user:apw@127.0.0.1:{}/{database}",
+        support::pg_port()
+    );
     let tenant: TenantId = sqlx::query_scalar(
         "INSERT INTO tenants (name, owner_user_id) VALUES ('delivery-restart', 7890) RETURNING id",
     )
     .fetch_one(&admin)
     .await
     .expect("创建租户失败");
-    let sender: IdentityId = sqlx::query_scalar(
+    let receiver: IdentityId = sqlx::query_scalar(
         "INSERT INTO identities (tenant_id, kind) VALUES ($1, 'mtproto') RETURNING id",
     )
     .bind(tenant)
     .fetch_one(&admin)
     .await
-    .expect("创建身份失败");
+    .expect("创建 MTProto 接收身份失败");
+    let sender: IdentityId = sqlx::query_scalar(
+        "INSERT INTO identities (tenant_id, kind) VALUES ($1, 'bot') RETURNING id",
+    )
+    .bind(tenant)
+    .fetch_one(&admin)
+    .await
+    .expect("创建 Bot 发送身份失败");
     let source_ref: i64 = sqlx::query_scalar(
         "INSERT INTO source_subscriptions
             (tenant_id, tg_chat_id, receiver_identity_id)
@@ -202,7 +214,7 @@ async fn frozen_requests_survive_subprocess_kill_before_and_after_simulated_send
          RETURNING id",
     )
     .bind(tenant)
-    .bind(sender)
+    .bind(receiver)
     .fetch_one(&admin)
     .await
     .expect("创建来源失败");
@@ -212,7 +224,7 @@ async fn frozen_requests_survive_subprocess_kill_before_and_after_simulated_send
          VALUES ('mtproto', $1, -1001, 42, clock_timestamp())
          RETURNING id",
     )
-    .bind(sender)
+    .bind(receiver)
     .fetch_one(&admin)
     .await
     .expect("创建规范化事件失败");

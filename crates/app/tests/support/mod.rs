@@ -5,6 +5,12 @@ use sqlx::PgPool;
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
 
+pub fn pg_port() -> u16 {
+    std::env::var("TGM_TEST_PG_PORT")
+        .map(|value| value.parse().expect("TGM_TEST_PG_PORT 必须是有效端口"))
+        .unwrap_or(55432)
+}
+
 pub struct AdminOnlyPool(PgPool);
 
 impl AdminOnlyPool {
@@ -22,7 +28,8 @@ pub async fn pools(injected: PgPool) -> (PgPool, AdminOnlyPool) {
     let app = PgPoolOptions::new()
         .max_connections(3)
         .connect(&format!(
-            "postgres://app_user:apw@127.0.0.1:55432/{database}"
+            "postgres://app_user:apw@127.0.0.1:{}/{database}",
+            pg_port()
         ))
         .await
         .expect("连接 app_user 测试池失败");
@@ -38,7 +45,8 @@ pub async fn auth_pool(admin: &AdminOnlyPool) -> PgPool {
     PgPoolOptions::new()
         .max_connections(3)
         .connect(&format!(
-            "postgres://auth_lookup:lpw@127.0.0.1:55432/{database}"
+            "postgres://auth_lookup:lpw@127.0.0.1:{}/{database}",
+            pg_port()
         ))
         .await
         .expect("连接 auth_lookup 测试池失败")
@@ -53,7 +61,8 @@ pub async fn media_cleanup_pool(admin: &AdminOnlyPool) -> PgPool {
     PgPoolOptions::new()
         .max_connections(3)
         .connect(&format!(
-            "postgres://media_cleanup:mcpw@127.0.0.1:55432/{database}"
+            "postgres://media_cleanup:mcpw@127.0.0.1:{}/{database}",
+            pg_port()
         ))
         .await
         .expect("连接 media_cleanup 测试池失败")

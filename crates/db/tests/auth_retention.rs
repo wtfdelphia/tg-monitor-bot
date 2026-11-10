@@ -13,7 +13,8 @@ async fn setup(
     let cleanup = PgPoolOptions::new()
         .max_connections(2)
         .connect(&format!(
-            "postgres://auth_cleanup:cpw@127.0.0.1:55432/{database}"
+            "postgres://auth_cleanup:cpw@127.0.0.1:{}/{database}",
+            support::direct_port()
         ))
         .await?;
     support::assert_role(&cleanup, "auth_cleanup").await;
@@ -141,7 +142,8 @@ async fn cleanup_role_cannot_access_secrets_or_mutate_sessions_and_logs(
         .await?;
     let app = PgPoolOptions::new()
         .connect(&format!(
-            "postgres://app_user:apw@127.0.0.1:55432/{database}"
+            "postgres://app_user:apw@127.0.0.1:{}/{database}",
+            support::direct_port()
         ))
         .await?;
     for table in [

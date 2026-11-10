@@ -1,3 +1,5 @@
+mod support;
+
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::{Duration, Instant};
 use tgm_db::auth_retention::Category;
@@ -12,7 +14,8 @@ async fn cleanup_runs_multiple_batches_waits_and_stops_without_leaking_transacti
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&format!(
-            "postgres://auth_cleanup:cpw@127.0.0.1:55432/{database}"
+            "postgres://auth_cleanup:cpw@127.0.0.1:{}/{database}",
+            support::pg_port()
         ))
         .await?;
     sqlx::query("INSERT INTO console_login_challenges (nonce, confirm_code, origin_ip, expires_at) SELECT int8send(number), 'ABCD', '127.0.0.1', now() - interval '1 hour' FROM generate_series(1, 5001) number")

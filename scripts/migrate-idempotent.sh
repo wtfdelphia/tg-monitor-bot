@@ -51,6 +51,13 @@ SELECT 'policy|'||schemaname||'.'||tablename||'|'||policyname||'|'||cmd
 SELECT 'grant|'||grantee||'|'||table_name||'|'||privilege_type
   FROM information_schema.role_table_grants
  WHERE table_schema='public' ORDER BY 1;
+SELECT 'column-grant|'||att.attname||'|'||acl.grantee::regrole||'|'||acl.privilege_type||'|'||acl.is_grantable
+  FROM pg_attribute att
+  JOIN pg_class rel ON rel.oid=att.attrelid
+  JOIN pg_namespace ns ON ns.oid=rel.relnamespace
+  CROSS JOIN LATERAL aclexplode(att.attacl) acl
+ WHERE ns.nspname='public' AND att.attnum>0 AND NOT att.attisdropped
+ ORDER BY 1;
 SQL
 }
 

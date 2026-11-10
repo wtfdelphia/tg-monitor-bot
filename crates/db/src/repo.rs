@@ -456,6 +456,7 @@ pub struct IdentityRecord {
     pub tg_user_id: Option<i64>,
     pub display_name: Option<String>,
     pub status: String,
+    pub flood_wait_until: Option<String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -525,6 +526,7 @@ struct IdentityWriteRecord {
     display_name: Option<String>,
     status: String,
     proxy_url: Option<String>,
+    flood_wait_until: Option<String>,
 }
 
 impl IdentityWriteRecord {
@@ -535,6 +537,7 @@ impl IdentityWriteRecord {
             tg_user_id: self.tg_user_id,
             display_name: self.display_name,
             status: self.status,
+            flood_wait_until: self.flood_wait_until,
         }
     }
 }
@@ -661,11 +664,19 @@ pub async fn list_tenant_identities(
         Box::pin(async move {
             sqlx::query_as::<_, IdentityRecord>(
                 r#"
-                SELECT id, kind, tg_user_id, display_name, status
+                SELECT id, kind, tg_user_id, display_name,
+                       CASE WHEN kind = 'bot' AND status = 'flood_wait'
+                                  AND flood_wait_until <= clock_timestamp()
+                            THEN 'offline' ELSE status END AS status,
+                       CASE WHEN flood_wait_until > clock_timestamp()
+                            THEN flood_wait_until::text END AS flood_wait_until
                   FROM identities
                  WHERE (tenant_id = $1 OR tenant_id IS NULL)
                    AND ($2::text IS NULL OR kind = $2)
-                   AND ($3::text IS NULL OR status = $3)
+                   AND ($3::text IS NULL OR
+                        CASE WHEN kind = 'bot' AND status = 'flood_wait'
+                                   AND flood_wait_until <= clock_timestamp()
+                             THEN 'offline' ELSE status END = $3)
                  ORDER BY id
                  LIMIT $4 OFFSET $5
                 "#,
@@ -698,11 +709,14 @@ pub async fn load_dashboard_summary(
                     (SELECT count(*)::bigint
                        FROM identities
                       WHERE (tenant_id = $1 OR tenant_id IS NULL)
-                        AND status = 'offline') AS identity_offline,
+                        AND (status = 'offline' OR
+                             (kind = 'bot' AND status = 'flood_wait'
+                              AND flood_wait_until <= clock_timestamp()))) AS identity_offline,
                     (SELECT count(*)::bigint
                        FROM identities
                       WHERE (tenant_id = $1 OR tenant_id IS NULL)
-                        AND status = 'flood_wait') AS identity_flood_wait,
+                        AND status = 'flood_wait'
+                        AND (kind <> 'bot' OR flood_wait_until > clock_timestamp())) AS identity_flood_wait,
                     (SELECT count(*)::bigint
                        FROM identities
                       WHERE (tenant_id = $1 OR tenant_id IS NULL)
@@ -737,11 +751,20 @@ pub async fn load_dashboard_summary(
                         AND log.created_at >= CURRENT_DATE
                         AND NOT log.ok) AS failed_today,
                     (SELECT max(next_retry_at)::text
-                       FROM delivery_tasks
-                      WHERE tenant_id = $1
-                        AND last_error_code = 'FLOOD_WAIT'
-                        AND status IN ('PENDING', 'FAILED')
-                        AND next_retry_at > clock_timestamp()) AS flood_wait_until
+                       FROM (
+                         SELECT next_retry_at
+                           FROM delivery_tasks
+                          WHERE tenant_id = $1
+                            AND last_error_code = 'FLOOD_WAIT'
+                            AND status IN ('PENDING', 'FAILED')
+                            AND next_retry_at > clock_timestamp()
+                         UNION ALL
+                         SELECT flood_wait_until
+                           FROM identities
+                          WHERE tenant_id = $1 AND kind = 'bot'
+                            AND status = 'flood_wait'
+                            AND flood_wait_until > clock_timestamp()
+                       ) waits) AS flood_wait_until
                 "#,
             )
             .bind(tenant.get())
@@ -1348,7 +1371,9 @@ pub async fn update_identity(
         Box::pin(async move {
             let before = sqlx::query_as::<_, IdentityWriteRecord>(
                 r#"
-                SELECT id, kind, tg_user_id, display_name, status, proxy_url
+                SELECT id, kind, tg_user_id, display_name, status, proxy_url,
+                       CASE WHEN flood_wait_until > clock_timestamp()
+                            THEN flood_wait_until::text END AS flood_wait_until
                   FROM identities
                  WHERE tenant_id = $1 AND id = $2
                  FOR UPDATE
@@ -1367,7 +1392,9 @@ pub async fn update_identity(
                        display_name = CASE WHEN $5 THEN $6::text ELSE display_name END,
                        updated_at = clock_timestamp()
                  WHERE tenant_id = $1 AND id = $2
-                RETURNING id, kind, tg_user_id, display_name, status, proxy_url
+                RETURNING id, kind, tg_user_id, display_name, status, proxy_url,
+                          CASE WHEN flood_wait_until > clock_timestamp()
+                               THEN flood_wait_until::text END AS flood_wait_until
                 "#,
             )
             .bind(tenant.get())
@@ -1430,7 +1457,9 @@ pub async fn reset_identity_status(
         Box::pin(async move {
             let before = sqlx::query_as::<_, IdentityWriteRecord>(
                 r#"
-                SELECT id, kind, tg_user_id, display_name, status, proxy_url
+                SELECT id, kind, tg_user_id, display_name, status, proxy_url,
+                       CASE WHEN flood_wait_until > clock_timestamp()
+                            THEN flood_wait_until::text END AS flood_wait_until
                   FROM identities
                  WHERE tenant_id = $1 AND id = $2
                  FOR UPDATE
@@ -1448,12 +1477,27 @@ pub async fn reset_identity_status(
                     "只有 flood_wait 状态可以手动复位；失效或封禁身份必须重新授权".to_owned(),
                 ));
             }
+            let flood_wait_active: bool = sqlx::query_scalar(
+                "SELECT flood_wait_until > clock_timestamp()
+                   FROM identities WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant.get())
+            .bind(identity_id)
+            .fetch_one(&mut *conn)
+            .await?;
+            if flood_wait_active {
+                return Ok(ResetResult::Invalid(
+                    "发送身份仍处于 Telegram 限流冷却期，不能手动提前复位".to_owned(),
+                ));
+            }
             let after = sqlx::query_as::<_, IdentityWriteRecord>(
                 r#"
                 UPDATE identities
                    SET status = 'offline', updated_at = clock_timestamp()
                  WHERE tenant_id = $1 AND id = $2 AND status = 'flood_wait'
-                RETURNING id, kind, tg_user_id, display_name, status, proxy_url
+                RETURNING id, kind, tg_user_id, display_name, status, proxy_url,
+                          CASE WHEN flood_wait_until > clock_timestamp()
+                               THEN flood_wait_until::text END AS flood_wait_until
                 "#,
             )
             .bind(tenant.get())
@@ -1512,7 +1556,9 @@ pub async fn delete_identity(
         Box::pin(async move {
             let before = sqlx::query_as::<_, IdentityWriteRecord>(
                 r#"
-                SELECT id, kind, tg_user_id, display_name, status, proxy_url
+                SELECT id, kind, tg_user_id, display_name, status, proxy_url,
+                       CASE WHEN flood_wait_until > clock_timestamp()
+                            THEN flood_wait_until::text END AS flood_wait_until
                   FROM identities
                  WHERE tenant_id = $1 AND id = $2
                  FOR UPDATE
@@ -4055,6 +4101,24 @@ pub async fn claim_due_delivery_task(
 ) -> Result<Option<DeliveryTaskRecord>, sqlx::Error> {
     tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            recover_expired_bot_flood_waits(conn, tenant, None).await?;
+            let sender_state: Option<(String, String, bool)> = sqlx::query_as(
+                "SELECT kind, status, flood_wait_until <= clock_timestamp()
+                   FROM identities
+                  WHERE tenant_id = $1 AND id = $2
+                  FOR UPDATE",
+            )
+            .bind(tenant.get())
+            .bind(sender_identity_id.get())
+            .fetch_optional(&mut *conn)
+            .await?;
+            if !sender_state.is_some_and(|(kind, status, cooled_down)| {
+                kind == "bot"
+                    && cooled_down
+                    && !matches!(status.as_str(), "banned" | "unauthorized" | "flood_wait")
+            }) {
+                return Ok(None);
+            }
             crate::tenant_retention::lock_event_lifecycle_shared(conn, tenant).await?;
             sqlx::query_as::<_, DeliveryTaskRecord>(
                 r#"
@@ -4109,6 +4173,7 @@ pub async fn list_delivery_sender_candidates(
 ) -> Result<Vec<IdentityId>, sqlx::Error> {
     tenant_write_tx(pool, tenant, |conn| {
         Box::pin(async move {
+            recover_expired_bot_flood_waits(conn, tenant, None).await?;
             sqlx::query_scalar::<_, IdentityId>(
                 "SELECT i.id
                    FROM identities i
@@ -4116,6 +4181,9 @@ pub async fn list_delivery_sender_candidates(
                   WHERE i.tenant_id = $1
                     AND i.kind = 'bot'
                     AND i.status NOT IN ('banned', 'unauthorized')
+                    AND (i.status <> 'flood_wait'
+                         OR i.flood_wait_until <= clock_timestamp())
+                    AND i.flood_wait_until <= clock_timestamp()
                     AND (EXISTS (SELECT 1 FROM target_channels t
                                   WHERE t.tenant_id = $1 AND t.sender_identity_id = i.id
                                     AND t.enabled)
@@ -4621,6 +4689,28 @@ pub async fn record_delivery_failure(
     tenant_tx(pool, tenant, |conn| {
         Box::pin(async move {
             let active = crate::lifecycle::active(conn, tenant).await?;
+            let sender_identity_id: Option<i64> = sqlx::query_scalar(
+                "SELECT sender_identity_id FROM delivery_tasks
+                  WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant.get())
+            .bind(task_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten();
+            let sender_state: Option<(String, String)> =
+                if let Some(sender_identity_id) = sender_identity_id {
+                    sqlx::query_as(
+                    "SELECT kind, status FROM identities
+                      WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+                )
+                .bind(tenant.get())
+                .bind(sender_identity_id)
+                .fetch_optional(&mut *conn)
+                .await?
+                } else {
+                    None
+                };
             let uncertain = !active
                 && matches!(
                     failure.error_code.as_str(),
@@ -4667,6 +4757,61 @@ pub async fn record_delivery_failure(
             let Some(updated) = updated else {
                 return Ok(None);
             };
+            if active
+                && failure.error_code == "FLOOD_WAIT"
+                && let Some(sender_identity_id) = sender_identity_id
+                && let Some(next_retry_at) = updated.next_retry_at
+                && let Some((kind, before_status)) = sender_state
+                && kind == "bot"
+                && !matches!(before_status.as_str(), "unauthorized" | "banned")
+            {
+                let state_change = sqlx::query_as::<_, (String, String, String, bool)>(
+                    "WITH old AS MATERIALIZED (
+                        SELECT id, status, flood_wait_until
+                          FROM identities
+                         WHERE tenant_id = $1 AND id = $2 AND kind = 'bot'
+                           AND status NOT IN ('unauthorized', 'banned')
+                         FOR UPDATE
+                     ), updated AS (
+                        UPDATE identities identity
+                           SET status = 'flood_wait',
+                               flood_wait_until = GREATEST(identity.flood_wait_until, $3),
+                               updated_at = clock_timestamp()
+                          FROM old
+                         WHERE identity.tenant_id = $1 AND identity.id = old.id
+                        RETURNING old.status, old.flood_wait_until::text AS before_until,
+                                  identity.flood_wait_until::text AS after_until,
+                                  old.status <> 'flood_wait'
+                                    OR old.flood_wait_until IS DISTINCT FROM identity.flood_wait_until
+                                    AS changed
+                     )
+                     SELECT status, before_until, after_until, changed FROM updated",
+                )
+                .bind(tenant.get())
+                .bind(sender_identity_id)
+                .bind(next_retry_at)
+                .fetch_optional(&mut *conn)
+                .await?;
+                if let Some((before_status, before_until, after_until, true)) = state_change {
+                    sqlx::query(
+                        "INSERT INTO audit_logs
+                            (tenant_id, actor_user_id, action, resource, resource_id, before, after, source)
+                         VALUES ($1, NULL, 'identity.flood_wait', 'identity', $2, $3, $4, 'system')",
+                    )
+                    .bind(tenant.get())
+                    .bind(sender_identity_id)
+                    .bind(json!({
+                        "status": before_status,
+                        "flood_wait_until": before_until
+                    }))
+                    .bind(json!({
+                        "status": "flood_wait",
+                        "flood_wait_until": after_until
+                    }))
+                    .execute(&mut *conn)
+                    .await?;
+                }
+            }
             sqlx::query(
                 r#"
                 INSERT INTO delivery_logs (
@@ -4695,6 +4840,50 @@ pub async fn record_delivery_failure(
         })
     })
     .await
+}
+
+async fn recover_expired_bot_flood_waits(
+    conn: &mut sqlx::PgConnection,
+    tenant: TenantId,
+    identity_id: Option<IdentityId>,
+) -> Result<(), sqlx::Error> {
+    let recovered = sqlx::query_as::<_, (i64, String, String)>(
+        "WITH candidates AS MATERIALIZED (
+            SELECT id, status, flood_wait_until
+              FROM identities
+             WHERE tenant_id = $1 AND kind = 'bot' AND status = 'flood_wait'
+               AND flood_wait_until <= clock_timestamp()
+               AND ($2::bigint IS NULL OR id = $2)
+             ORDER BY id
+             FOR UPDATE SKIP LOCKED
+         ), recovered AS (
+            UPDATE identities identity
+               SET status = 'offline', updated_at = clock_timestamp()
+              FROM candidates old
+             WHERE identity.tenant_id = $1 AND identity.id = old.id
+               AND identity.status = 'flood_wait'
+            RETURNING identity.id, old.status, old.flood_wait_until
+         )
+         SELECT id, status, flood_wait_until::text FROM recovered",
+    )
+    .bind(tenant.get())
+    .bind(identity_id.map(IdentityId::get))
+    .fetch_all(&mut *conn)
+    .await?;
+    for (identity, before_status, flood_wait_until) in recovered {
+        sqlx::query(
+            "INSERT INTO audit_logs
+                (tenant_id, actor_user_id, action, resource, resource_id, before, after, source)
+             VALUES ($1, NULL, 'identity.flood_wait_recovered', 'identity', $2, $3, $4, 'system')",
+        )
+        .bind(tenant.get())
+        .bind(identity)
+        .bind(json!({ "status": before_status, "flood_wait_until": flood_wait_until }))
+        .bind(json!({ "status": "offline", "flood_wait_until": flood_wait_until }))
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
 }
 
 /// 租户套餐（`tenants.plan`）。`tenants` 是丙类表，按主键读。

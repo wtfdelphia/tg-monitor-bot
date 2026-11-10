@@ -16,11 +16,20 @@
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-fn direct_port() -> u16 {
+pub fn direct_port() -> u16 {
     std::env::var("TGM_TEST_PG_PORT")
-        .ok()
-        .and_then(|value| value.parse().ok())
+        .map(|value| value.parse().expect("TGM_TEST_PG_PORT 必须是有效端口"))
         .unwrap_or(55432)
+}
+
+pub fn pgbouncer_port() -> u16 {
+    std::env::var("TGM_TEST_PGBOUNCER_PORT")
+        .map(|value| {
+            value
+                .parse()
+                .expect("TGM_TEST_PGBOUNCER_PORT 必须是有效端口")
+        })
+        .unwrap_or(56432)
 }
 
 /// `sqlx::test` 注入的测试管理池。
@@ -81,7 +90,7 @@ pub async fn auth_pool(admin: &AdminOnlyPool) -> PgPool {
 /// PgBouncer 的 `DB_NAME` 固定指向 `tgm`，连不到 `sqlx::test` 建的临时库 ——
 /// 所以走这条的测试用的是 compose 里那个常驻库，不是每测试一库。
 pub async fn app_pool_via_bouncer() -> PgPool {
-    connect_as("app_user", "apw", 56432, "tgm").await
+    connect_as("app_user", "apw", pgbouncer_port(), "tgm").await
 }
 
 async fn current_database(pool: &PgPool) -> String {

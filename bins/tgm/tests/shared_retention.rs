@@ -1,3 +1,5 @@
+mod support;
+
 use anyhow::Result;
 use sqlx::PgPool;
 use std::process::{Child, Command, Stdio};
@@ -29,7 +31,8 @@ async fn cli_uses_only_its_own_credentials_and_redacts_database_failures(
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&admin)
         .await?;
-    let url = format!("postgres://shared_cleanup:scpw@127.0.0.1:55432/{database}");
+    let port = support::pg_port()?;
+    let url = format!("postgres://shared_cleanup:scpw@127.0.0.1:{port}/{database}");
     let output = command(&url).output()?;
     assert!(
         output.status.success(),
@@ -45,7 +48,7 @@ async fn cli_uses_only_its_own_credentials_and_redacts_database_failures(
         ("postgres", "pw"),
     ] {
         let output = command(&format!(
-            "postgres://{role}:{password}@127.0.0.1:55432/{database}"
+            "postgres://{role}:{password}@127.0.0.1:{port}/{database}"
         ))
         .output()?;
         assert!(!output.status.success());

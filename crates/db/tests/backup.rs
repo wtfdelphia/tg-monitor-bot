@@ -10,10 +10,17 @@
 // 同 isolation.rs：反向测试里 expect 与 panic 就是断言本身。
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod support;
+
 use std::process::Command;
 
 /// 受限角色的连接串。口令是 eng/02 §二 的本地开发值。
-const APP_URL: &str = "postgres://app_user:apw@127.0.0.1:55432/tgm";
+fn app_url() -> String {
+    format!(
+        "postgres://app_user:apw@127.0.0.1:{}/tgm",
+        support::direct_port()
+    )
+}
 
 /// 找 pg_dump。它不在非交互 shell 的 PATH 里（eng/00 §零 那句「✓ 已装」
 /// 对脚本和 CI 都是假的），所以这里按 env.sh 里那个前缀兜一次。
@@ -65,7 +72,7 @@ fn version_of(bin: &str) -> Option<String> {
 #[test]
 fn r7_restricted_role_cannot_pg_dump() {
     let out = Command::new(pg_dump())
-        .args(["--data-only", APP_URL])
+        .args(["--data-only", &app_url()])
         .output()
         .expect("起 pg_dump 失败");
 
@@ -90,8 +97,12 @@ fn r7_restricted_role_cannot_pg_dump() {
 /// 这一条同时是那句前提的正向证据：owner 跑得通。
 #[test]
 fn r7_counterproof_superuser_can_pg_dump() {
-    let url = std::env::var("TGM_DB_URL_OWNER")
-        .unwrap_or_else(|_| "postgres://postgres:pw@127.0.0.1:55432/tgm".into());
+    let url = std::env::var("TGM_DB_URL_OWNER").unwrap_or_else(|_| {
+        format!(
+            "postgres://postgres:pw@127.0.0.1:{}/tgm",
+            support::direct_port()
+        )
+    });
 
     let out = Command::new(pg_dump())
         .args(["--schema-only", &url])

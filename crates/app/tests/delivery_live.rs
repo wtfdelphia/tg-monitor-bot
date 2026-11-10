@@ -9,6 +9,7 @@
 //! V3 live_revoked_token             Token 在 BotFather 重置后，身份转 unauthorized 并写审计
 //! V4a live_bot_session_capture      登录、存 session 到文件、确认此刻可复用（重置 Token 之前跑）
 //! V4b live_bot_session_after_revoke 在 BotFather 重置 Token 之后，用 V4a 的旧 session 建连并试发
+//! G4 live_delivery_flood_wait_recovery 真实投递限流、退避落库、到期恢复与幂等复跑
 //! ```
 //!
 //! V4 回答 ADR-0034 代价节的未验证项：重置 Token 是否注销已有 auth key。两段之间由人去
@@ -24,6 +25,10 @@
 //! TGM_LIVE_REVOKED_BOT_TOKEN                    已在 BotFather 重置作废的旧 Token（V3）
 //! TGM_LIVE_LOGIN_REPEAT                         V1 次数，默认 5
 //! TGM_LIVE_SESSION_FILE                         V4 的 session 文件路径（仓库外）
+//! TGM_G4_FLOOD_WAIT_MAX_SECONDS                 G4 最长等待上限，默认 1800
+//! TGM_G4_REPORT_FILE                            G4 脱敏报告路径（可选）
+//! TGM_G4_SENDER_SESSION_FILE                    G4 预先捕获的测试发送 Bot session（0600）
+//! TGM_G4_OBSERVER_SESSION_FILE                  G4 预先捕获的只读 Bot session（0600）
 //! ```
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -59,6 +64,7 @@ use tokio::sync::watch;
 
 const LOCAL_KEK: &str = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=";
 const CHILD_TIMEOUT: Duration = Duration::from_secs(90);
+const G4_PROBE_MARKER: &str = "tgm-g4-flood-wait-probe";
 
 fn kek() -> EnvKek {
     EnvKek::new(Profile::Development, LOCAL_KEK).expect("构造 EnvKek 失败")
@@ -373,6 +379,644 @@ fn read(directory: &Path, name: &str) -> Option<String> {
     std::fs::read_to_string(directory.join(name)).ok()
 }
 
+struct CapturedDelivery {
+    inner: TelegramDeliveryTransport,
+    error: Arc<std::sync::Mutex<Option<DeliverySendError>>>,
+}
+
+fn g4_error_category(error: &DeliverySendError) -> &'static str {
+    if error.code != "TELEGRAM_CLIENT_ERROR" {
+        return "telegram_rpc_or_delivery_code";
+    }
+    match error.message.as_deref() {
+        Some(message) if message.starts_with("无法解析 Telegram peer:") => "peer_resolution",
+        Some(message) if message.starts_with("Telegram 调用失败: request error: rpc error ") => {
+            "invocation_rpc"
+        }
+        Some(message) if message.starts_with("Telegram 调用失败: request error: IO failed:") => {
+            "invocation_io"
+        }
+        Some(message)
+            if message.starts_with("Telegram 调用失败: request error: transport-level:") =>
+        {
+            "invocation_transport"
+        }
+        Some(message) if message.starts_with("Telegram 调用失败: request error: bad response:") => {
+            "invocation_deserialize"
+        }
+        Some(message)
+            if message.starts_with("Telegram 调用失败: request error: dropped (cancelled)") =>
+        {
+            "invocation_dropped"
+        }
+        Some(message) if message.starts_with("Telegram 调用失败: request error: invalid dc") => {
+            "invocation_invalid_dc"
+        }
+        Some(message) if message.starts_with("Telegram 调用失败: session error") => {
+            "invocation_session"
+        }
+        Some(message)
+            if message.starts_with("Telegram 调用失败: request error: authentication") =>
+        {
+            "invocation_authentication"
+        }
+        Some(message) if message.starts_with("Telegram 调用失败:") => "invocation_unclassified",
+        Some(message) if message.starts_with("无法同步 Telegram 更新状态:") => {
+            "session_sync"
+        }
+        Some(message) if message.starts_with("无法建立 Telegram 更新流:") => "update_stream",
+        Some(message) if message.starts_with("session 快照失败:") => "session_snapshot",
+        Some(message) if message.starts_with("Telegram runner 关闭失败:") => "runner_shutdown",
+        Some(message) if message.starts_with("媒体上传失败:") => "media_upload",
+        _ => "unclassified_client_error",
+    }
+}
+
+#[test]
+fn g4_error_category_does_not_expose_error_text() {
+    let error = DeliverySendError {
+        code: "TELEGRAM_CLIENT_ERROR".to_owned(),
+        message: Some("Telegram 调用失败: request error: rpc error 420: FLOOD_WAIT_12".to_owned()),
+        flood_wait_seconds: None,
+    };
+    assert_eq!(g4_error_category(&error), "invocation_rpc");
+
+    let transport = DeliverySendError {
+        code: "TELEGRAM_CLIENT_ERROR".to_owned(),
+        message: Some(
+            "Telegram 调用失败: request error: transport-level: private details".to_owned(),
+        ),
+        flood_wait_seconds: None,
+    };
+    assert_eq!(g4_error_category(&transport), "invocation_transport");
+
+    let io = DeliverySendError {
+        code: "TELEGRAM_CLIENT_ERROR".to_owned(),
+        message: Some("Telegram 调用失败: request error: IO failed: private details".to_owned()),
+        flood_wait_seconds: None,
+    };
+    assert_eq!(g4_error_category(&io), "invocation_io");
+
+    let unknown = DeliverySendError {
+        code: "TELEGRAM_CLIENT_ERROR".to_owned(),
+        message: Some("unexpected private details".to_owned()),
+        flood_wait_seconds: None,
+    };
+    assert_eq!(g4_error_category(&unknown), "unclassified_client_error");
+}
+
+struct BlockedProbe {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl DeliveryTransport for BlockedProbe {
+    async fn deliver(&self, _payload: DeliveryPayload) -> Result<i64, DeliverySendError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(DeliverySendError {
+            code: "G4_LOCAL_PROBE_BLOCKED".to_owned(),
+            message: None,
+            flood_wait_seconds: None,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl DeliveryTransport for CapturedDelivery {
+    async fn deliver(&self, payload: DeliveryPayload) -> Result<i64, DeliverySendError> {
+        let result = self.inner.deliver(payload).await;
+        if let Err(error) = &result {
+            *self.error.lock().expect("读取限流错误捕获器失败") = Some(error.clone());
+        }
+        result
+    }
+}
+
+fn g4_report_path() -> Option<PathBuf> {
+    std::env::var_os("TGM_G4_REPORT_FILE").map(PathBuf::from)
+}
+
+fn write_g4_report(lines: &[String]) {
+    let Some(path) = g4_report_path() else {
+        return;
+    };
+    let body = format!("{}\n", lines.join("\n"));
+    std::fs::write(path, body).expect("写 G4 脱敏报告失败");
+}
+
+async fn g4_delete_message(token: &str, target: i64, message_id: i64) -> Result<(), String> {
+    let response = reqwest::Client::new()
+        .post(format!("https://api.telegram.org/bot{token}/deleteMessage"))
+        .json(&json!({"chat_id": target, "message_id": message_id}))
+        .send()
+        .await
+        .map_err(|_| "G4 清理测试消息网络失败".to_owned())?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|_| "G4 清理测试消息响应无效".to_owned())?;
+    if response["ok"] == true {
+        Ok(())
+    } else {
+        Err("G4 清理测试消息被拒绝".to_owned())
+    }
+}
+
+async fn g4_task_state(
+    admin: &support::AdminOnlyPool,
+    task_id: i64,
+) -> (
+    String,
+    i32,
+    Option<sqlx::types::chrono::DateTime<Utc>>,
+    Option<String>,
+    Option<i64>,
+) {
+    sqlx::query_as(
+        "SELECT status, attempt_count, next_retry_at, last_error_code, telegram_message_id
+           FROM delivery_tasks WHERE id = $1",
+    )
+    .bind(task_id)
+    .fetch_one(admin.raw())
+    .await
+    .expect("读取 G4 投递任务状态失败")
+}
+
+async fn g4_identity_status(admin: &support::AdminOnlyPool, identity: IdentityId) -> String {
+    sqlx::query_scalar("SELECT status FROM identities WHERE id = $1")
+        .bind(identity)
+        .fetch_one(admin.raw())
+        .await
+        .expect("读取 G4 发送身份状态失败")
+}
+
+fn g4_max_wait() -> Duration {
+    let seconds = match std::env::var("TGM_G4_FLOOD_WAIT_MAX_SECONDS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .expect("TGM_G4_FLOOD_WAIT_MAX_SECONDS 必须是正整数"),
+        Err(_) => 1800,
+    };
+    assert!(seconds > 0, "TGM_G4_FLOOD_WAIT_MAX_SECONDS 必须大于零");
+    Duration::from_secs(seconds)
+}
+
+fn g4_session(name: &str) -> Secret<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let path = PathBuf::from(required(name));
+    let metadata = std::fs::symlink_metadata(&path).expect("读取 G4 session 元数据失败");
+    assert!(metadata.is_file(), "G4 session 必须是普通文件");
+    assert_eq!(metadata.mode() & 0o777, 0o600, "G4 session 权限必须是 0600");
+    Secret::new(std::fs::read(path).expect("读取 G4 session 失败"))
+}
+
+async fn g4_resume_bot(
+    config: TelegramClientConfig,
+    session: &Secret<Vec<u8>>,
+) -> Result<(TelegramClient, i64), String> {
+    let stored =
+        StoredSession::restore(session.expose()).map_err(|_| "G4 session 快照无效".to_owned())?;
+    TelegramClient::resume_bot_sender(config, stored)
+        .await
+        .map_err(|_| "G4 复用预先捕获的 Bot session 失败".to_owned())
+}
+
+async fn g4_wait_until(deadline: sqlx::types::chrono::DateTime<Utc>) {
+    loop {
+        let now = Utc::now();
+        if now >= deadline {
+            return;
+        }
+        let remaining = (deadline - now).num_seconds().max(0);
+        println!("[G4] wait_expiry=pending remaining_seconds={remaining}");
+        tokio::time::sleep(Duration::from_secs(remaining.min(30) as u64)).await;
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+#[ignore = "真机：只使用专用测试 Bot/频道；不会自动制造限流"]
+async fn live_delivery_flood_wait_recovery(admin: PgPool) {
+    assert_eq!(
+        std::env::var("TGM_G4_FLOOD_WAIT_ALLOW").as_deref(),
+        Ok("1"),
+        "必须显式设置 TGM_G4_FLOOD_WAIT_ALLOW=1，并确认使用专用测试对象"
+    );
+    let token = required("TGM_LIVE_BOT_TOKEN");
+    let observer_token = required("TGM_LIVE_BOT2_TOKEN");
+    let sender_session = g4_session("TGM_G4_SENDER_SESSION_FILE");
+    let observer_session = g4_session("TGM_G4_OBSERVER_SESSION_FILE");
+    let target: i64 = required("TGM_LIVE_TARGET_CHAT")
+        .parse()
+        .expect("TGM_LIVE_TARGET_CHAT 必须是整数");
+    let (app, admin) = support::pools(admin).await;
+    let tenant = support::seed_tenant(&admin, "delivery-g4-flood-wait", 9301).await;
+    let bot = seed_bot(&app, &admin, tenant, &token).await;
+    sqlx::query(
+        "INSERT INTO source_subscriptions
+            (tenant_id, tg_chat_id, title, receiver_identity_id, enabled)
+         VALUES ($1, $2, 'G4 flood wait probe', $3, TRUE)",
+    )
+    .bind(tenant)
+    .bind(target)
+    .bind(bot)
+    .execute(admin.raw())
+    .await
+    .expect("创建 G4 临时来源失败");
+    let random_id = fresh_random_id();
+    let canonical = insert_canonical_event(
+        &app,
+        &CanonicalEventInput {
+            receiver_tenant_id: Some(tenant),
+            adapter: CanonicalAdapter::Bot,
+            receiver_identity_id: bot,
+            tg_chat_id: target,
+            tg_message_id: random_id,
+            event_type: CanonicalEventType::MessageCreated,
+            edit_version: 0,
+            update_id: None,
+            media_group_id: None,
+            sender_id: None,
+            message_date: Utc::now(),
+            text: Some(G4_PROBE_MARKER.to_owned()),
+            caption: None,
+            media_type: None,
+            content_hash: None,
+            file_unique_id: None,
+            file_name: None,
+            file_size: None,
+            mime_type: None,
+            raw_file_id: None,
+        },
+    )
+    .await
+    .expect("创建 G4 规范事件失败");
+    let tenant_event = fanout_canonical_event(&app, tenant, canonical.id)
+        .await
+        .expect("扇出 G4 事件失败")
+        .expect("G4 事件应匹配来源");
+    let task_id: i64 = sqlx::query_scalar(
+        "INSERT INTO delivery_tasks
+            (tenant_id, tenant_event_id, sender_identity_id, target_tg_chat_id, action,
+             telegram_random_id, payload_snapshot)
+         VALUES ($1, $5, $2, $3, 'COPY', $4, $6) RETURNING id",
+    )
+    .bind(tenant)
+    .bind(bot)
+    .bind(target)
+    .bind(random_id)
+    .bind(tenant_event.id)
+    .bind(json!({
+        "source": {"tg_chat_id": target, "tg_message_id": random_id, "media_type": "TEXT"},
+        "message": {"text": G4_PROBE_MARKER, "parse_mode": "HTML"},
+        "text_only": true
+    }))
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建 G4 投递任务失败");
+    let platform = platform_app();
+    let config = TelegramClientConfig::new(platform.api_id).expect("api_id 无效");
+    let (client, bot_id) = g4_resume_bot(config.clone(), &sender_session)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(bot_id, bot_id_from_token(&token).expect("Token 格式无效"));
+    let capture = Arc::new(std::sync::Mutex::new(None));
+    let sender_client = Arc::new(client);
+    let transport = CapturedDelivery {
+        inner: TelegramDeliveryTransport::new(
+            Arc::clone(&sender_client),
+            platform.media_store.clone(),
+            app.clone(),
+            tenant,
+        ),
+        error: Arc::clone(&capture),
+    };
+    let first = tgm_app::delivery::run_delivery_once(&app, tenant, bot, &transport)
+        .await
+        .expect("G4 首次真实投递执行失败");
+    let observed_at = Utc::now();
+    let (status, attempt_count, next_retry_at, last_error_code, message_id) =
+        g4_task_state(&admin, task_id).await;
+    let captured = capture.lock().expect("读取 G4 限流错误捕获器失败").clone();
+    println!(
+        "[G4] first_outcome={first:?} task_status={status} attempt_count={attempt_count} \
+         last_error_code={} next_retry_at_present={} identity_status={}",
+        last_error_code.as_deref().unwrap_or("-"),
+        next_retry_at.is_some(),
+        g4_identity_status(&admin, bot).await,
+    );
+    let Some(error) = captured else {
+        let cleanup = match message_id {
+            Some(message_id) => g4_delete_message(&token, target, message_id).await,
+            None => Err("没有可用于确认清理结果的 Telegram message id".to_owned()),
+        };
+        write_g4_report(&[
+            "source_message: not-run".to_owned(),
+            "flood_wait_observed: not-run".to_owned(),
+            "retry_at_persisted: not-run".to_owned(),
+            "identity_state: not-run".to_owned(),
+            "retry_suppressed: not-run".to_owned(),
+            "wait_expiry: not-run".to_owned(),
+            "single_delivery_after_recovery: not-run".to_owned(),
+            "duplicate_delivery: not-run".to_owned(),
+            "journal_redaction: not-run".to_owned(),
+            "production_credentials: not-used".to_owned(),
+            "production_services: untouched".to_owned(),
+            format!(
+                "cleanup: {}",
+                if cleanup.is_ok() { "pass" } else { "partial" }
+            ),
+        ]);
+        if let Err(error) = cleanup {
+            panic!("{error}");
+        }
+        println!("[G4] flood_wait_observed=not-run reason=first_delivery_was_not_rate_limited");
+        return;
+    };
+    if error.code != "FLOOD_WAIT" {
+        let error_category = g4_error_category(&error);
+        drop(transport);
+        drop(sender_client);
+        let cleanup = match message_id {
+            Some(message_id) => g4_delete_message(&token, target, message_id).await,
+            None => Err("非限流响应没有可核对的消息 id".to_owned()),
+        };
+        write_g4_report(&[
+            "source_message: not-run".to_owned(),
+            "flood_wait_observed: fail".to_owned(),
+            "retry_at_persisted: not-run".to_owned(),
+            "identity_state: not-run".to_owned(),
+            "retry_suppressed: not-run".to_owned(),
+            "wait_expiry: not-run".to_owned(),
+            "single_delivery_after_recovery: not-run".to_owned(),
+            "duplicate_delivery: not-run".to_owned(),
+            "journal_redaction: not-run".to_owned(),
+            format!("observed_error_code: {}", error.code),
+            format!("observed_error_category: {error_category}"),
+            "production_credentials: not-used".to_owned(),
+            "production_services: untouched".to_owned(),
+            format!(
+                "cleanup: {}",
+                if cleanup.is_ok() { "pass" } else { "partial" }
+            ),
+        ]);
+        if let Err(error) = cleanup {
+            panic!("{error}");
+        }
+        panic!("G4 首次真实投递返回非 FLOOD_WAIT：{}", error.code);
+    }
+    let Some(wait_seconds) = error.flood_wait_seconds.filter(|seconds| *seconds > 0) else {
+        drop(transport);
+        drop(sender_client);
+        write_g4_report(&[
+            "source_message: not-run".to_owned(),
+            "flood_wait_observed: fail".to_owned(),
+            "retry_at_persisted: not-run".to_owned(),
+            "identity_state: not-run".to_owned(),
+            "retry_suppressed: not-run".to_owned(),
+            "wait_expiry: not-run".to_owned(),
+            "single_delivery_after_recovery: not-run".to_owned(),
+            "duplicate_delivery: not-run".to_owned(),
+            "journal_redaction: not-run".to_owned(),
+            "production_credentials: not-used".to_owned(),
+            "production_services: untouched".to_owned(),
+            "cleanup: partial".to_owned(),
+        ]);
+        panic!("G4 FLOOD_WAIT 响应缺少有效的服务端等待秒数");
+    };
+    let wait_seconds = wait_seconds as u64;
+    write_g4_report(&[
+        "source_message: not-run".to_owned(),
+        "flood_wait_observed: pass".to_owned(),
+        "retry_at_persisted: not-run".to_owned(),
+        "identity_state: not-run".to_owned(),
+        "retry_suppressed: not-run".to_owned(),
+        "wait_expiry: not-run".to_owned(),
+        "single_delivery_after_recovery: not-run".to_owned(),
+        "duplicate_delivery: not-run".to_owned(),
+        "journal_redaction: not-run".to_owned(),
+        "production_credentials: not-used".to_owned(),
+        "production_services: untouched".to_owned(),
+        "cleanup: partial".to_owned(),
+    ]);
+    let retry_persisted = status == "PENDING"
+        && last_error_code.as_deref() == Some("FLOOD_WAIT")
+        && next_retry_at.is_some_and(|deadline| {
+            deadline >= observed_at + Duration::from_secs(wait_seconds)
+                && deadline <= observed_at + g4_max_wait()
+        });
+    let identity_status = g4_identity_status(&admin, bot).await;
+    let identity_pass = identity_status == "flood_wait";
+    let Some(deadline) = next_retry_at else {
+        drop(transport);
+        drop(sender_client);
+        write_g4_report(&[
+            "source_message: not-run".to_owned(),
+            "flood_wait_observed: pass".to_owned(),
+            "retry_at_persisted: fail".to_owned(),
+            format!(
+                "identity_state: {}",
+                if identity_pass { "pass" } else { "fail" }
+            ),
+            "retry_suppressed: fail".to_owned(),
+            "wait_expiry: not-run".to_owned(),
+            "single_delivery_after_recovery: not-run".to_owned(),
+            "duplicate_delivery: not-run".to_owned(),
+            "journal_redaction: not-run".to_owned(),
+            "production_credentials: not-used".to_owned(),
+            "production_services: untouched".to_owned(),
+            "cleanup: pass".to_owned(),
+        ]);
+        panic!("G4 FLOOD_WAIT 未写入 next_retry_at");
+    };
+    let probe_at = Utc::now();
+    let remaining = (deadline - probe_at).num_seconds().max(0) as u64;
+    let retry_suppressed = if deadline > probe_at + Duration::from_secs(5) {
+        let probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = BlockedProbe {
+            calls: Arc::clone(&probe_calls),
+        };
+        let suppressed = tgm_app::delivery::run_delivery_once(&app, tenant, bot, &probe)
+            .await
+            .expect("G4 冷却期领取检查失败");
+        matches!(suppressed, tgm_app::delivery::DeliveryRunOutcome::Idle)
+            && probe_calls.load(std::sync::atomic::Ordering::SeqCst) == 0
+    } else {
+        false
+    };
+    write_g4_report(&[
+        "source_message: not-run".to_owned(),
+        "flood_wait_observed: pass".to_owned(),
+        format!(
+            "retry_at_persisted: {}",
+            if retry_persisted { "pass" } else { "fail" }
+        ),
+        format!(
+            "identity_state: {}",
+            if identity_pass { "pass" } else { "fail" }
+        ),
+        format!(
+            "retry_suppressed: {}",
+            if remaining <= 5 && !retry_suppressed {
+                "not-run"
+            } else if retry_suppressed {
+                "pass"
+            } else {
+                "fail"
+            }
+        ),
+        "wait_expiry: not-run".to_owned(),
+        "single_delivery_after_recovery: not-run".to_owned(),
+        "duplicate_delivery: not-run".to_owned(),
+        "journal_redaction: not-run".to_owned(),
+        "production_credentials: not-used".to_owned(),
+        "production_services: untouched".to_owned(),
+        "cleanup: partial".to_owned(),
+    ]);
+    if !retry_persisted || !retry_suppressed || remaining > g4_max_wait().as_secs() {
+        write_g4_report(&[
+            "source_message: not-run".to_owned(),
+            "flood_wait_observed: pass".to_owned(),
+            format!(
+                "retry_at_persisted: {}",
+                if retry_persisted { "pass" } else { "fail" }
+            ),
+            format!(
+                "identity_state: {}",
+                if identity_pass { "pass" } else { "fail" }
+            ),
+            format!(
+                "retry_suppressed: {}",
+                if remaining <= 5 && !retry_suppressed {
+                    "not-run"
+                } else if retry_suppressed {
+                    "pass"
+                } else {
+                    "fail"
+                }
+            ),
+            "wait_expiry: not-run".to_owned(),
+            "single_delivery_after_recovery: not-run".to_owned(),
+            "duplicate_delivery: not-run".to_owned(),
+            "journal_redaction: not-run".to_owned(),
+            "production_credentials: not-used".to_owned(),
+            "production_services: untouched".to_owned(),
+            "cleanup: partial".to_owned(),
+        ]);
+        drop(transport);
+        drop(sender_client);
+        panic!(
+            "G4 FLOOD_WAIT 退避不满足判据：retry_persisted={retry_persisted} \
+             identity_pass={identity_pass} retry_suppressed={retry_suppressed} \
+             remaining={remaining} wait_seconds={wait_seconds}"
+        );
+    }
+    drop(transport);
+    drop(sender_client);
+    println!("[G4] flood_wait_observed=pass wait_seconds={wait_seconds}");
+    println!(
+        "[G4] retry_at_persisted={} identity_state={} retry_suppressed={retry_suppressed}",
+        retry_persisted, identity_status,
+    );
+    assert!(retry_persisted, "G4 next_retry_at 未正确落库");
+    assert!(retry_suppressed, "G4 冷却期仍领取了待发送任务");
+    let _ = g4_wait_until(deadline).await;
+    let (client, bot_id) = g4_resume_bot(config, &sender_session)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(bot_id, bot_id_from_token(&token).expect("Token 格式无效"));
+    let recovery = TelegramDeliveryTransport::new(
+        Arc::new(client),
+        platform.media_store.clone(),
+        app.clone(),
+        tenant,
+    );
+    let recovered = tgm_app::delivery::run_delivery_once(&app, tenant, bot, &recovery)
+        .await
+        .expect("G4 等待到期恢复投递失败");
+    let (status, _, _, _, message_id) = g4_task_state(&admin, task_id).await;
+    assert!(matches!(
+        recovered,
+        tgm_app::delivery::DeliveryRunOutcome::Done { .. }
+    ));
+    assert_eq!(status, "DONE");
+    let duplicate = tgm_app::delivery::run_delivery_once(&app, tenant, bot, &recovery)
+        .await
+        .expect("G4 重复恢复检查失败");
+    drop(recovery);
+    assert!(matches!(
+        duplicate,
+        tgm_app::delivery::DeliveryRunOutcome::Idle
+    ));
+    let observer_result = g4_resume_bot(
+        TelegramClientConfig::new(platform.api_id).expect("api_id 无效"),
+        &observer_session,
+    )
+    .await;
+    let message_id = message_id.expect("G4 DONE 任务没有 message id");
+    let observation = match observer_result {
+        Ok((observer, observer_id)) => {
+            let expected_id = bot_id_from_token(&observer_token).expect("只读 Bot Token 格式无效");
+            let read_result = if observer_id != expected_id {
+                Err("G4 只读 session 与 Bot Token 不一致".to_owned())
+            } else {
+                observer
+                    .media_reader()
+                    .read_messages(target, &[message_id])
+                    .await
+                    .and_then(|messages| {
+                        if messages.len() == 1
+                            && messages[0].tg_chat_id == target
+                            && messages[0].text.as_deref() == Some(G4_PROBE_MARKER)
+                        {
+                            Ok(())
+                        } else {
+                            Err(tgm_tg::TelegramClientError::SourceMessageMissing)
+                        }
+                    })
+                    .map_err(|_| "G4 只读 Bot 读取目标消息失败".to_owned())
+            };
+            let shutdown_result = observer
+                .shutdown()
+                .await
+                .map_err(|_| "关闭 G4 只读 Bot 失败".to_owned());
+            read_result.and(shutdown_result)
+        }
+        Err(error) => Err(error),
+    };
+    let cleanup = g4_delete_message(&token, target, message_id).await;
+    let observation_pass = observation.is_ok();
+    let cleanup_pass = cleanup.is_ok();
+    write_g4_report(&[
+        "source_message: not-run".to_owned(),
+        "flood_wait_observed: pass".to_owned(),
+        "retry_at_persisted: pass".to_owned(),
+        format!(
+            "identity_state: {}",
+            if identity_pass { "pass" } else { "fail" }
+        ),
+        "retry_suppressed: pass".to_owned(),
+        "wait_expiry: pass".to_owned(),
+        format!(
+            "single_delivery_after_recovery: {}",
+            if observation_pass { "pass" } else { "fail" }
+        ),
+        "duplicate_delivery: pass".to_owned(),
+        "journal_redaction: not-run".to_owned(),
+        "production_credentials: not-used".to_owned(),
+        "production_services: untouched".to_owned(),
+        format!("cleanup: {}", if cleanup_pass { "pass" } else { "fail" }),
+    ]);
+    if let Err(error) = observation {
+        panic!("{error}");
+    }
+    if let Err(error) = cleanup {
+        panic!("{error}");
+    }
+    println!(
+        "[G4] wait_expiry=pass single_delivery_after_recovery=pass duplicate_delivery=pass journal_redaction=not-run cleanup=pass"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations-test")]
 #[ignore = "真机：需要测试 Bot、测试频道与平台 api_id"]
 async fn live_delivery_g4_kill_restart(admin: PgPool) {
@@ -384,7 +1028,10 @@ async fn live_delivery_g4_kill_restart(admin: PgPool) {
         .fetch_one(&admin)
         .await
         .expect("读取库名失败");
-    let url = format!("postgres://app_user:apw@127.0.0.1:55432/{database}");
+    let url = format!(
+        "postgres://app_user:apw@127.0.0.1:{}/{database}",
+        support::pg_port()
+    );
     let (app, admin) = support::pools(admin).await;
     let tenant = support::seed_tenant(&admin, "delivery-live", 9101).await;
     let bot = seed_bot(&app, &admin, tenant, &token).await;

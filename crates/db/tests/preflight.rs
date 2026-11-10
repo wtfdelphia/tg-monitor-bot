@@ -29,9 +29,12 @@ async fn lock_preflight_catalog(admin: &PgPool) {
 async fn superuser_pool() -> PgPool {
     PgPoolOptions::new()
         .max_connections(1)
-        .connect("postgres://postgres:pw@127.0.0.1:55432/tgm")
+        .connect(&format!(
+            "postgres://postgres:pw@127.0.0.1:{}/tgm",
+            support::direct_port()
+        ))
         .await
-        .expect("以 postgres 连 tgm:55432 失败")
+        .expect("以 postgres 连测试 tgm 库失败")
 }
 
 #[tokio::test]
@@ -132,7 +135,10 @@ async fn role_owning_a_public_table_is_refused() {
 
     let owner = PgPoolOptions::new()
         .max_connections(1)
-        .connect(&format!("postgres://{role_name}:ppw@127.0.0.1:55432/tgm"))
+        .connect(&format!(
+            "postgres://{role_name}:ppw@127.0.0.1:{}/tgm",
+            support::direct_port()
+        ))
         .await
         .expect("以 pf_owner 连库失败");
     let verdict = check_runtime_role(&owner).await;
@@ -212,7 +218,10 @@ async fn membership_in_a_bypassrls_role_is_caught() {
 
     let member = PgPoolOptions::new()
         .max_connections(1)
-        .connect(&format!("postgres://{member_name}:ppw@127.0.0.1:55432/tgm"))
+        .connect(&format!(
+            "postgres://{member_name}:ppw@127.0.0.1:{}/tgm",
+            support::direct_port()
+        ))
         .await
         .expect("以 pf_member 连库失败");
 

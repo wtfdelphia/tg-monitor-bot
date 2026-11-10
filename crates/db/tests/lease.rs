@@ -122,7 +122,8 @@ async fn expired_lease_race_has_exactly_one_winner_and_release_preserves_monoton
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
             .connect(&format!(
-                "postgres://app_user:apw@127.0.0.1:55432/{database}"
+                "postgres://app_user:apw@127.0.0.1:{}/{database}",
+                support::direct_port()
             ))
             .await
             .expect("建立第二个受限池失败")

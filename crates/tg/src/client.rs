@@ -1534,4 +1534,252 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    #[ignore = "只读真机诊断：检查最近目标消息是否含 G4 探针标记"]
+    async fn live_g4_readonly_marker_check() -> Result<(), TelegramClientError> {
+        use std::path::PathBuf;
+
+        use super::resolve_peer_ref;
+        use crate::session::StoredSession;
+
+        let api_id = std::env::var("TGM_PLATFORM_API_ID")
+            .expect("缺少 TGM_PLATFORM_API_ID")
+            .parse::<i32>()
+            .expect("TGM_PLATFORM_API_ID 必须是整数");
+        let target = std::env::var("TGM_LIVE_TARGET_CHAT")
+            .expect("缺少 TGM_LIVE_TARGET_CHAT")
+            .parse::<i64>()
+            .expect("TGM_LIVE_TARGET_CHAT 必须是整数");
+        let session_path = PathBuf::from(
+            std::env::var("TGM_G4_OBSERVER_SESSION_FILE")
+                .expect("缺少 TGM_G4_OBSERVER_SESSION_FILE"),
+        );
+        let since = std::env::var("TGM_G4_PROBE_SINCE")
+            .expect("缺少 TGM_G4_PROBE_SINCE")
+            .parse::<i64>()
+            .expect("TGM_G4_PROBE_SINCE 必须是 Unix 秒");
+        let bytes = std::fs::read(session_path).expect("读取只读 observer session 失败");
+        let session = StoredSession::restore(&bytes).map_err(TelegramClientError::Snapshot)?;
+        let observer_token = std::env::var("TGM_LIVE_BOT2_TOKEN").expect("缺少 observer Bot token");
+        let expected_bot_id = observer_token
+            .split_once(':')
+            .and_then(|(id, _)| id.parse::<i64>().ok())
+            .expect("observer Bot token 格式无效");
+        let (client, bot_id) =
+            TelegramClient::resume_bot_sender(TelegramClientConfig::new(api_id)?, session).await?;
+        assert_eq!(bot_id, expected_bot_id, "observer identity mismatch");
+        println!("g4_readonly_stage=observer_resume:pass");
+
+        let peer = match resolve_peer_ref(&client.client, &client.session, target).await {
+            Ok(peer) => peer,
+            Err(error) => {
+                let category = match &error {
+                    TelegramClientError::InvalidPeer(_) => "invalid_peer",
+                    TelegramClientError::PeerResolution(_) => "peer_resolution",
+                    TelegramClientError::Snapshot(_) => "session_snapshot",
+                    TelegramClientError::Invocation(grammers_client::InvocationError::Rpc(rpc)) => {
+                        match rpc.name.as_str() {
+                            "CHANNEL_INVALID" => "rpc_channel_invalid",
+                            "CHANNEL_PRIVATE" => "rpc_channel_private",
+                            "PEER_ID_INVALID" => "rpc_peer_id_invalid",
+                            "FLOOD_WAIT" => "rpc_flood_wait",
+                            _ if rpc.name.bytes().all(|byte| {
+                                byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                            }) && !rpc.name.is_empty()
+                                && rpc.name.len() <= 64 =>
+                            {
+                                println!("g4_readonly_failure=rpc_{}", rpc.name);
+                                let _ = client.shutdown().await;
+                                return Err(error);
+                            }
+                            _ => "rpc_other",
+                        }
+                    }
+                    TelegramClientError::Invocation(grammers_client::InvocationError::Dropped) => {
+                        "invocation_dropped"
+                    }
+                    TelegramClientError::Invocation(grammers_client::InvocationError::Session(
+                        _,
+                    )) => "invocation_session",
+                    TelegramClientError::Invocation(grammers_client::InvocationError::Io(_)) => {
+                        "invocation_io"
+                    }
+                    TelegramClientError::Invocation(
+                        grammers_client::InvocationError::Transport(_),
+                    ) => "invocation_transport",
+                    TelegramClientError::Invocation(
+                        grammers_client::InvocationError::Deserialize(_),
+                    ) => "invocation_deserialize",
+                    TelegramClientError::Invocation(
+                        grammers_client::InvocationError::InvalidDc,
+                    ) => "invocation_invalid_dc",
+                    TelegramClientError::Invocation(
+                        grammers_client::InvocationError::Authentication(_),
+                    ) => "invocation_authentication",
+                    _ => "other_client_error",
+                };
+                println!("g4_readonly_failure={category}");
+                let _ = client.shutdown().await;
+                return Err(error);
+            }
+        };
+        println!("g4_readonly_stage=peer_resolution:pass");
+        let mut messages = client.client.iter_messages(peer).limit(100);
+        let mut scanned = 0usize;
+        let mut marker_matches = 0usize;
+        loop {
+            let message = match messages.next().await {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(error) => {
+                    let category = match &error {
+                        grammers_client::InvocationError::Rpc(rpc)
+                            if !rpc.name.is_empty()
+                                && rpc.name.len() <= 64
+                                && rpc.name.bytes().all(|byte| {
+                                    byte.is_ascii_uppercase()
+                                        || byte.is_ascii_digit()
+                                        || byte == b'_'
+                                }) =>
+                        {
+                            format!("rpc_{}", rpc.name)
+                        }
+                        grammers_client::InvocationError::Rpc(_) => "rpc_other".to_owned(),
+                        grammers_client::InvocationError::Dropped => {
+                            "invocation_dropped".to_owned()
+                        }
+                        grammers_client::InvocationError::Session(_) => {
+                            "invocation_session".to_owned()
+                        }
+                        grammers_client::InvocationError::Io(_) => "invocation_io".to_owned(),
+                        grammers_client::InvocationError::Transport(_) => {
+                            "invocation_transport".to_owned()
+                        }
+                        grammers_client::InvocationError::Deserialize(_) => {
+                            "invocation_deserialize".to_owned()
+                        }
+                        grammers_client::InvocationError::InvalidDc => {
+                            "invocation_invalid_dc".to_owned()
+                        }
+                        grammers_client::InvocationError::Authentication(_) => {
+                            "invocation_authentication".to_owned()
+                        }
+                    };
+                    println!("g4_readonly_failure=history_{category}");
+                    let _ = client.shutdown().await;
+                    return Err(TelegramClientError::Invocation(error));
+                }
+            };
+            scanned += 1;
+            if message.date().timestamp() < since {
+                break;
+            }
+            if message.text().contains("tgm-g4-flood-wait-probe") {
+                marker_matches += 1;
+            }
+        }
+        println!("g4_readonly_stage=message_search:pass");
+        client.shutdown().await?;
+        println!("g4_readonly_recent_messages={scanned} marker_matches={marker_matches}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "只读真机诊断：确认 sender session 能否解析目标 peer，不发送消息"]
+    async fn live_g4_sender_peer_resolution_check() -> Result<(), TelegramClientError> {
+        use std::path::PathBuf;
+
+        use super::resolve_peer_ref;
+        use crate::session::StoredSession;
+        use grammers_session::types::PeerId;
+
+        let api_id = std::env::var("TGM_PLATFORM_API_ID")
+            .expect("缺少 TGM_PLATFORM_API_ID")
+            .parse::<i32>()
+            .expect("TGM_PLATFORM_API_ID 必须是整数");
+        let target = std::env::var("TGM_LIVE_TARGET_CHAT")
+            .expect("缺少 TGM_LIVE_TARGET_CHAT")
+            .parse::<i64>()
+            .expect("TGM_LIVE_TARGET_CHAT 必须是整数");
+        let token = std::env::var("TGM_LIVE_BOT_TOKEN").expect("缺少 sender Bot token");
+        let expected_bot_id = token
+            .split_once(':')
+            .and_then(|(id, _)| id.parse::<i64>().ok())
+            .expect("sender Bot token 格式无效");
+        let session_path = PathBuf::from(
+            std::env::var("TGM_G4_SENDER_SESSION_FILE").expect("缺少 TGM_G4_SENDER_SESSION_FILE"),
+        );
+        let bytes = std::fs::read(session_path).expect("读取 sender session 失败");
+        let session = StoredSession::restore(&bytes).map_err(TelegramClientError::Snapshot)?;
+        let (client, bot_id) =
+            TelegramClient::resume_bot_sender(TelegramClientConfig::new(api_id)?, session).await?;
+        if bot_id != expected_bot_id {
+            println!("g4_sender_peer_resolution=failed_identity_mismatch");
+            client.shutdown().await?;
+            return Ok(());
+        }
+
+        use grammers_session::Session;
+        let peer_id = PeerId::from_bot_api_dialog_id(target)
+            .ok_or(TelegramClientError::InvalidPeer(target))?;
+        let cache_state = if client
+            .session
+            .peer_ref(peer_id)
+            .await
+            .map_err(TelegramClientError::Snapshot)?
+            .is_some()
+        {
+            "hit"
+        } else {
+            "miss"
+        };
+        println!("g4_sender_peer_cache={cache_state}");
+
+        let result = resolve_peer_ref(&client.client, &client.session, target).await;
+        let outcome = match result {
+            Ok(_) => "pass".to_owned(),
+            Err(TelegramClientError::InvalidPeer(_)) => "failed_invalid_peer".to_owned(),
+            Err(TelegramClientError::PeerResolution(_)) => "failed_peer_resolution".to_owned(),
+            Err(TelegramClientError::Snapshot(_)) => "failed_session_snapshot".to_owned(),
+            Err(TelegramClientError::Invocation(grammers_client::InvocationError::Dropped)) => {
+                "failed_invocation_dropped".to_owned()
+            }
+            Err(TelegramClientError::Invocation(grammers_client::InvocationError::Rpc(rpc))) => {
+                let name = &rpc.name;
+                if !name.is_empty()
+                    && name.len() <= 64
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+                {
+                    format!("failed_rpc_{name}")
+                } else {
+                    "failed_rpc_other".to_owned()
+                }
+            }
+            Err(TelegramClientError::Invocation(grammers_client::InvocationError::Session(_))) => {
+                "failed_invocation_session".to_owned()
+            }
+            Err(TelegramClientError::Invocation(grammers_client::InvocationError::Io(_))) => {
+                "failed_invocation_io".to_owned()
+            }
+            Err(TelegramClientError::Invocation(grammers_client::InvocationError::Transport(
+                _,
+            ))) => "failed_invocation_transport".to_owned(),
+            Err(TelegramClientError::Invocation(
+                grammers_client::InvocationError::Deserialize(_),
+            )) => "failed_invocation_deserialize".to_owned(),
+            Err(TelegramClientError::Invocation(grammers_client::InvocationError::InvalidDc)) => {
+                "failed_invocation_invalid_dc".to_owned()
+            }
+            Err(TelegramClientError::Invocation(
+                grammers_client::InvocationError::Authentication(_),
+            )) => "failed_invocation_authentication".to_owned(),
+            Err(_) => "failed_client_error_other".to_owned(),
+        };
+        println!("g4_sender_peer_resolution={outcome}");
+        client.shutdown().await?;
+        Ok(())
+    }
 }

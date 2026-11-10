@@ -3316,6 +3316,7 @@ async fn identity_router_lists_owned_and_shared_identities(admin: PgPool) {
     assert_eq!(body["items"][0]["id"], identity_a.get());
     assert_eq!(body["items"][0]["kind"], "bot");
     assert_eq!(body["items"][0]["status"], "offline");
+    assert!(body["items"][0]["flood_wait_until"].is_null());
     assert_eq!(body["items"][1]["display_name"], "shared-demo");
     assert_eq!(body["items"][1]["status"], "online");
     assert!(body.get("tenant_id").is_none());
@@ -3499,6 +3500,55 @@ async fn identity_write_routes_enforce_scope_state_and_delete_guards(admin: PgPo
         .execute(admin.raw())
         .await
         .expect("设置 flood_wait 状态失败");
+    sqlx::query("UPDATE identities SET flood_wait_until = clock_timestamp() + interval '1 minute' WHERE id = $1")
+        .bind(identity_a)
+        .execute(admin.raw())
+        .await
+        .expect("设置身份冷却截止时间失败");
+    let blocked_reset = router(ControlPlaneState::new(app.clone()))
+        .oneshot(with_auth(
+            request(
+                "POST",
+                &format!("/api/v1/identities/{}/reset-status", identity_a.get()),
+                Body::empty(),
+            ),
+            owner_a,
+        ))
+        .await
+        .expect("执行有效冷却期间复位请求失败");
+    assert_eq!(blocked_reset.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(blocked_reset).await["error"]["code"],
+        "CONDITION_INVALID"
+    );
+    let blocked_status: String = sqlx::query_scalar("SELECT status FROM identities WHERE id = $1")
+        .bind(identity_a)
+        .fetch_one(admin.raw())
+        .await
+        .expect("核对拒绝复位后的身份状态失败");
+    assert_eq!(blocked_status, "flood_wait");
+    let listed = router(ControlPlaneState::new(app.clone()))
+        .oneshot(with_auth(
+            request("GET", "/api/v1/identities?kind=bot", Body::empty()),
+            owner_a,
+        ))
+        .await
+        .expect("冷却期间查询身份列表失败");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed_body = response_json(listed).await;
+    let cooling_identity = listed_body["items"]
+        .as_array()
+        .expect("身份列表 items 缺失")
+        .iter()
+        .find(|identity| identity["id"] == identity_a.get())
+        .expect("冷却身份未出现在列表");
+    assert_eq!(cooling_identity["status"], "flood_wait");
+    assert!(cooling_identity["flood_wait_until"].is_string());
+    sqlx::query("UPDATE identities SET flood_wait_until = clock_timestamp() - interval '1 second' WHERE id = $1")
+        .bind(identity_a)
+        .execute(admin.raw())
+        .await
+        .expect("推进身份冷却到期失败");
     let reset = router(ControlPlaneState::new(app.clone()))
         .oneshot(with_auth(
             request(
@@ -3611,6 +3661,7 @@ async fn dashboard_returns_tenant_scoped_status_and_today_summary(admin: PgPool)
     let tenant_a = support::seed_tenant(&admin, "dashboard-tenant-a", 5301).await;
     let tenant_b = support::seed_tenant(&admin, "dashboard-tenant-b", 5302).await;
     let identity_a = support::seed_identity(&admin, tenant_a).await;
+    let cooling_identity = support::seed_identity(&admin, tenant_a).await;
     let identity_b = support::seed_identity(&admin, tenant_b).await;
     sqlx::query("UPDATE identities SET status = 'online' WHERE id = $1")
         .bind(identity_a)
@@ -3622,6 +3673,16 @@ async fn dashboard_returns_tenant_scoped_status_and_today_summary(admin: PgPool)
         .execute(admin.raw())
         .await
         .expect("更新租户 B 身份状态失败");
+    sqlx::query(
+        "UPDATE identities
+            SET status = 'flood_wait',
+                flood_wait_until = clock_timestamp() + interval '1 minute'
+          WHERE id = $1",
+    )
+    .bind(cooling_identity)
+    .execute(admin.raw())
+    .await
+    .expect("设置 Dashboard 身份冷却状态失败");
 
     let source_a = support::seed_source(&admin, tenant_a, identity_a, -5301, "Dashboard A").await;
     let canonical_id: i64 = sqlx::query_scalar(
@@ -3685,13 +3746,14 @@ async fn dashboard_returns_tenant_scoped_status_and_today_summary(admin: PgPool)
     let body = response_json(response).await;
     assert_eq!(body["status"], "ok");
     assert_eq!(body["identities"]["online"], 1);
+    assert_eq!(body["identities"]["flood_wait"], 1);
     assert_eq!(body["identities"]["banned"], 0);
     assert_eq!(body["queue_depth"], 1);
     assert_eq!(body["today"]["received"], 1);
     assert_eq!(body["today"]["matched"], 1);
     assert_eq!(body["today"]["delivered"], 1);
     assert_eq!(body["today"]["failed"], 1);
-    assert!(body["flood_wait_until"].is_null());
+    assert!(body["flood_wait_until"].is_string());
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]

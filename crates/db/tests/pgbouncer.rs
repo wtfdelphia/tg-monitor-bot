@@ -126,7 +126,7 @@ async fn r3_session_var_does_not_leak_across_clients() {
 
 /// R4 用的种子数据。常驻库是共享的，所以名字带 `r4-` 前缀且用完即删。
 ///
-/// 用超级用户直连 55432 灌：这一步是前置条件不是被测对象，而 `app_user`
+/// 用超级用户直连数据库灌：这一步是前置条件不是被测对象，而 `app_user`
 /// 在 FORCE 的表上灌两个租户的数据要来回切 `app.tenant_id`，
 /// 那会把前置条件本身变成一个要验的东西。
 ///
@@ -202,9 +202,12 @@ async fn sample(pool: &PgPool, tenant: TenantId) -> (Vec<String>, i32, i64) {
 async fn r4_prepared_statement_reuse_returns_the_second_tenant() {
     let admin = PgPoolOptions::new()
         .max_connections(1)
-        .connect("postgres://postgres:pw@127.0.0.1:55432/tgm")
+        .connect(&format!(
+            "postgres://postgres:pw@127.0.0.1:{}/tgm",
+            support::direct_port()
+        ))
         .await
-        .expect("以 postgres 连 tgm:55432 失败");
+        .expect("以 postgres 连测试 tgm 库失败");
     // 上一轮若中途 panic 会留下残留，先清。
     sqlx::query("DELETE FROM tenants WHERE name LIKE 'r4-%'")
         .execute(&admin)
@@ -216,7 +219,10 @@ async fn r4_prepared_statement_reuse_returns_the_second_tenant() {
     // 可能走一条全新的、没有语句缓存的连接，那就什么都没测到。
     let pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect("postgres://app_user:apw@127.0.0.1:56432/tgm")
+        .connect(&format!(
+            "postgres://app_user:apw@127.0.0.1:{}/tgm",
+            support::pgbouncer_port()
+        ))
         .await
         .expect("以 app_user 经 PgBouncer 连库失败");
     support::assert_role(&pool, "app_user").await;
