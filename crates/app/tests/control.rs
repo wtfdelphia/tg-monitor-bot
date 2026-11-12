@@ -13,7 +13,9 @@ use josekit::jwt::{self, JwtPayload};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::types::chrono::{TimeZone, Utc};
-use std::sync::{Arc, Mutex};
+use std::io;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 use tgm_app::bot_console::{BotConsoleConfig, TelegramBotApiClient, process_console_login_action};
 use tgm_app::console_login::{ConsoleLoginAction, confirm_callback_data};
@@ -24,6 +26,47 @@ use tgm_core::secret::Secret;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
+use tracing_subscriber::prelude::*;
+
+#[derive(Clone)]
+struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+struct SharedWriterGuard(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for SharedWriterGuard {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let mut output = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("test output lock poisoned"))?;
+        output.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedWriter {
+    type Writer = SharedWriterGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedWriterGuard(Arc::clone(&self.0))
+    }
+}
+
+fn capture_subscriber(output: Arc<Mutex<Vec<u8>>>) -> tracing::Dispatch {
+    tracing::Dispatch::new(
+        tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_current_span(true)
+                .with_span_list(true)
+                .with_writer(SharedWriter(output)),
+        ),
+    )
+}
 
 fn request(method: &str, uri: &str, body: Body) -> Request<Body> {
     Request::builder()
@@ -226,6 +269,8 @@ async fn source_router_fails_closed_without_auth(admin: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations-test")]
 async fn auth_me_returns_current_web_identity(admin: PgPool) {
+    use tracing::instrument::WithSubscriber;
+
     let (app, admin) = support::pools(admin).await;
     let auth_pool = support::auth_pool(&admin).await;
     let tenant = support::seed_tenant(&admin, "auth-me", 7002).await;
@@ -254,6 +299,7 @@ async fn auth_me_returns_current_web_identity(admin: PgPool) {
     .await
     .expect("创建 auth/me 测试会话失败");
 
+    let output = Arc::new(Mutex::new(Vec::new()));
     let response = router(ControlPlaneState::with_auth_pool(
         app.clone(),
         auth_pool.clone(),
@@ -261,14 +307,24 @@ async fn auth_me_returns_current_web_identity(admin: PgPool) {
     .oneshot(
         Request::builder()
             .method("GET")
-            .uri("/auth/me")
+            .uri("/auth/me?tenant_id=999999")
+            .header("x-tenant-id", "999999")
+            .header("x-tgm-request-id", "caller-controlled")
             .header("cookie", session_cookie(SESSION_ID))
             .body(Body::empty())
             .expect("构造 auth/me 请求失败"),
     )
+    .with_subscriber(capture_subscriber(Arc::clone(&output)))
     .await
     .expect("执行 auth/me 请求失败");
     assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response
+        .headers()
+        .get("x-tgm-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("响应缺少服务端 request ID")
+        .to_owned();
+    assert_ne!(request_id, "caller-controlled");
     assert_eq!(
         response_json(response).await,
         json!({
@@ -277,17 +333,49 @@ async fn auth_me_returns_current_web_identity(admin: PgPool) {
             "role": "TENANT_ADMIN",
         })
     );
+    let logs = String::from_utf8(output.lock().expect("读取 tracing 日志失败").clone())
+        .expect("tracing 日志不是 UTF-8");
+    assert!(
+        logs.contains(&request_id),
+        "响应 ID 未出现在 request span：{logs}"
+    );
+    assert!(
+        logs.contains(&format!("\"tenant_id\":{}", tenant.get())),
+        "已认证租户未记录到 request span：{logs}"
+    );
+    assert!(
+        !logs.contains("999999"),
+        "调用者提供的租户 ID 进入 tracing：{logs}"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]
 async fn auth_me_fails_closed_without_authentication(admin: PgPool) {
+    use tracing::instrument::WithSubscriber;
+
     let (app, _admin) = support::pools(admin).await;
+    let output = Arc::new(Mutex::new(Vec::new()));
     let response = router(ControlPlaneState::new(app))
-        .oneshot(request("GET", "/auth/me", Body::empty()))
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/auth/me?tenant_id=999999")
+                .header("x-tenant-id", "999999")
+                .header("x-tgm-request-id", "caller-controlled")
+                .body(Body::empty())
+                .expect("构造未认证 spoof 请求失败"),
+        )
+        .with_subscriber(capture_subscriber(Arc::clone(&output)))
         .await
         .expect("执行未认证 auth/me 请求失败");
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let request_id = response
+        .headers()
+        .get("x-tgm-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("未认证响应缺少服务端 request ID");
+    assert_ne!(request_id, "caller-controlled");
     assert_eq!(
         response
             .headers()
@@ -298,6 +386,12 @@ async fn auth_me_fails_closed_without_authentication(admin: PgPool) {
     assert_eq!(
         response_json(response).await["error"]["code"],
         "UNAUTHENTICATED"
+    );
+    let logs = String::from_utf8(output.lock().expect("读取 tracing 日志失败").clone())
+        .expect("tracing 日志不是 UTF-8");
+    assert!(
+        !logs.contains("999999"),
+        "伪造租户字段进入未认证 span：{logs}"
     );
 }
 
@@ -407,6 +501,8 @@ async fn auth_logout_revokes_current_session_and_clears_cookies(admin: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations-test")]
 async fn auth_logout_rejects_missing_or_invalid_csrf_without_deleting_session(admin: PgPool) {
+    use tracing::instrument::WithSubscriber;
+
     let (app, admin) = support::pools(admin).await;
     let auth_pool = support::auth_pool(&admin).await;
     let tenant = support::seed_tenant(&admin, "auth-logout-csrf", 7004).await;
@@ -435,6 +531,7 @@ async fn auth_logout_rejects_missing_or_invalid_csrf_without_deleting_session(ad
     .await
     .expect("创建 CSRF 测试会话失败");
 
+    let output = Arc::new(Mutex::new(Vec::new()));
     let missing = router(ControlPlaneState::with_auth_pool(
         app.clone(),
         auth_pool.clone(),
@@ -442,18 +539,35 @@ async fn auth_logout_rejects_missing_or_invalid_csrf_without_deleting_session(ad
     .oneshot(
         Request::builder()
             .method("POST")
-            .uri("/auth/logout")
+            .uri("/auth/logout?tenant_id=999999")
             .header("cookie", session_cookie(SESSION_ID))
+            .header("x-tenant-id", "999999")
+            .header("x-tgm-request-id", "caller-controlled")
             .body(Body::empty())
             .expect("构造缺失 CSRF logout 请求失败"),
     )
+    .with_subscriber(capture_subscriber(Arc::clone(&output)))
     .await
     .expect("执行缺失 CSRF logout 请求失败");
     assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    let request_id = missing
+        .headers()
+        .get("x-tgm-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("认证中间件提前拒绝响应缺少 request ID")
+        .to_owned();
+    assert_ne!(request_id, "caller-controlled");
     assert_eq!(
         response_json(missing).await["error"]["code"],
         "CSRF_INVALID"
     );
+    let logs = String::from_utf8(output.lock().expect("读取 CSRF tracing 日志失败").clone())
+        .expect("CSRF tracing 日志不是 UTF-8");
+    assert!(
+        logs.contains(&request_id),
+        "request ID 未进入请求 span：{logs}"
+    );
+    assert!(!logs.contains("999999"), "伪造租户值进入请求 span：{logs}");
 
     let invalid = router(ControlPlaneState::with_auth_pool(app, auth_pool))
         .oneshot(

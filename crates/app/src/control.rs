@@ -31,6 +31,7 @@ use tgm_core::oidc::{
 };
 use tgm_core::secret::Secret;
 use tokio::net::TcpListener;
+use tracing::Instrument;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::bot_console::BotConsoleConfig;
@@ -179,6 +180,12 @@ const OIDC_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const OIDC_MAX_TOKEN_BYTES: u64 = 256 * 1024;
 const OIDC_MAX_JWKS_BYTES: u64 = 1024 * 1024;
 const SESSION_TOKEN_LEN: usize = 32;
+const REQUEST_ID_HEADER: &str = "x-tgm-request-id";
+
+tokio::task_local! {
+    static REQUEST_ID: String;
+}
+
 pub const OIDC_AUTHORIZATION_ENDPOINT: &str = "https://oauth.telegram.org/auth";
 pub const OIDC_TOKEN_ENDPOINT: &str = "https://oauth.telegram.org/token";
 pub const OIDC_ISSUER: &str = "https://oauth.telegram.org";
@@ -724,12 +731,14 @@ where
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        parts
+        let auth = parts
             .extensions
             .get::<AuthContext>()
             .copied()
             .map(Self)
-            .ok_or_else(|| AppError::Unauthenticated.into())
+            .ok_or_else(|| ApiError::from(AppError::Unauthenticated))?;
+        record_tenant(auth.0);
+        Ok(auth)
     }
 }
 
@@ -1446,6 +1455,7 @@ async fn authenticate_request(
     next: Next,
 ) -> Response {
     if let Some(auth) = request.extensions().get::<AuthContext>().copied() {
+        record_tenant(auth);
         if let Err(error) = check_tenant_request(
             &state.pool,
             auth,
@@ -1507,6 +1517,9 @@ async fn authenticate_request(
         AuthContext::new(session.tenant_id, session.user_id, role, AuthSource::Web)
             .with_web_session_id(session_id),
     );
+    if let Some(auth) = request.extensions().get::<AuthContext>().copied() {
+        record_tenant(auth);
+    }
     if let Some(auth) = request.extensions().get::<AuthContext>().copied()
         && let Err(error) = check_tenant_request(
             &state.pool,
@@ -1520,6 +1533,40 @@ async fn authenticate_request(
         return ApiError::from(error).into_response();
     }
     next.run(request).await
+}
+
+fn record_tenant(auth: AuthContext) {
+    tracing::Span::current().record("tenant_id", auth.tenant_id().get());
+}
+
+async fn request_context(request: axum::http::Request<Body>, next: Next) -> Response {
+    let mut random = [0_u8; 16];
+    if let Err(error) = getrandom::fill(&mut random) {
+        tracing::error!(error = %error, "failed to generate request id");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let request_id = URL_SAFE_NO_PAD.encode(random);
+    let method = request.method().as_str().to_owned();
+    let span = tracing::info_span!(
+        "http.request",
+        request_id = %request_id,
+        http_method = %method,
+        tenant_id = tracing::field::Empty,
+    );
+    REQUEST_ID
+        .scope(request_id.clone(), async move {
+            let mut response = next.run(request).await;
+            if let Ok(value) = HeaderValue::from_str(&request_id) {
+                response.headers_mut().insert(REQUEST_ID_HEADER, value);
+            }
+            tracing::info!(
+                http_status_code = response.status().as_u16(),
+                "request completed"
+            );
+            response
+        })
+        .instrument(span)
+        .await
 }
 
 async fn check_tenant_request(
@@ -1817,7 +1864,26 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         if self.0.is_internal() {
-            tracing::error!(error = %self.0, code = self.0.code(), "control plane request failed");
+            let error_kind = match &self.0 {
+                AppError::Db(_) => "database",
+                AppError::Other(_) => "internal",
+                AppError::OidcProviderUnavailable => "oidc_provider",
+                _ => "internal",
+            };
+            if let Ok(request_id) = REQUEST_ID.try_with(|request_id| request_id.clone()) {
+                tracing::error!(
+                    request_id = %request_id,
+                    error_kind,
+                    code = self.0.code(),
+                    "control plane request failed"
+                );
+            } else {
+                tracing::error!(
+                    error_kind,
+                    code = self.0.code(),
+                    "control plane request failed"
+                );
+            }
         }
         let status =
             StatusCode::from_u16(self.0.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -5124,11 +5190,46 @@ pub struct PublicApiDoc;
 pub struct AdminApiDoc;
 
 pub fn public_openapi_json() -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(&PublicApiDoc::openapi())
+    let mut openapi = PublicApiDoc::openapi();
+    add_request_id_response_headers(&mut openapi);
+    serde_json::to_string_pretty(&openapi)
 }
 
 pub fn admin_openapi_json() -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(&AdminApiDoc::openapi())
+    let mut openapi = AdminApiDoc::openapi();
+    add_request_id_response_headers(&mut openapi);
+    serde_json::to_string_pretty(&openapi)
+}
+
+fn add_request_id_response_headers(openapi: &mut utoipa::openapi::OpenApi) {
+    use utoipa::openapi::{RefOr, header::HeaderBuilder};
+
+    for path in openapi.paths.paths.values_mut() {
+        for operation in [
+            path.get.as_mut(),
+            path.put.as_mut(),
+            path.post.as_mut(),
+            path.delete.as_mut(),
+            path.options.as_mut(),
+            path.head.as_mut(),
+            path.patch.as_mut(),
+            path.trace.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for response in operation.responses.responses.values_mut() {
+                if let RefOr::T(response) = response {
+                    response.headers.insert(
+                        "X-Tgm-Request-Id".to_owned(),
+                        HeaderBuilder::new()
+                            .description(Some("服务端生成的请求关联标识"))
+                            .build(),
+                    );
+                }
+            }
+        }
+    }
 }
 
 pub fn router(state: ControlPlaneState) -> Router {
@@ -5251,6 +5352,7 @@ pub fn router(state: ControlPlaneState) -> Router {
             state.clone(),
             authenticate_request,
         ))
+        .layer(middleware::from_fn(request_context))
         .with_state(state)
 }
 
@@ -5350,6 +5452,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use axum::response::IntoResponse;
+    use axum::routing::get;
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use josekit::jwk::alg::rsa::RsaKeyPair;
@@ -5360,12 +5463,54 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
+    use std::{io, sync::Mutex};
     use tgm_core::error::AppError;
     use tgm_core::oidc::{OidcLoginMaterial, OidcSigningAlgorithm};
     use tgm_core::secret::Secret;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tower::ServiceExt;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedWriterGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedWriterGuard {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let mut output = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("test output lock poisoned"))?;
+            output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedWriter {
+        type Writer = SharedWriterGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedWriterGuard(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_subscriber(output: Arc<Mutex<Vec<u8>>>) -> tracing::Dispatch {
+        tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_current_span(true)
+                    .with_span_list(true)
+                    .with_writer(SharedWriter(output)),
+            ),
+        )
+    }
 
     fn test_database_url() -> String {
         let port = std::env::var("TGM_TEST_PG_PORT").unwrap_or_else(|_| "55432".to_owned());
@@ -5635,6 +5780,155 @@ mod tests {
         let encoded = serde_json::to_value(ErrorResponse { error: body.error }).expect("json");
         assert_eq!(encoded["error"]["code"], "NOT_FOUND");
         assert!(encoded.get("tenant_id").is_none());
+    }
+
+    #[test]
+    fn openapi_documents_request_id_on_every_response() {
+        for encoded in [
+            super::public_openapi_json().expect("生成 public OpenAPI 失败"),
+            super::admin_openapi_json().expect("生成 admin OpenAPI 失败"),
+        ] {
+            let document: serde_json::Value =
+                serde_json::from_str(&encoded).expect("解析 OpenAPI 失败");
+            let paths = document["paths"].as_object().expect("OpenAPI paths");
+            for (path, path_item) in paths {
+                let operations = path_item.as_object().expect("path item");
+                for (method, operation) in operations {
+                    let Some(responses) = operation.get("responses").and_then(|v| v.as_object())
+                    else {
+                        continue;
+                    };
+                    for (status, response) in responses {
+                        assert!(
+                            response["headers"]["X-Tgm-Request-Id"].is_object(),
+                            "{method} {path} {status} 未声明 X-Tgm-Request-Id"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_context_replaces_spoofed_ids_and_correlates_redacted_errors() {
+        use tracing::instrument::WithSubscriber;
+
+        const SENTINEL: &str = "internal-error-secret-sentinel";
+        const QUERY_SENTINEL: &str = "query-secret-sentinel";
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = capture_subscriber(Arc::clone(&output));
+        let app = axum::Router::new()
+            .route("/ok", get(|| async { StatusCode::NO_CONTENT }))
+            .route(
+                "/internal",
+                get(|| async move {
+                    Err::<StatusCode, ApiError>(
+                        AppError::internal(io::Error::other(SENTINEL)).into(),
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(super::request_context));
+
+        let success = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ok")
+                    .header("x-tgm-request-id", "caller-controlled")
+                    .header("x-tgm-request-id", "second-caller-value")
+                    .body(Body::empty())
+                    .expect("构造请求失败"),
+            )
+            .with_subscriber(dispatch.clone())
+            .await
+            .expect("执行成功请求失败");
+        assert_eq!(success.status(), StatusCode::NO_CONTENT);
+        let success_id = success
+            .headers()
+            .get(super::REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("成功响应缺少 request id")
+            .to_owned();
+        assert_ne!(success_id, "caller-controlled");
+        assert_ne!(success_id, "second-caller-value");
+
+        let without_client_id = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ok?value={QUERY_SENTINEL}"))
+                    .body(Body::empty())
+                    .expect("构造无 request ID 请求失败"),
+            )
+            .with_subscriber(dispatch.clone())
+            .await
+            .expect("执行无 request ID 请求失败");
+        let generated_id = without_client_id
+            .headers()
+            .get(super::REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("无 request ID 请求的响应缺少 request ID");
+        assert_ne!(success_id, generated_id);
+
+        let not_found = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/missing")
+                    .body(Body::empty())
+                    .expect("构造未知路径请求失败"),
+            )
+            .with_subscriber(dispatch.clone())
+            .await
+            .expect("执行未知路径请求失败");
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        assert!(not_found.headers().contains_key(super::REQUEST_ID_HEADER));
+
+        let internal = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/internal?value={QUERY_SENTINEL}"))
+                    .header("x-tgm-request-id", "caller-controlled")
+                    .header("x-tgm-request-id", "second-caller-value")
+                    .body(Body::empty())
+                    .expect("构造内部错误请求失败"),
+            )
+            .with_subscriber(dispatch)
+            .await
+            .expect("执行内部错误请求失败");
+        assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let internal_id = internal
+            .headers()
+            .get(super::REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("错误响应缺少 request id")
+            .to_owned();
+        assert_ne!(success_id, internal_id);
+        let internal_body = axum::body::to_bytes(internal.into_body(), 1_048_576)
+            .await
+            .expect("读取内部错误响应失败");
+        let internal_body =
+            String::from_utf8(internal_body.to_vec()).expect("内部错误响应不是 UTF-8");
+        assert!(!internal_body.contains(SENTINEL));
+        assert!(!internal_body.contains(QUERY_SENTINEL));
+
+        let logs = String::from_utf8(output.lock().expect("读取测试日志失败").clone())
+            .expect("测试日志不是 UTF-8");
+        assert!(
+            logs.contains(&internal_id),
+            "内部错误日志未关联响应 ID：{logs}"
+        );
+        assert!(!logs.contains(SENTINEL), "内部错误细节泄漏到日志：{logs}");
+        assert!(!logs.contains(QUERY_SENTINEL), "query 串泄漏到日志：{logs}");
+        assert!(
+            !logs.contains("caller-controlled"),
+            "伪造 request ID 泄漏到日志：{logs}"
+        );
+        assert!(
+            !logs.contains("second-caller-value"),
+            "重复 request ID 泄漏到日志：{logs}"
+        );
+        assert!(logs.contains("database") || logs.contains("internal"));
     }
 
     #[tokio::test]

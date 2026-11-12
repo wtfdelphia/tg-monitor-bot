@@ -59,6 +59,14 @@
         "responses": {
           "200": {
             "description": "Tenant audit logs",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -69,6 +77,14 @@
           },
           "400": {
             "description": "Invalid audit log filters",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -79,6 +95,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -97,6 +121,14 @@
         "responses": {
           "200": {
             "description": "Dashboard summary",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -107,6 +139,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -159,6 +199,14 @@
         "responses": {
           "200": {
             "description": "Tenant identities",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -169,6 +217,14 @@
           },
           "400": {
             "description": "Invalid filters",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -179,6 +235,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -207,6 +271,14 @@
         "responses": {
           "201": {
             "description": "Bot identity created; token is never echoed",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -217,6 +289,14 @@
           },
           "400": {
             "description": "Token rejected by Telegram or bot already registered",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -227,6 +307,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -237,6 +325,14 @@
           },
           "403": {
             "description": "Owner or admin required, or credential submitted via Bot",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -265,6 +361,14 @@
         "responses": {
           "200": {
             "description": "Password checked; wrong password stays in awaiting_password",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -275,6 +379,14 @@
           },
           "400": {
             "description": "Login is not waiting for a password",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -285,6 +397,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -295,6 +415,14 @@
           },
           "403": {
             "description": "Owner or admin required, or submitted via Bot",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -305,6 +433,14 @@
           },
           "404": {
             "description": "Unknown, finished, or someone else's login",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -315,6 +451,14 @@
           },
           "429": {
             "description": "Submitted faster than every 2 seconds",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -343,6 +487,14 @@
         "responses": {
           "201": {
             "description": "QR login started; api_hash is never echoed",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -353,6 +505,14 @@
           },
           "400": {
             "description": "Invalid api_id/api_hash, or rejected by Telegram",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -363,6 +523,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -373,6 +541,14 @@
           },
           "403": {
             "description": "Owner or admin on pro plan required, consent missing, or submitted via Bot",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -383,6 +559,14 @@
           },
           "404": {
             "description": "Identity to reauthorize not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -393,6 +577,14 @@
           },
           "429": {
             "description": "Too many QR logins for this tenant",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -422,6 +614,14 @@
         "responses": {
           "200": {
             "description": "QR login status",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -432,6 +632,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -442,6 +650,14 @@
           },
           "403": {
             "description": "Owner or admin required, or requested via Bot",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -452,6 +668,14 @@
           },
           "404": {
             "description": "Unknown, finished, or someone else's login",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -462,6 +686,14 @@
           },
           "429": {
             "description": "Polled faster than every 2 seconds",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -491,10 +723,26 @@
         ],
         "responses": {
           "204": {
-            "description": "Identity deleted"
+            "description": "Identity deleted",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            }
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -505,6 +753,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -515,6 +771,14 @@
           },
           "404": {
             "description": "Identity not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -525,6 +789,14 @@
           },
           "409": {
             "description": "Identity is still referenced",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -563,6 +835,14 @@
         "responses": {
           "200": {
             "description": "Identity updated",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -573,6 +853,14 @@
           },
           "400": {
             "description": "Invalid identity update",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -583,6 +871,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -593,6 +889,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -603,6 +907,14 @@
           },
           "404": {
             "description": "Identity not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -633,6 +945,14 @@
         "responses": {
           "200": {
             "description": "Identity status reset",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -643,6 +963,14 @@
           },
           "400": {
             "description": "Identity cannot be reset",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -653,6 +981,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -663,6 +999,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -673,6 +1017,14 @@
           },
           "404": {
             "description": "Identity not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -733,6 +1085,14 @@
         "responses": {
           "200": {
             "description": "Tenant keywords",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -743,6 +1103,14 @@
           },
           "400": {
             "description": "Invalid keyword filters",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -753,6 +1121,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -779,6 +1155,14 @@
         "responses": {
           "201": {
             "description": "Keyword created",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -789,6 +1173,14 @@
           },
           "400": {
             "description": "Invalid keyword",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -799,6 +1191,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -809,6 +1209,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -819,6 +1227,14 @@
           },
           "409": {
             "description": "Keyword already exists",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -847,6 +1263,14 @@
         "responses": {
           "200": {
             "description": "Tenant keywords export",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -857,6 +1281,14 @@
           },
           "400": {
             "description": "Invalid export format",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -867,6 +1299,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -895,6 +1335,14 @@
         "responses": {
           "201": {
             "description": "Keywords imported",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -905,6 +1353,14 @@
           },
           "400": {
             "description": "Invalid keyword import",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -915,6 +1371,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -925,6 +1389,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -935,6 +1407,14 @@
           },
           "409": {
             "description": "Keyword or rule conflict",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -963,6 +1443,14 @@
         "responses": {
           "200": {
             "description": "Enabled keywords matched against sample text",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -973,6 +1461,14 @@
           },
           "400": {
             "description": "Invalid sample text or unsupported match type",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -983,6 +1479,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1012,10 +1516,26 @@
         ],
         "responses": {
           "204": {
-            "description": "Keyword deleted"
+            "description": "Keyword deleted",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            }
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1026,6 +1546,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1036,6 +1564,14 @@
           },
           "404": {
             "description": "Keyword not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1046,6 +1582,14 @@
           },
           "409": {
             "description": "Keyword is referenced by rules",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1084,6 +1628,14 @@
         "responses": {
           "200": {
             "description": "Keyword updated",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1094,6 +1646,14 @@
           },
           "400": {
             "description": "Invalid keyword",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1104,6 +1664,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1114,6 +1682,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1124,6 +1700,14 @@
           },
           "404": {
             "description": "Keyword not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1134,6 +1718,14 @@
           },
           "409": {
             "description": "Keyword already exists",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1186,6 +1778,14 @@
         "responses": {
           "200": {
             "description": "Tenant system logs",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1196,6 +1796,14 @@
           },
           "400": {
             "description": "Invalid log pagination",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1206,6 +1814,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1234,6 +1850,14 @@
         "responses": {
           "200": {
             "description": "Replacement rules copied",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1244,6 +1868,14 @@
           },
           "400": {
             "description": "Invalid replacement copy request",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1254,6 +1886,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1264,6 +1904,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1274,6 +1922,14 @@
           },
           "404": {
             "description": "Rule not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1334,6 +1990,14 @@
         "responses": {
           "200": {
             "description": "Tenant rules",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1344,6 +2008,14 @@
           },
           "400": {
             "description": "Invalid rule filters",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1354,6 +2026,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1380,6 +2060,14 @@
         "responses": {
           "201": {
             "description": "Rule created",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1390,6 +2078,14 @@
           },
           "400": {
             "description": "Invalid rule",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1400,6 +2096,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1410,6 +2114,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1420,6 +2132,14 @@
           },
           "409": {
             "description": "Conflicting rule",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1450,6 +2170,14 @@
         "responses": {
           "200": {
             "description": "Rule detail",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1460,6 +2188,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1470,6 +2206,14 @@
           },
           "404": {
             "description": "Rule not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1497,10 +2241,26 @@
         ],
         "responses": {
           "204": {
-            "description": "Rule deleted"
+            "description": "Rule deleted",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            }
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1511,6 +2271,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1521,6 +2289,14 @@
           },
           "404": {
             "description": "Rule not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1559,6 +2335,14 @@
         "responses": {
           "200": {
             "description": "Rule updated",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1569,6 +2353,14 @@
           },
           "400": {
             "description": "Invalid rule",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1579,6 +2371,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1589,6 +2389,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1599,6 +2407,14 @@
           },
           "404": {
             "description": "Rule not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1609,6 +2425,14 @@
           },
           "409": {
             "description": "Conflicting rule",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1649,6 +2473,14 @@
         "responses": {
           "201": {
             "description": "Rule copied",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1659,6 +2491,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1669,6 +2509,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1679,6 +2527,14 @@
           },
           "404": {
             "description": "Rule or target not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1689,6 +2545,14 @@
           },
           "409": {
             "description": "Conflicting rule",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1719,6 +2583,14 @@
         "responses": {
           "200": {
             "description": "Rule replacements",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1729,6 +2601,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1739,6 +2619,14 @@
           },
           "404": {
             "description": "Rule not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1777,6 +2665,14 @@
         "responses": {
           "200": {
             "description": "Rule replacements replaced",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1787,6 +2683,14 @@
           },
           "400": {
             "description": "Invalid replacements",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1797,6 +2701,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1807,6 +2719,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1817,6 +2737,14 @@
           },
           "404": {
             "description": "Rule not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1857,6 +2785,14 @@
         "responses": {
           "200": {
             "description": "Replacement preview with intermediate steps",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1867,6 +2803,14 @@
           },
           "400": {
             "description": "Invalid replacement pattern",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1877,6 +2821,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1887,6 +2839,14 @@
           },
           "404": {
             "description": "Rule not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1927,6 +2887,14 @@
         "responses": {
           "200": {
             "description": "Rule evaluation with trace",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1937,6 +2905,14 @@
           },
           "400": {
             "description": "Invalid rule test input",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1947,6 +2923,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1957,6 +2941,14 @@
           },
           "404": {
             "description": "Rule not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1987,6 +2979,14 @@
         "responses": {
           "200": {
             "description": "Rule version history",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1997,6 +2997,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2007,6 +3015,14 @@
           },
           "404": {
             "description": "Rule not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2047,6 +3063,14 @@
         "responses": {
           "200": {
             "description": "Rule version snapshot",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2057,6 +3081,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2067,6 +3099,14 @@
           },
           "404": {
             "description": "Rule or version not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2127,6 +3167,14 @@
         "responses": {
           "200": {
             "description": "Tenant source subscriptions",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2137,6 +3185,14 @@
           },
           "400": {
             "description": "Invalid filters",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2147,6 +3203,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2173,6 +3237,14 @@
         "responses": {
           "201": {
             "description": "Source subscription created or reused",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2183,6 +3255,14 @@
           },
           "400": {
             "description": "Invalid source",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2193,6 +3273,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2203,6 +3291,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2213,6 +3309,14 @@
           },
           "404": {
             "description": "Identity not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2243,6 +3347,14 @@
         "responses": {
           "200": {
             "description": "Tenant source subscription",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2253,6 +3365,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2263,6 +3383,14 @@
           },
           "404": {
             "description": "Source not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2301,6 +3429,14 @@
         "responses": {
           "200": {
             "description": "Source subscription updated",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2311,6 +3447,14 @@
           },
           "400": {
             "description": "Invalid source update",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2321,6 +3465,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2331,6 +3483,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2341,6 +3501,14 @@
           },
           "404": {
             "description": "Source or identity not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2377,6 +3545,14 @@
         "responses": {
           "200": {
             "description": "Tenant target channels",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2387,6 +3563,14 @@
           },
           "400": {
             "description": "Invalid pagination",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2397,6 +3581,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2423,6 +3615,14 @@
         "responses": {
           "201": {
             "description": "Target channel created; Telegram probe pending",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2433,6 +3633,14 @@
           },
           "400": {
             "description": "Invalid target",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2443,6 +3651,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2453,6 +3669,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2463,6 +3687,14 @@
           },
           "404": {
             "description": "Sender identity not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2473,6 +3705,14 @@
           },
           "409": {
             "description": "Target channel already exists",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2502,10 +3742,26 @@
         ],
         "responses": {
           "204": {
-            "description": "Target channel disabled"
+            "description": "Target channel disabled",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            }
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2516,6 +3772,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2526,6 +3790,14 @@
           },
           "404": {
             "description": "Target channel not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2564,6 +3836,14 @@
         "responses": {
           "200": {
             "description": "Target channel updated; probe state cleared when routing fields change",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2574,6 +3854,14 @@
           },
           "400": {
             "description": "Invalid target update",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2584,6 +3872,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2594,6 +3890,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2604,6 +3908,14 @@
           },
           "404": {
             "description": "Target or sender identity not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2614,6 +3926,14 @@
           },
           "409": {
             "description": "Target channel already exists",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2644,6 +3964,14 @@
         "responses": {
           "200": {
             "description": "Current target probe",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2654,6 +3982,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2664,6 +4000,14 @@
           },
           "404": {
             "description": "Target not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2692,6 +4036,14 @@
         "responses": {
           "202": {
             "description": "Probe queued or already in progress",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2702,6 +4054,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2712,6 +4072,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2722,6 +4090,14 @@
           },
           "404": {
             "description": "Target not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2782,6 +4158,14 @@
         "responses": {
           "200": {
             "description": "Tenant delivery tasks",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2792,6 +4176,14 @@
           },
           "400": {
             "description": "Invalid task filters",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2802,6 +4194,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2832,6 +4232,14 @@
         "responses": {
           "200": {
             "description": "Delivery task with logs and rule snapshot",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2842,6 +4250,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2852,6 +4268,14 @@
           },
           "404": {
             "description": "Task not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2882,6 +4306,14 @@
         "responses": {
           "200": {
             "description": "Delivery task queued for retry",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2892,6 +4324,14 @@
           },
           "400": {
             "description": "Task is not retryable",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2902,6 +4342,14 @@
           },
           "401": {
             "description": "Authentication required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2912,6 +4360,14 @@
           },
           "403": {
             "description": "Owner or admin required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2922,6 +4378,14 @@
           },
           "404": {
             "description": "Task not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2939,10 +4403,26 @@
         "operationId": "auth_logout",
         "responses": {
           "204": {
-            "description": "Current session revoked"
+            "description": "Current session revoked",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            }
           },
           "401": {
             "description": "Authentication is required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2953,6 +4433,14 @@
           },
           "403": {
             "description": "CSRF token is invalid",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2963,6 +4451,14 @@
           },
           "500": {
             "description": "Session revocation failed",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2981,6 +4477,14 @@
         "responses": {
           "200": {
             "description": "Current authenticated user",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2991,6 +4495,14 @@
           },
           "401": {
             "description": "Authentication is required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3035,6 +4547,14 @@
         "responses": {
           "400": {
             "description": "OIDC callback parameters are invalid",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3045,6 +4565,14 @@
           },
           "403": {
             "description": "OIDC identity is not an unambiguous tenant member",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3055,6 +4583,14 @@
           },
           "500": {
             "description": "OIDC session issuance failed",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3065,6 +4601,14 @@
           },
           "503": {
             "description": "OIDC provider is unavailable; retry the login",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3082,10 +4626,26 @@
         "operationId": "start_oidc_login",
         "responses": {
           "302": {
-            "description": "Redirect to Telegram OIDC authorization endpoint"
+            "description": "Redirect to Telegram OIDC authorization endpoint",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            }
           },
           "500": {
             "description": "OIDC configuration or challenge generation failed",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3095,7 +4655,15 @@
             }
           },
           "501": {
-            "description": "OIDC is not configured"
+            "description": "OIDC is not configured",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            }
           }
         }
       }
@@ -3107,6 +4675,14 @@
         "responses": {
           "201": {
             "description": "Console QR challenge created",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3117,6 +4693,14 @@
           },
           "500": {
             "description": "Challenge creation failed",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3146,6 +4730,14 @@
         "responses": {
           "200": {
             "description": "Challenge status",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3156,6 +4748,14 @@
           },
           "404": {
             "description": "Challenge not found",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3166,6 +4766,14 @@
           },
           "500": {
             "description": "Challenge lookup failed",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3184,6 +4792,14 @@
         "responses": {
           "200": {
             "description": "Own active sessions; ids are non-bearer references",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3194,6 +4810,14 @@
           },
           "401": {
             "description": "Authentication is required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3204,6 +4828,14 @@
           },
           "500": {
             "description": "Session lookup failed",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3232,10 +4864,26 @@
         ],
         "responses": {
           "204": {
-            "description": "Session revoked or unavailable"
+            "description": "Session revoked or unavailable",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            }
           },
           "400": {
             "description": "Invalid session reference",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3246,6 +4894,14 @@
           },
           "401": {
             "description": "Authentication is required",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3256,6 +4912,14 @@
           },
           "403": {
             "description": "CSRF token is invalid",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3266,6 +4930,14 @@
           },
           "500": {
             "description": "Session revocation failed",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3284,6 +4956,14 @@
         "responses": {
           "200": {
             "description": "Health status",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3294,6 +4974,14 @@
           },
           "503": {
             "description": "At least one component is unhealthy",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3312,6 +5000,14 @@
         "responses": {
           "200": {
             "description": "Process is alive",
+            "headers": {
+              "X-Tgm-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "服务端生成的请求关联标识"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
