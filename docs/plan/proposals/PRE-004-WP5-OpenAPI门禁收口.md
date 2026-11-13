@@ -1,18 +1,24 @@
 # PRE-004：WP-5 OpenAPI 门禁收口
 
+当前状态（2026-11-13）：PRE-004 的双 OpenAPI 契约检查已接入固定本地与 CI static
+门禁，并由后续发布 CI 裁决。以下“仍跳过”“仍未提交或创建 PR”等只保留为实施前的历史
+快照，不是当前待执行状态。实现证据见
+`docs/plan/evidence/PRE-001-PRE-004-门禁收口-2026-10-12.md`。admin 契约为空不等于平台
+管理能力已经完成；PRE-004 的完成也不单独宣告 WP-5 全部出口通过。
+
 ## 当前状态
 
 发布增量（2026-10-12）：前置基础、后端、控制台已分别创建 PR #3/#4/#5，base 均为
 `dev`，远端 CI 均全绿。当前 PRE-004 发布工作树已分别对双契约制造漂移并证明固定
 static 入口拒绝，产物恢复逐字节一致；完整卡口和本批 CI 分别验收，结果见
 `docs/plan/evidence/PRE-004-独立发布验收-2026-10-12.md`。
-以下“未提交”保留为授权前状态，不代表前置批次当前状态。
+以下“未提交”只保留为当时状态，不代表当前发布状态。
 
 实施增量（2026-10-12）：用户在上轮明确列出本提案与 PRE-001 后再次要求实施。
 双契约检查已接入本地和 CI static 卡口；真实产物漂移拒绝及卡口失败传播已验证。
 以下“仍跳过”是实施前状态，当前结果见
-`docs/plan/evidence/PRE-001-PRE-004-门禁收口-2026-10-12.md`。仍未提交或创建 PR，
-不能把本地门禁通过记为远端 CI、干净提交树验收或整个 WP-5 完成。
+`docs/plan/evidence/PRE-001-PRE-004-门禁收口-2026-10-12.md`。后续发布记录已裁决本项；
+本地/CI 契约卡口通过不单独代表整个 WP-5 完成。
 
 控制面已经由 `utoipa` 生成租户契约与平台管理契约，仓库内的
 `openapi.json`、`openapi-admin.json` 均已生成。当前本地执行：
@@ -23,9 +29,9 @@ SQLX_OFFLINE=true cargo run --quiet --bin tgm -- openapi --check
 
 结果为契约一致。
 
-任务代码卡口与可信数据库卡口也已通过；但 `scripts/ai-driver/ai-gates.sh`
-仍按旧基线跳过 `openapi-check`，`.github/workflows/ci.yml` 仍以注释保留该步骤。
-因此 WP-5 的“OpenAPI 契约门禁通过”目前只有手工可执行证据，还没有进入机器裁决链。
+以下实施前快照曾记录 `scripts/ai-driver/ai-gates.sh` 跳过 `openapi-check`、
+`.github/workflows/ci.yml` 以注释保留该步骤。该状态已由后续实现取代，不应再据此判断
+当前门禁。
 
 ## 需要批准的改动
 
@@ -63,7 +69,7 @@ SQLX_OFFLINE=true cargo run --quiet --bin tgm -- openapi --check
 命中仓库根 `AGENTS.md` §五 的安全/门禁升级条件，不能由执行器直接改动。
 
 上述同步已按用户后续实施要求在本地落地；原来的“批准前不修改”边界没有扩展到
-真实凭据、提交或远端发布。仍须在 CI 中完成当前提交的真实裁决。
+真实凭据、提交或远端发布。后续发布记录已完成相应 CI 裁决；本提案不代替其他工作包出口。
 
 [report]
 task: PRE-004-WP5-OpenAPI门禁收口
