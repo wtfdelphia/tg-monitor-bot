@@ -1,0 +1,13 @@
+services:
+  postgres:
+    ports: !override
+      - "127.0.0.1:55482:5432"
+  pgbouncer:
+    ports: !override
+      - "127.0.0.1:56482:5432"
+  redis:
+    ports: !override
+      - "127.0.0.1:56382:6379"
+  minio:
+    ports: !override
+      - "127.0.0.1:59082:9000"
