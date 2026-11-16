@@ -96,8 +96,10 @@ pub enum OidcClaimsError {
     AudienceMismatch,
     #[error("OIDC id_token 已过期")]
     Expired,
-    #[error("OIDC id_token 的 subject 不是正整数 Telegram 用户 id")]
+    #[error("OIDC id_token 的 subject 为空")]
     InvalidSubject,
+    #[error("OIDC id_token 缺少正整数 Telegram 用户 id")]
+    InvalidUserId,
     #[error("OIDC id_token 的 nonce 校验失败")]
     Nonce(OidcNonceError),
 }
@@ -109,8 +111,6 @@ pub enum OidcClaimsError {
 pub enum OidcSigningAlgorithm {
     Rs256,
     Es256,
-    EdDsa,
-    Es256k,
 }
 
 impl OidcSigningAlgorithm {
@@ -118,8 +118,6 @@ impl OidcSigningAlgorithm {
         match value {
             "RS256" => Ok(Self::Rs256),
             "ES256" => Ok(Self::Es256),
-            "EdDSA" => Ok(Self::EdDsa),
-            "ES256K" => Ok(Self::Es256k),
             _ => Err(OidcAlgorithmError::Unsupported),
         }
     }
@@ -128,8 +126,6 @@ impl OidcSigningAlgorithm {
         match self {
             Self::Rs256 => "RS256",
             Self::Es256 => "ES256",
-            Self::EdDsa => "EdDSA",
-            Self::Es256k => "ES256K",
         }
     }
 
@@ -270,6 +266,7 @@ pub struct OidcIdTokenClaims<'a> {
     issuer: &'a str,
     audiences: &'a [&'a str],
     subject: &'a str,
+    telegram_user_id: Option<i64>,
     nonce: &'a str,
     exp_unix: i64,
 }
@@ -279,6 +276,7 @@ impl<'a> OidcIdTokenClaims<'a> {
         issuer: &'a str,
         audiences: &'a [&'a str],
         subject: &'a str,
+        telegram_user_id: Option<i64>,
         nonce: &'a str,
         exp_unix: i64,
     ) -> Self {
@@ -286,6 +284,7 @@ impl<'a> OidcIdTokenClaims<'a> {
             issuer,
             audiences,
             subject,
+            telegram_user_id,
             nonce,
             exp_unix,
         }
@@ -308,16 +307,17 @@ pub fn validate_id_token_claims(
     if claims.exp_unix <= now_unix {
         return Err(OidcClaimsError::Expired);
     }
-    let subject = claims
-        .subject
-        .parse::<i64>()
-        .ok()
+    if claims.subject.is_empty() {
+        return Err(OidcClaimsError::InvalidSubject);
+    }
+    let telegram_user_id = claims
+        .telegram_user_id
         .filter(|value| *value > 0)
-        .ok_or(OidcClaimsError::InvalidSubject)?;
+        .ok_or(OidcClaimsError::InvalidUserId)?;
     material
         .nonce_matches(claims.nonce)
         .map_err(OidcClaimsError::Nonce)?;
-    Ok(subject)
+    Ok(telegram_user_id)
 }
 
 pub fn code_challenge(code_verifier: &str) -> Result<String, OidcVerifierError> {
@@ -659,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn id_token_claims_require_issuer_audience_expiry_subject_and_nonce() {
+    fn id_token_claims_keep_subject_opaque_and_use_telegram_user_id() {
         let material = OidcLoginMaterial {
             state: "state".to_owned(),
             code_verifier: "a".repeat(43),
@@ -670,7 +670,8 @@ mod tests {
         let claims = OidcIdTokenClaims::new(
             "https://oauth.telegram.org",
             &audiences,
-            "7001",
+            "opaque-telegram-subject",
+            Some(7001),
             "nonce",
             101,
         );
@@ -688,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn id_token_claims_reject_wrong_issuer_audience_expiry_subject_and_nonce() {
+    fn id_token_claims_reject_wrong_issuer_audience_expiry_subject_user_id_and_nonce() {
         let material = OidcLoginMaterial {
             state: "state".to_owned(),
             code_verifier: "a".repeat(43),
@@ -698,14 +699,22 @@ mod tests {
         let audiences = ["12345"];
         let cases = [
             (
-                OidcIdTokenClaims::new("https://evil.example", &audiences, "7001", "nonce", 101),
+                OidcIdTokenClaims::new(
+                    "https://evil.example",
+                    &audiences,
+                    "8002",
+                    Some(7001),
+                    "nonce",
+                    101,
+                ),
                 OidcClaimsError::IssuerMismatch,
             ),
             (
                 OidcIdTokenClaims::new(
                     "https://oauth.telegram.org",
                     &["99999"],
-                    "7001",
+                    "8002",
+                    Some(7001),
                     "nonce",
                     101,
                 ),
@@ -715,7 +724,8 @@ mod tests {
                 OidcIdTokenClaims::new(
                     "https://oauth.telegram.org",
                     &audiences,
-                    "7001",
+                    "8002",
+                    Some(7001),
                     "nonce",
                     100,
                 ),
@@ -725,7 +735,8 @@ mod tests {
                 OidcIdTokenClaims::new(
                     "https://oauth.telegram.org",
                     &audiences,
-                    "not-a-user",
+                    "",
+                    Some(7001),
                     "nonce",
                     101,
                 ),
@@ -736,6 +747,40 @@ mod tests {
                     "https://oauth.telegram.org",
                     &audiences,
                     "7001",
+                    None,
+                    "nonce",
+                    101,
+                ),
+                OidcClaimsError::InvalidUserId,
+            ),
+            (
+                OidcIdTokenClaims::new(
+                    "https://oauth.telegram.org",
+                    &audiences,
+                    "7001",
+                    Some(0),
+                    "nonce",
+                    101,
+                ),
+                OidcClaimsError::InvalidUserId,
+            ),
+            (
+                OidcIdTokenClaims::new(
+                    "https://oauth.telegram.org",
+                    &audiences,
+                    "7001",
+                    Some(-1),
+                    "nonce",
+                    101,
+                ),
+                OidcClaimsError::InvalidUserId,
+            ),
+            (
+                OidcIdTokenClaims::new(
+                    "https://oauth.telegram.org",
+                    &audiences,
+                    "8002",
+                    Some(7001),
                     "replayed",
                     101,
                 ),
