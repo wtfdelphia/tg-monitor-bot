@@ -17,9 +17,10 @@ set -a
 . "$ENV_FILE"
 set +a
 export TGM_LIVE_E2E_ALLOW=1
-export DATABASE_URL="${DATABASE_URL:-postgres://tgm_test:tpw@127.0.0.1:55432/tgm_test_control}"
+export TGM_TEST_PG_PORT="${TGM_LIVE_PG_PORT:-${TGM_TEST_PG_PORT:-55432}}"
+export DATABASE_URL="${DATABASE_URL:-postgres://tgm_test:tpw@127.0.0.1:${TGM_TEST_PG_PORT}/tgm_test_control}"
 export SQLX_OFFLINE=true
-export TGM_S3_ENDPOINT="${TGM_S3_ENDPOINT:-http://127.0.0.1:59000}"
+export TGM_S3_ENDPOINT="${TGM_S3_ENDPOINT:-http://127.0.0.1:${TGM_LIVE_MINIO_PORT:-59000}}"
 export TGM_S3_BUCKET="${TGM_S3_BUCKET:-tgm-g34-live}"
 export TGM_S3_ACCESS_KEY_ID="${TGM_S3_ACCESS_KEY_ID:-minioadmin}"
 export TGM_S3_SECRET_ACCESS_KEY="${TGM_S3_SECRET_ACCESS_KEY:-minioadmin}"
@@ -32,7 +33,7 @@ export TGM_LIVE_2FA_PASSWORD_FILE="$TGM_LIVE_QR_DIR/2fa.txt"
 export TGM_LIVE_USER_SESSION_FILE="$TGM_LIVE_QR_DIR/user.session"
 
 cleanup() {
-  python3 - "$TGM_LIVE_QR_HTML_FILE" "$TGM_LIVE_QR_LINK_FILE" "$TGM_LIVE_USER_SESSION_FILE" <<'PY'
+  python3 - "$TGM_LIVE_QR_HTML_FILE" "$TGM_LIVE_QR_LINK_FILE" "$TGM_LIVE_2FA_PASSWORD_FILE" "$TGM_LIVE_USER_SESSION_FILE" <<'PY'
 from pathlib import Path
 import sys
 for name in sys.argv[1:]:

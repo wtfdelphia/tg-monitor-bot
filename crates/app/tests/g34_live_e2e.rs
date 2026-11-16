@@ -62,10 +62,24 @@ fn api_id() -> i32 {
         .expect("TGM_PLATFORM_API_ID 必须是整数")
 }
 
-fn chat_id() -> i64 {
+fn source_chat_id() -> i64 {
+    required("TGM_LIVE_SOURCE_CHAT")
+        .parse()
+        .expect("TGM_LIVE_SOURCE_CHAT 必须是整数")
+}
+
+fn target_chat_id() -> i64 {
     required("TGM_LIVE_TARGET_CHAT")
         .parse()
         .expect("TGM_LIVE_TARGET_CHAT 必须是整数")
+}
+
+fn validate_chat_boundary() {
+    assert_ne!(
+        source_chat_id(),
+        target_chat_id(),
+        "G3 验收必须使用独立的源频道和目标频道"
+    );
 }
 
 fn nonce() -> String {
@@ -140,6 +154,7 @@ async fn call(
 #[ignore = "真机：需要专用测试用户扫码，可能要求 2FA"]
 async fn live_g34_source_rule_delivery(admin: PgPool) {
     allow_live();
+    validate_chat_boundary();
     let _ = tracing_subscriber::fmt()
         .with_env_filter("tgm_app::control=debug,tgm_tg::qr_login=debug")
         .with_test_writer()
@@ -333,30 +348,29 @@ async fn live_g34_source_rule_delivery(admin: PgPool) {
 struct BotApi {
     http: reqwest::Client,
     base: String,
-    chat: i64,
 }
 
 struct MessageCleanup {
     bot: BotApi,
-    ids: Vec<i64>,
+    messages: Vec<(i64, i64)>,
 }
 
 impl MessageCleanup {
     fn new() -> Self {
         Self {
             bot: BotApi::new(),
-            ids: Vec::new(),
+            messages: Vec::new(),
         }
     }
 
-    fn track(&mut self, id: i64) {
-        self.ids.push(id);
+    fn track(&mut self, chat: i64, id: i64) {
+        self.messages.push((chat, id));
     }
 
     async fn cleanup(mut self) -> Vec<bool> {
-        let mut results = Vec::with_capacity(self.ids.len());
-        for id in self.ids.drain(..) {
-            results.push(self.bot.delete(id).await);
+        let mut results = Vec::with_capacity(self.messages.len());
+        for (chat, id) in self.messages.drain(..) {
+            results.push(self.bot.delete(chat, id).await);
         }
         results
     }
@@ -364,14 +378,14 @@ impl MessageCleanup {
 
 impl Drop for MessageCleanup {
     fn drop(&mut self) {
-        if self.ids.is_empty() {
+        if self.messages.is_empty() {
             return;
         }
-        let ids = std::mem::take(&mut self.ids);
+        let messages = std::mem::take(&mut self.messages);
         let bot = BotApi::new();
         tokio::spawn(async move {
-            for id in ids {
-                let _ = bot.delete(id).await;
+            for (chat, id) in messages {
+                let _ = bot.delete(chat, id).await;
             }
         });
     }
@@ -385,7 +399,6 @@ impl BotApi {
                 "https://api.telegram.org/bot{}",
                 required("TGM_LIVE_BOT_TOKEN")
             ),
-            chat: chat_id(),
         }
     }
 
@@ -414,18 +427,18 @@ impl BotApi {
         }
     }
 
-    async fn send_source(&self, text: &str) -> i64 {
-        self.call("sendMessage", json!({"chat_id": self.chat, "text": text}))
+    async fn send_source(&self, chat: i64, text: &str) -> i64 {
+        self.call("sendMessage", json!({"chat_id": chat, "text": text}))
             .await
             .expect("发送测试源消息失败")["message_id"]
             .as_i64()
             .expect("源消息缺 message_id")
     }
 
-    async fn delete(&self, message_id: i64) -> bool {
+    async fn delete(&self, chat: i64, message_id: i64) -> bool {
         self.call(
             "deleteMessage",
-            json!({"chat_id": self.chat, "message_id": message_id}),
+            json!({"chat_id": chat, "message_id": message_id}),
         )
         .await
         .is_ok()
@@ -471,7 +484,7 @@ async fn setup(
          VALUES ($1, $2, 'G34 isolated source', $3, TRUE) RETURNING id",
     )
     .bind(tenant)
-    .bind(chat_id())
+    .bind(source_chat_id())
     .bind(receiver)
     .fetch_one(raw)
     .await
@@ -481,7 +494,7 @@ async fn setup(
          VALUES ($1, $2, $3, TRUE) RETURNING id",
     )
     .bind(tenant)
-    .bind(chat_id())
+    .bind(target_chat_id())
     .bind(sender)
     .fetch_one(raw)
     .await
@@ -656,10 +669,16 @@ async fn run_delivery(
         assert!(!mtproto.is_finished(), "采集 worker 启动后提前退出");
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    let source_hit = bot.send_source(&format!("{keyword} synthetic")).await;
-    let source_miss = bot.send_source(&format!("{unmatched} synthetic")).await;
-    messages.lock().await.track(source_hit);
-    messages.lock().await.track(source_miss);
+    let source_chat = source_chat_id();
+    let target_chat = target_chat_id();
+    let source_hit = bot
+        .send_source(source_chat, &format!("{keyword} synthetic"))
+        .await;
+    let source_miss = bot
+        .send_source(source_chat, &format!("{unmatched} synthetic"))
+        .await;
+    messages.lock().await.track(source_chat, source_hit);
+    messages.lock().await.track(source_chat, source_miss);
     println!("[G34-E2E] source_messages_sent=2 worker_started=true");
     let (fanout_stop, fanout_shutdown) = watch::channel(false);
     let fanout =
@@ -722,9 +741,9 @@ async fn run_delivery(
     .0;
     let target_reader = observer.media_reader();
     let target_message_id = task.2.expect("DONE 任务必须有 message id");
-    messages.lock().await.track(target_message_id);
+    messages.lock().await.track(target_chat, target_message_id);
     let target_message = target_reader
-        .read_messages(chat_id(), &[target_message_id])
+        .read_messages(target_chat, &[target_message_id])
         .await
         .expect("读取目标消息失败");
     assert_eq!(target_message.len(), 1);
