@@ -12,7 +12,7 @@ use axum::{
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use josekit::jwk::JwkSet;
-use josekit::jws::{ES256, ES256K, EdDSA, RS256};
+use josekit::jws::{ES256, RS256};
 use josekit::jwt::{self, JwtPayload};
 use regex::Regex;
 use reqwest::redirect::Policy;
@@ -26,8 +26,8 @@ use tgm_core::auth::{AuthContext, AuthSource, TenantRole};
 use tgm_core::error::AppError;
 use tgm_core::kek::Kek;
 use tgm_core::oidc::{
-    OidcIdTokenClaims, OidcLoginMaterial, OidcLoginStateStore, OidcSigningAlgorithm,
-    OidcTokenHeader, validate_id_token_claims,
+    OidcClaimsError, OidcIdTokenClaims, OidcLoginMaterial, OidcLoginStateStore,
+    OidcSigningAlgorithm, OidcTokenHeader, validate_id_token_claims,
 };
 use tgm_core::secret::Secret;
 use tokio::net::TcpListener;
@@ -968,12 +968,16 @@ async fn oidc_callback(
     headers: HeaderMap,
     Query(query): Query<OidcCallbackQuery>,
 ) -> Result<Response, ApiError> {
-    let browser_state = cookie_value(&headers, OIDC_STATE_COOKIE).ok_or(AppError::CsrfInvalid)?;
-    let returned_state = query.state.as_deref().ok_or(AppError::CsrfInvalid)?;
+    let browser_state = cookie_value(&headers, OIDC_STATE_COOKIE)
+        .ok_or_else(|| oidc_csrf_rejected("missing_state_cookie"))?;
+    let returned_state = query
+        .state
+        .as_deref()
+        .ok_or_else(|| oidc_csrf_rejected("missing_returned_state"))?;
     let material = state
         .oidc_states
         .take_if_bound(returned_state, &browser_state)
-        .ok_or(AppError::CsrfInvalid)?;
+        .ok_or_else(|| oidc_csrf_rejected("state_binding_mismatch_or_expired"))?;
 
     let clear_cookie = || OIDC_STATE_CLEAR_COOKIE;
     if query.error.is_some() {
@@ -1013,8 +1017,8 @@ async fn oidc_callback(
         Ok(id_token) => id_token,
         Err(error) => return oidc_error_response(error),
     };
-    if OidcTokenHeader::parse_and_validate(&id_token, config.signing_algorithm).is_err() {
-        return oidc_error_response(oidc_authentication_failed());
+    if let Err(error) = OidcTokenHeader::parse_and_validate(&id_token, config.signing_algorithm) {
+        return oidc_error_response(oidc_header_rejected(error));
     }
     let jwks = match fetch_oidc_jwks(config).await {
         Ok(jwks) => jwks,
@@ -1101,11 +1105,40 @@ fn oidc_http_client() -> Result<reqwest::Client, AppError> {
         .map_err(AppError::internal)
 }
 
-fn oidc_authentication_failed() -> AppError {
+fn oidc_authentication_failed(stage: &'static str, reason: &'static str) -> AppError {
+    let request_id = REQUEST_ID.try_with(Clone::clone).ok();
+    tracing::warn!(stage, reason, ?request_id, "OIDC authentication rejected");
     AppError::ConditionInvalid("OIDC authentication failed".to_owned())
 }
 
-fn oidc_provider_unavailable() -> AppError {
+fn oidc_csrf_rejected(reason: &'static str) -> AppError {
+    let request_id = REQUEST_ID.try_with(Clone::clone).ok();
+    tracing::warn!(
+        stage = "csrf",
+        reason,
+        ?request_id,
+        "OIDC callback rejected"
+    );
+    AppError::CsrfInvalid
+}
+
+fn oidc_header_rejected(error: tgm_core::oidc::OidcTokenHeaderError) -> AppError {
+    use tgm_core::oidc::OidcTokenHeaderError;
+
+    let reason = match error {
+        OidcTokenHeaderError::InvalidStructure => "invalid_structure",
+        OidcTokenHeaderError::InvalidEncoding => "invalid_encoding",
+        OidcTokenHeaderError::InvalidJson => "invalid_json",
+        OidcTokenHeaderError::MissingAlgorithm => "missing_algorithm",
+        OidcTokenHeaderError::MissingKeyId => "missing_key_id",
+        OidcTokenHeaderError::Algorithm(_) => "algorithm_mismatch",
+    };
+    oidc_authentication_failed("token_header", reason)
+}
+
+fn oidc_provider_unavailable(stage: &'static str, reason: &'static str) -> AppError {
+    let request_id = REQUEST_ID.try_with(Clone::clone).ok();
+    tracing::warn!(stage, reason, ?request_id, "OIDC provider request failed");
     AppError::OidcProviderUnavailable
 }
 
@@ -1128,33 +1161,57 @@ async fn exchange_oidc_code(
         ("grant_type", "authorization_code"),
         ("code", code),
         ("client_id", config.bot_id.as_str()),
-        ("client_secret", config.client_secret.expose().as_str()),
         ("redirect_uri", config.redirect_url.as_str()),
         ("code_verifier", material.code_verifier()),
     ];
     let response = client
         .post(&config.token_endpoint)
+        .basic_auth(&config.bot_id, Some(config.client_secret.expose().as_str()))
         .form(&form)
         .send()
         .await
-        .map_err(|_| oidc_provider_unavailable())?;
+        .map_err(|_| oidc_provider_unavailable("token", "transport"))?;
     if response.status().is_server_error()
         || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
     {
-        return Err(oidc_provider_unavailable());
+        return Err(oidc_provider_unavailable("token", "overloaded"));
     }
     if !response.status().is_success() {
-        return Err(oidc_authentication_failed());
+        let status = response.status().as_u16();
+        let body = read_response_body(response, OIDC_MAX_TOKEN_BYTES)
+            .await
+            .map_err(|_| oidc_provider_unavailable("token", "body_read_or_size"))?;
+        let error = serde_json::from_slice::<serde_json::Value>(&body).ok();
+        let reason = match error
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("invalid_client") => "invalid_client",
+            Some("invalid_grant") => "invalid_grant",
+            Some("invalid_request") => "invalid_request",
+            Some("unauthorized_client") => "unauthorized_client",
+            Some("unsupported_grant_type") => "unsupported_grant_type",
+            Some("invalid_scope") => "invalid_scope",
+            _ => "provider_rejected",
+        };
+        tracing::warn!(
+            stage = "token",
+            status,
+            reason,
+            "OIDC token endpoint rejected request"
+        );
+        return Err(oidc_authentication_failed("token", reason));
     }
     let body = read_response_body(response, OIDC_MAX_TOKEN_BYTES)
         .await
-        .map_err(|_| oidc_provider_unavailable())?;
+        .map_err(|_| oidc_provider_unavailable("token", "body_read_or_size"))?;
     let token = serde_json::from_slice::<OidcTokenResponse>(&body)
-        .map_err(|_| oidc_authentication_failed())?;
+        .map_err(|_| oidc_authentication_failed("token", "invalid_response_json"))?;
     token
         .id_token
         .filter(|value| !value.is_empty())
-        .ok_or_else(oidc_authentication_failed)
+        .ok_or_else(|| oidc_authentication_failed("token", "missing_id_token"))
 }
 
 async fn fetch_oidc_jwks(config: &OidcConfig) -> Result<JwkSet, AppError> {
@@ -1163,18 +1220,18 @@ async fn fetch_oidc_jwks(config: &OidcConfig) -> Result<JwkSet, AppError> {
         .get(&config.jwks_endpoint)
         .send()
         .await
-        .map_err(|_| oidc_provider_unavailable())?;
+        .map_err(|_| oidc_provider_unavailable("jwks", "transport"))?;
     if !response.status().is_success()
         || response
             .content_length()
             .is_some_and(|length| length > OIDC_MAX_JWKS_BYTES)
     {
-        return Err(oidc_provider_unavailable());
+        return Err(oidc_provider_unavailable("jwks", "status_or_size"));
     }
     let body = read_response_body(response, OIDC_MAX_JWKS_BYTES)
         .await
-        .map_err(|_| oidc_provider_unavailable())?;
-    JwkSet::from_bytes(body).map_err(|_| oidc_provider_unavailable())
+        .map_err(|_| oidc_provider_unavailable("jwks", "body_read_or_size"))?;
+    JwkSet::from_bytes(body).map_err(|_| oidc_provider_unavailable("jwks", "invalid_key_set"))
 }
 
 async fn read_response_body(
@@ -1205,7 +1262,10 @@ fn validate_jwk_metadata(
             .algorithm()
             .is_some_and(|value| value != algorithm.as_str())
     {
-        return Err(oidc_authentication_failed());
+        return Err(oidc_authentication_failed(
+            "verification",
+            "invalid_key_metadata",
+        ));
     }
     Ok(())
 }
@@ -1216,39 +1276,27 @@ fn decode_oidc_id_token(
     jwks: &JwkSet,
 ) -> Result<JwtPayload, AppError> {
     let token_header = OidcTokenHeader::parse_and_validate(id_token, config.signing_algorithm)
-        .map_err(|_| oidc_authentication_failed())?;
+        .map_err(oidc_header_rejected)?;
     let keys = jwks.get(token_header.key_id());
     let Some(jwk) = (keys.len() == 1).then(|| keys[0]) else {
-        return Err(oidc_provider_unavailable());
+        return Err(oidc_provider_unavailable("verification", "key_not_unique"));
     };
     validate_jwk_metadata(jwk, config.signing_algorithm)?;
     let payload = match config.signing_algorithm {
         OidcSigningAlgorithm::Rs256 => {
             let verifier = RS256
                 .verifier_from_jwk(jwk)
-                .map_err(|_| oidc_authentication_failed())?;
+                .map_err(|_| oidc_authentication_failed("verification", "invalid_key"))?;
             jwt::decode_with_verifier(id_token, &verifier)
         }
         OidcSigningAlgorithm::Es256 => {
             let verifier = ES256
                 .verifier_from_jwk(jwk)
-                .map_err(|_| oidc_authentication_failed())?;
-            jwt::decode_with_verifier(id_token, &verifier)
-        }
-        OidcSigningAlgorithm::EdDsa => {
-            let verifier = EdDSA
-                .verifier_from_jwk(jwk)
-                .map_err(|_| oidc_authentication_failed())?;
-            jwt::decode_with_verifier(id_token, &verifier)
-        }
-        OidcSigningAlgorithm::Es256k => {
-            let verifier = ES256K
-                .verifier_from_jwk(jwk)
-                .map_err(|_| oidc_authentication_failed())?;
+                .map_err(|_| oidc_authentication_failed("verification", "invalid_key"))?;
             jwt::decode_with_verifier(id_token, &verifier)
         }
     }
-    .map_err(|_| oidc_authentication_failed())?;
+    .map_err(|_| oidc_authentication_failed("verification", "invalid_signature_or_payload"))?;
     Ok(payload.0)
 }
 
@@ -1259,8 +1307,12 @@ fn validate_oidc_id_token(
     jwks: &JwkSet,
 ) -> Result<i64, AppError> {
     let payload = decode_oidc_id_token(id_token, config, jwks)?;
-    let issuer = payload.issuer().ok_or_else(oidc_authentication_failed)?;
-    let audiences = payload.audience().ok_or_else(oidc_authentication_failed)?;
+    let issuer = payload
+        .issuer()
+        .ok_or_else(|| oidc_authentication_failed("claims", "missing_issuer"))?;
+    let audiences = payload
+        .audience()
+        .ok_or_else(|| oidc_authentication_failed("claims", "invalid_audience"))?;
     if payload
         .claim("azp")
         .is_some_and(|value| value.as_str() != Some(config.bot_id.as_str()))
@@ -1268,18 +1320,35 @@ fn validate_oidc_id_token(
             && payload.claim("azp").and_then(serde_json::Value::as_str)
                 != Some(config.bot_id.as_str()))
     {
-        return Err(oidc_authentication_failed());
+        return Err(oidc_authentication_failed(
+            "claims",
+            "invalid_authorized_party",
+        ));
     }
-    let subject = payload.subject().ok_or_else(oidc_authentication_failed)?;
+    let subject = payload
+        .subject()
+        .ok_or_else(|| oidc_authentication_failed("claims", "missing_subject"))?;
+    let telegram_user_id = payload.claim("id").and_then(|value| match value {
+        serde_json::Value::Number(value) => value.as_i64(),
+        serde_json::Value::String(value)
+            if !value.is_empty()
+                && value.len() <= 19
+                && !value.starts_with('0')
+                && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            value.parse::<i64>().ok()
+        }
+        _ => None,
+    });
     let nonce = payload
         .claim("nonce")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(oidc_authentication_failed)?;
+        .ok_or_else(|| oidc_authentication_failed("claims", "missing_nonce"))?;
     let exp = payload
         .claim("exp")
         .and_then(serde_json::Value::as_i64)
-        .ok_or_else(oidc_authentication_failed)?;
-    let claims = OidcIdTokenClaims::new(issuer, &audiences, subject, nonce, exp);
+        .ok_or_else(|| oidc_authentication_failed("claims", "invalid_expiry"))?;
+    let claims = OidcIdTokenClaims::new(issuer, &audiences, subject, telegram_user_id, nonce, exp);
     validate_id_token_claims(
         &claims,
         &config.issuer,
@@ -1287,7 +1356,31 @@ fn validate_oidc_id_token(
         Utc::now().timestamp(),
         material,
     )
-    .map_err(|_| oidc_authentication_failed())
+    .map_err(|error| {
+        let reason = match error {
+            OidcClaimsError::IssuerMismatch => "issuer_mismatch",
+            OidcClaimsError::AudienceMismatch => "audience_mismatch",
+            OidcClaimsError::Expired => "expired",
+            OidcClaimsError::InvalidSubject => "invalid_subject",
+            OidcClaimsError::InvalidUserId => match payload.claim("id") {
+                None => "telegram_id_missing",
+                Some(serde_json::Value::Null) => "telegram_id_null",
+                Some(serde_json::Value::String(_)) => "telegram_id_invalid_string",
+                Some(serde_json::Value::Number(value)) if value.as_i64().is_some() => {
+                    "telegram_id_nonpositive"
+                }
+                Some(serde_json::Value::Number(value)) if value.as_u64().is_some() => {
+                    "telegram_id_overflow"
+                }
+                Some(serde_json::Value::Number(_)) => "telegram_id_not_integer",
+                Some(serde_json::Value::Bool(_)) => "telegram_id_boolean",
+                Some(serde_json::Value::Array(_)) => "telegram_id_array",
+                Some(serde_json::Value::Object(_)) => "telegram_id_object",
+            },
+            OidcClaimsError::Nonce(_) => "nonce_mismatch",
+        };
+        oidc_authentication_failed("claims", reason)
+    })
 }
 
 async fn no_store_sensitive_auth(request: Request<Body>, next: Next) -> Response {
@@ -5455,6 +5548,8 @@ mod tests {
     use axum::routing::get;
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
     use josekit::jwk::alg::rsa::RsaKeyPair;
     use josekit::jwk::{JwkSet, KeyPair};
     use josekit::jws::{JwsHeader, RS256};
@@ -5659,7 +5754,10 @@ mod tests {
         }
     }
 
-    fn signed_test_id_token(material: &OidcLoginMaterial) -> (String, JwkSet) {
+    fn signed_test_id_token(
+        material: &OidcLoginMaterial,
+        update: impl FnOnce(&mut JwtPayload),
+    ) -> (String, JwkSet) {
         let mut key_pair = RsaKeyPair::generate(2048).expect("生成测试 RSA 密钥失败");
         key_pair.set_algorithm(Some("RS256"));
         key_pair.set_key_id(Some("test-kid"));
@@ -5672,7 +5770,10 @@ mod tests {
 
         let mut payload = JwtPayload::new();
         payload.set_issuer(OIDC_ISSUER);
-        payload.set_subject("7001");
+        payload.set_subject("8002");
+        payload
+            .set_claim("id", Some(json!(7001)))
+            .expect("写入测试 Telegram id 失败");
         payload.set_audience(vec!["12345"]);
         payload.set_expires_at(
             &(SystemTime::UNIX_EPOCH
@@ -5687,6 +5788,7 @@ mod tests {
         payload
             .set_claim("nonce", Some(json!(material.nonce())))
             .expect("写入测试 nonce 失败");
+        update(&mut payload);
 
         let mut header = JwsHeader::new();
         header.set_algorithm("RS256");
@@ -5702,7 +5804,7 @@ mod tests {
         (token, jwks)
     }
 
-    async fn read_http_request_body(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
         let mut buffer = Vec::new();
         let mut chunk = [0_u8; 1024];
         loop {
@@ -5724,10 +5826,13 @@ mod tests {
                         .or_else(|| line.strip_prefix("content-length:"))
                 })
                 .and_then(|value| value.trim().parse::<usize>().ok())
-                .expect("测试请求缺少 Content-Length");
+                .unwrap_or(0);
             let body_start = header_end + 4;
             if buffer.len() >= body_start + content_length {
-                return buffer[body_start..body_start + content_length].to_vec();
+                return (
+                    header_text.into_owned(),
+                    buffer[body_start..body_start + content_length].to_vec(),
+                );
             }
         }
     }
@@ -5932,19 +6037,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oidc_token_exchange_sends_client_secret_and_pkce_fields() {
+    async fn oidc_token_exchange_sends_basic_auth_and_pkce_fields() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("启动 OIDC token 测试服务失败");
         let address = listener.local_addr().expect("读取 token 测试地址失败");
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("接受 token 测试请求失败");
-            let body = read_http_request_body(&mut socket).await;
+            let (headers, body) = read_http_request(&mut socket).await;
+            let authorization = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("authorization")
+                        .then_some(value.trim())
+                })
+                .expect("OIDC 换码缺少客户端认证头");
+            let expected =
+                base64::engine::general_purpose::STANDARD.encode("12345:test-client-secret");
+            assert_eq!(authorization, format!("Basic {expected}"));
             let body = String::from_utf8(body).expect("解析 token 测试请求体失败");
             assert!(body.contains("grant_type=authorization_code"));
             assert!(body.contains("code=auth-code"));
             assert!(body.contains("client_id=12345"));
-            assert!(body.contains("client_secret=test-client-secret"));
+            assert!(!body.contains("client_secret"));
+            assert!(!body.contains("test-client-secret"));
             assert!(
                 body.contains(
                     "redirect_uri=https%3A%2F%2Fconsole.example%2Fauth%2Foidc%2Fcallback"
@@ -5975,6 +6092,181 @@ mod tests {
         server.await.expect("token 测试服务任务失败");
     }
 
+    async fn gzip_oidc_provider(body: &[u8]) -> (String, tokio::task::JoinHandle<()>) {
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).expect("压缩 OIDC 测试响应失败");
+        let compressed = encoder.finish().expect("完成 OIDC 测试响应压缩失败");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("启动 OIDC gzip 测试服务失败");
+        let address = listener.local_addr().expect("读取 OIDC gzip 测试地址失败");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("接受 OIDC gzip 测试请求失败");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket
+                    .read(&mut chunk)
+                    .await
+                    .expect("读取 OIDC gzip 测试请求失败");
+                assert!(read > 0, "OIDC gzip 测试请求提前结束");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                compressed.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("写入 OIDC gzip 响应头失败");
+            socket
+                .write_all(&compressed)
+                .await
+                .expect("写入 OIDC gzip 响应失败");
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn oidc_token_exchange_accepts_gzip_and_rejects_oversized_decompressed_body() {
+        for oversized in [false, true] {
+            let expected = if oversized {
+                "x".repeat(super::OIDC_MAX_TOKEN_BYTES as usize)
+            } else {
+                "signed-token".to_owned()
+            };
+            let body = serde_json::to_vec(&json!({ "id_token": expected }))
+                .expect("构造 OIDC gzip token 响应失败");
+            let (base_url, server) = gzip_oidc_provider(&body).await;
+            let config = oidc_test_config(
+                format!("{base_url}/token"),
+                "http://127.0.0.1:9/jwks".to_owned(),
+            );
+            let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+            let result = exchange_oidc_code(&config, "auth-code", &material).await;
+            if oversized {
+                assert_eq!(
+                    result.expect_err("解压后超大的 token 必须拒绝").code(),
+                    "OIDC_PROVIDER_UNAVAILABLE"
+                );
+            } else {
+                assert_eq!(result.expect("解压 OIDC token 失败"), expected);
+            }
+            server.await.expect("OIDC gzip token 测试服务失败");
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_jwks_accepts_gzip_and_rejects_oversized_decompressed_body() {
+        let body = br#"{"keys":[{"kty":"RSA","kid":"gzip-key","n":"AQAB","e":"AQAB"}]}"#;
+        for oversized in [false, true] {
+            let mut body = body.to_vec();
+            if oversized {
+                body.resize(super::OIDC_MAX_JWKS_BYTES as usize + 1, b' ');
+            }
+            let (base_url, server) = gzip_oidc_provider(&body).await;
+            let config = oidc_test_config(
+                "http://127.0.0.1:9/token".to_owned(),
+                format!("{base_url}/jwks"),
+            );
+            let result = fetch_oidc_jwks(&config).await;
+            if oversized {
+                assert_eq!(
+                    result.expect_err("解压后超大的 JWKS 必须拒绝").code(),
+                    "OIDC_PROVIDER_UNAVAILABLE"
+                );
+            } else {
+                assert_eq!(result.expect("解压 JWKS 失败").get("gzip-key").len(), 1);
+            }
+            server.await.expect("OIDC gzip JWKS 测试服务失败");
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_provider_failure_logs_exclude_credentials_urls_and_response_bodies() {
+        use tracing::instrument::WithSubscriber;
+
+        const SENTINEL: &str = "oidc-private-payload-must-not-be-logged";
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("启动 OIDC 脱敏测试服务失败");
+        let address = listener.local_addr().expect("读取 OIDC 脱敏测试地址失败");
+        let server = tokio::spawn(async move {
+            let rejected_client =
+                format!(r#"{{"error":"invalid_client","error_description":"{SENTINEL}"}}"#);
+            let unknown_error = format!(r#"{{"error":"{SENTINEL}"}}"#);
+            for (status, body) in [
+                ("400 Bad Request", rejected_client.as_str()),
+                ("503 Service Unavailable", SENTINEL),
+                ("400 Bad Request", unknown_error.as_str()),
+            ] {
+                let (mut socket, _) = listener.accept().await.expect("接受 OIDC 脱敏测试请求失败");
+                let _ = read_http_request(&mut socket).await;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("写入 OIDC 脱敏测试响应失败");
+            }
+        });
+        let config = oidc_test_config(
+            format!("http://{address}/token?secret={SENTINEL}"),
+            format!("http://{address}/jwks?secret={SENTINEL}"),
+        );
+        let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(SharedWriter(Arc::clone(&output)))
+                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            ),
+        );
+        super::REQUEST_ID
+            .scope("oidc-safe-request-id".to_owned(), async {
+                assert!(
+                    exchange_oidc_code(&config, SENTINEL, &material)
+                        .await
+                        .is_err()
+                );
+                assert!(fetch_oidc_jwks(&config).await.is_err());
+                assert!(
+                    exchange_oidc_code(&config, SENTINEL, &material)
+                        .await
+                        .is_err()
+                );
+            })
+            .with_subscriber(dispatch)
+            .await;
+        server.await.expect("OIDC 脱敏测试服务失败");
+        let logs = String::from_utf8(output.lock().expect("读取 OIDC 测试日志失败").clone())
+            .expect("OIDC 测试日志不是 UTF-8");
+        assert!(logs.contains("oidc-safe-request-id"));
+        assert!(logs.contains("\"stage\":\"token\""));
+        assert!(logs.contains("\"stage\":\"jwks\""));
+        assert!(logs.contains("\"reason\":\"invalid_client\""));
+        assert!(logs.contains("\"reason\":\"provider_rejected\""));
+        for value in [
+            SENTINEL,
+            "test-client-secret",
+            material.code_verifier(),
+            material.nonce(),
+            &address.to_string(),
+        ] {
+            assert!(!logs.contains(value), "OIDC 日志泄漏敏感输入");
+        }
+    }
+
     #[tokio::test]
     async fn oidc_token_exchange_maps_provider_overload_to_503() {
         for status in ["429 Too Many Requests", "503 Service Unavailable"] {
@@ -5990,7 +6282,7 @@ mod tests {
                     .accept()
                     .await
                     .expect("接受 OIDC provider 错误测试请求失败");
-                let _ = read_http_request_body(&mut socket).await;
+                let _ = read_http_request(&mut socket).await;
                 let response =
                     format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 socket
@@ -6026,7 +6318,7 @@ mod tests {
                 .accept()
                 .await
                 .expect("接受 OIDC token 拒绝测试请求失败");
-            let _ = read_http_request_body(&mut socket).await;
+            let _ = read_http_request(&mut socket).await;
             let response =
                 "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             socket
@@ -6127,7 +6419,7 @@ mod tests {
     #[test]
     fn oidc_rs256_jwks_verification_rejects_tampered_algorithm() {
         let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
-        let (token, jwks) = signed_test_id_token(&material);
+        let (token, jwks) = signed_test_id_token(&material, |_| {});
         let config = oidc_test_config(
             "http://127.0.0.1:9/token".to_owned(),
             "http://127.0.0.1:9/jwks".to_owned(),
@@ -6143,7 +6435,8 @@ mod tests {
         let (payload, header) =
             jwt::decode_with_verifier(&token, &verifier).expect("josekit 直接验签失败");
         assert_eq!(header.algorithm(), Some("RS256"));
-        assert_eq!(payload.subject(), Some("7001"));
+        assert_eq!(payload.subject(), Some("8002"));
+        assert_eq!(payload.claim("id"), Some(&json!(7001)));
         assert_eq!(
             validate_oidc_id_token(&token, &config, &material, &jwks)
                 .expect("RS256 测试 token 验签失败"),
@@ -6161,6 +6454,156 @@ mod tests {
         let tampered_header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","kid":"test-kid"}"#);
         let tampered = format!("{tampered_header}.{payload}.{signature}");
         assert!(validate_oidc_id_token(&tampered, &config, &material, &jwks).is_err());
+    }
+
+    #[test]
+    fn oidc_verified_token_accepts_integer_and_canonical_decimal_string_ids() {
+        let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+        let config = oidc_test_config(
+            "http://127.0.0.1:9/token".to_owned(),
+            "http://127.0.0.1:9/jwks".to_owned(),
+        );
+        for (user_id, expected) in [
+            (json!(1), 1),
+            (json!(7001), 7001),
+            (json!(i64::MAX), i64::MAX),
+            (json!("1"), 1),
+            (json!("7001"), 7001),
+            (json!(i64::MAX.to_string()), i64::MAX),
+        ] {
+            let (token, jwks) = signed_test_id_token(&material, |payload| {
+                payload
+                    .set_claim("id", Some(user_id))
+                    .expect("设置整数或字符串 id 失败");
+            });
+            assert_eq!(
+                validate_oidc_id_token(&token, &config, &material, &jwks)
+                    .expect("已验签的规范正整数 id 应通过"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_verified_token_rejects_invalid_ids_without_subject_fallback_or_log_disclosure() {
+        let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+        let config = oidc_test_config(
+            "http://127.0.0.1:9/token".to_owned(),
+            "http://127.0.0.1:9/jwks".to_owned(),
+        );
+        for (user_id, expected_reason) in [
+            (None, "telegram_id_missing"),
+            (Some(json!(null)), "telegram_id_null"),
+            (Some(json!("")), "telegram_id_invalid_string"),
+            (Some(json!("0")), "telegram_id_invalid_string"),
+            (Some(json!("00")), "telegram_id_invalid_string"),
+            (Some(json!("07001")), "telegram_id_invalid_string"),
+            (Some(json!("+7001")), "telegram_id_invalid_string"),
+            (Some(json!("-7001")), "telegram_id_invalid_string"),
+            (Some(json!(" 7001")), "telegram_id_invalid_string"),
+            (Some(json!("7001 ")), "telegram_id_invalid_string"),
+            (Some(json!("7001\n")), "telegram_id_invalid_string"),
+            (Some(json!("7e3")), "telegram_id_invalid_string"),
+            (Some(json!("7001.0")), "telegram_id_invalid_string"),
+            (Some(json!("７００１")), "telegram_id_invalid_string"),
+            (Some(json!("٧٠٠١")), "telegram_id_invalid_string"),
+            (
+                Some(json!("9223372036854775808")),
+                "telegram_id_invalid_string",
+            ),
+            (
+                Some(json!("18446744073709551615")),
+                "telegram_id_invalid_string",
+            ),
+            (
+                Some(json!("7001must-not-be-logged")),
+                "telegram_id_invalid_string",
+            ),
+            (Some(json!(0)), "telegram_id_nonpositive"),
+            (Some(json!(-1)), "telegram_id_nonpositive"),
+            (Some(json!(1.5)), "telegram_id_not_integer"),
+            (Some(json!(true)), "telegram_id_boolean"),
+            (Some(json!(9223372036854775808_u64)), "telegram_id_overflow"),
+            (Some(json!([])), "telegram_id_array"),
+            (Some(json!({})), "telegram_id_object"),
+            (
+                Some(json!({"private": "must-not-be-logged"})),
+                "telegram_id_object",
+            ),
+        ] {
+            let (token, jwks) = signed_test_id_token(&material, |payload| {
+                payload.set_subject("7001");
+                payload.set_claim("id", user_id).expect("设置反证 id 失败");
+            });
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let dispatch = capture_subscriber(Arc::clone(&output));
+            let error = tracing::dispatcher::with_default(&dispatch, || {
+                validate_oidc_id_token(&token, &config, &material, &jwks)
+                    .expect_err("非法 id 不得回退使用有效数字 subject")
+            });
+            assert_eq!(error.code(), "CONDITION_INVALID");
+            assert_eq!(error.http_status(), 400);
+            let logs = output.lock().expect("读取 OIDC 身份字段诊断失败");
+            let events: Vec<serde_json::Value> = logs
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).expect("诊断日志必须为 JSON"))
+                .collect();
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0]["fields"],
+                json!({
+                    "message": "OIDC authentication rejected",
+                    "stage": "claims",
+                    "reason": expected_reason,
+                    "request_id": "None",
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_verified_token_rejects_invalid_bound_claims() {
+        let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+        let config = oidc_test_config(
+            "http://127.0.0.1:9/token".to_owned(),
+            "http://127.0.0.1:9/jwks".to_owned(),
+        );
+        for (claim, value) in [
+            ("sub", None),
+            ("sub", Some(json!(""))),
+            ("iss", Some(json!("https://evil.example"))),
+            ("aud", Some(json!(["99999"]))),
+            ("exp", Some(json!(1))),
+            ("nonce", Some(json!("wrong-nonce"))),
+            ("azp", Some(json!("99999"))),
+            ("azp", Some(json!(12345))),
+            ("aud", Some(json!(["12345", "99999"]))),
+        ] {
+            let (token, jwks) = signed_test_id_token(&material, |payload| {
+                payload
+                    .set_claim("id", Some(json!("7001")))
+                    .expect("设置 provider 字符串 id 失败");
+                payload
+                    .set_claim(claim, value)
+                    .expect("设置 claims 反证失败");
+            });
+            assert!(validate_oidc_id_token(&token, &config, &material, &jwks).is_err());
+        }
+        let (token, jwks) = signed_test_id_token(&material, |payload| {
+            payload.set_subject("opaque-subject");
+            payload
+                .set_claim("aud", Some(json!(["12345", "99999"])))
+                .expect("设置多 audience 失败");
+            payload
+                .set_claim("azp", Some(json!("12345")))
+                .expect("设置合法 azp 失败");
+        });
+        assert_eq!(
+            validate_oidc_id_token(&token, &config, &material, &jwks)
+                .expect("合法 opaque sub 验证失败"),
+            7001
+        );
     }
 
     #[tokio::test]
@@ -6240,7 +6683,7 @@ mod tests {
         let address = listener.local_addr().expect("读取 OIDC 拒绝测试地址失败");
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("接受 OIDC 拒绝测试请求失败");
-            let _ = read_http_request_body(&mut socket).await;
+            let _ = read_http_request(&mut socket).await;
             let response =
                 "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             socket

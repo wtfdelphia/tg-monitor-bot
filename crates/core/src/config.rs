@@ -32,7 +32,7 @@ pub enum ConfigProblem {
     )]
     SqlxLogNotSilenced(String),
 
-    #[error("TGM_OIDC_ALG 只接受 RS256、ES256、EdDSA 或 ES256K，收到 {0:?}")]
+    #[error("TGM_OIDC_ALG 的 profile 登录只接受 RS256 或 ES256，收到 {0:?}")]
     InvalidOidcAlgorithm(String),
 
     #[error("TGM_KEK_BACKEND 只接受 kms 或 env")]
@@ -1332,12 +1332,7 @@ mod tests {
     fn oidc_algorithm_configuration_is_closed_over_supported_public_key_algorithms() {
         assert_eq!(validate_oidc_alg("RS256"), Ok(OidcSigningAlgorithm::Rs256));
         assert_eq!(validate_oidc_alg("ES256"), Ok(OidcSigningAlgorithm::Es256));
-        assert_eq!(validate_oidc_alg("EdDSA"), Ok(OidcSigningAlgorithm::EdDsa));
-        assert_eq!(
-            validate_oidc_alg("ES256K"),
-            Ok(OidcSigningAlgorithm::Es256k)
-        );
-        for invalid in ["none", "HS256", "", "RS384"] {
+        for invalid in ["EdDSA", "ES256K", "none", "HS256", "", "RS384"] {
             assert_eq!(
                 validate_oidc_alg(invalid),
                 Err(ConfigProblem::InvalidOidcAlgorithm(invalid.to_owned()))

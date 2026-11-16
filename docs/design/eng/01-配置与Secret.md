@@ -70,7 +70,7 @@ root/user 身份差异及启动步骤见 `../../../deploy/native/README.md` 的�
 | `TGM_KMS_KEY_ARN` | 同上（`backend=kms`） | KEK 在 KMS 里的标识 |
 | `TGM_LOCAL_KEK` | 同上（`backend=env`） | base64 的 32 字节。`production` 下拒绝启动 |
 | `TGM_OIDC_BOT_ID` | control-plane | `id_token.aud` 的期望值 |
-| `TGM_OIDC_ALG` | control-plane | **验签算法从这里读，不从 token header 读** |
+| `TGM_OIDC_ALG` | control-plane | 仅 `RS256` / `ES256`，满足 `openid profile` 登录；**验签算法从这里读，不从 token header 读** |
 | `TGM_OIDC_REDIRECT_URL` | control-plane | 必须与 BotFather 登记的白名单一致 |
 | `TGM_OIDC_CLIENT_SECRET` | control-plane | Telegram OIDC token exchange 的 Client Secret，只能由 Secret 注入 |
 | `TGM_CONTROL_BOT_TOKEN` | control-plane | 控制 Bot 的 token（平台自己的，非租户凭据） |

@@ -210,7 +210,7 @@ fn query_parameter(location: &str, name: &str) -> String {
         .to_owned()
 }
 
-fn signed_test_id_token(nonce: &str) -> (String, String) {
+fn signed_test_id_token(nonce: &str, user_id: serde_json::Value) -> (String, String) {
     let mut key_pair = RsaKeyPair::generate(2048).expect("生成 OIDC 测试 RSA 密钥失败");
     key_pair.set_algorithm(Some("RS256"));
     key_pair.set_key_id(Some("test-kid"));
@@ -223,7 +223,10 @@ fn signed_test_id_token(nonce: &str) -> (String, String) {
 
     let mut payload = JwtPayload::new();
     payload.set_issuer(OIDC_ISSUER);
-    payload.set_subject("7001");
+    payload.set_subject("8002");
+    payload
+        .set_claim("id", Some(user_id))
+        .expect("写入 OIDC 测试 Telegram id 失败");
     payload.set_audience(vec!["12345"]);
     payload.set_expires_at(
         &(SystemTime::UNIX_EPOCH
@@ -1057,10 +1060,17 @@ async fn console_pages_expose_complete_frontend_controls(admin: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]
-async fn oidc_callback_issues_session_from_verified_member(admin: PgPool) {
+async fn oidc_callback_issues_session_for_verified_id_not_subject_member(admin: PgPool) {
     let (app, admin) = support::pools(admin).await;
     let auth_pool = support::auth_pool(&admin).await;
     let tenant = support::seed_tenant(&admin, "oidc-callback", 7001).await;
+    let auth_role: (String, bool) = sqlx::query_as(
+        "SELECT current_user::text,rolbypassrls FROM pg_roles WHERE rolname=current_user",
+    )
+    .fetch_one(&auth_pool)
+    .await
+    .expect("读取 OIDC 鉴权角色边界失败");
+    assert_eq!(auth_role, ("auth_lookup".to_owned(), false));
     sqlx::query(
         "INSERT INTO tenant_members (tenant_id, user_id, role)
          VALUES ($1, 7001, 'TENANT_OWNER')",
@@ -1069,189 +1079,249 @@ async fn oidc_callback_issues_session_from_verified_member(admin: PgPool) {
     .execute(admin.raw())
     .await
     .expect("创建 OIDC 测试成员失败");
+    let subject_tenant = support::seed_tenant(&admin, "oidc-subject-decoy", 8002).await;
+    sqlx::query(
+        "INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, 8002, 'TENANT_OWNER')",
+    )
+    .bind(subject_tenant)
+    .execute(admin.raw())
+    .await
+    .expect("创建 subject 同名成员反证失败");
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("启动 OIDC 本地测试服务失败");
-    let address = listener.local_addr().expect("读取 OIDC 本地测试地址失败");
-    let state = ControlPlaneState::with_auth_pool_and_oidc(
-        app,
-        auth_pool,
-        OidcConfig {
-            bot_id: "12345".to_owned(),
-            client_secret: Arc::new(Secret::new("test-client-secret".to_owned())),
-            signing_algorithm: OidcSigningAlgorithm::Rs256,
-            redirect_url: "https://console.example/auth/oidc/callback".to_owned(),
-            authorization_endpoint: "http://127.0.0.1:9/auth".to_owned(),
-            token_endpoint: format!("http://{address}/token"),
-            issuer: OIDC_ISSUER.to_owned(),
-            jwks_endpoint: format!("http://{address}/jwks"),
-        },
-    );
-    let app = router(state.clone());
-    let start = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/auth/oidc/start")
-                .body(Body::empty())
-                .expect("构造 OIDC 成功起始请求失败"),
-        )
-        .await
-        .expect("执行 OIDC 成功起始请求失败");
-    assert_eq!(start.status(), StatusCode::FOUND);
-    let location = start
-        .headers()
-        .get("location")
-        .and_then(|value| value.to_str().ok())
-        .expect("OIDC 成功起始响应缺少 Location")
-        .to_owned();
-    let state_value = query_parameter(&location, "state");
-    let state_cookie = start
-        .headers()
-        .get("set-cookie")
-        .and_then(|value| value.to_str().ok())
-        .expect("OIDC 成功起始响应缺少 state cookie")
-        .split(';')
-        .next()
-        .expect("OIDC state cookie 为空")
-        .to_owned();
-    let nonce = query_parameter(&location, "nonce");
-    let (id_token, jwks) = signed_test_id_token(&nonce);
-    let server = tokio::spawn(async move {
-        let (mut token_socket, _) = listener
-            .accept()
+    for (invited, user_id) in [
+        (true, json!(7001)),
+        (true, json!("7001")),
+        (false, json!(7001)),
+        (false, json!("7001")),
+    ] {
+        if !invited {
+            sqlx::query("DELETE FROM tenant_members WHERE tenant_id=$1 AND user_id=7001")
+                .bind(tenant)
+                .execute(admin.raw())
+                .await
+                .expect("移除 OIDC 测试成员失败");
+        }
+        let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("接受 OIDC token 测试请求失败");
-        read_http_headers(&mut token_socket).await;
-        let token_body = format!(r#"{{"id_token":{}}}"#, json!(id_token));
-        let token_response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            token_body.len(),
-            token_body
+            .expect("启动 OIDC 本地测试服务失败");
+        let address = listener.local_addr().expect("读取 OIDC 本地测试地址失败");
+        let state = ControlPlaneState::with_auth_pool_and_oidc(
+            app.clone(),
+            auth_pool.clone(),
+            OidcConfig {
+                bot_id: "12345".to_owned(),
+                client_secret: Arc::new(Secret::new("test-client-secret".to_owned())),
+                signing_algorithm: OidcSigningAlgorithm::Rs256,
+                redirect_url: "https://console.example/auth/oidc/callback".to_owned(),
+                authorization_endpoint: "http://127.0.0.1:9/auth".to_owned(),
+                token_endpoint: format!("http://{address}/token"),
+                issuer: OIDC_ISSUER.to_owned(),
+                jwks_endpoint: format!("http://{address}/jwks"),
+            },
         );
-        token_socket
-            .write_all(token_response.as_bytes())
+        let app = router(state.clone());
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/auth/oidc/start")
+                    .body(Body::empty())
+                    .expect("构造 OIDC 成功起始请求失败"),
+            )
             .await
-            .expect("写入 OIDC token 测试响应失败");
-
-        let (mut jwks_socket, _) = listener
-            .accept()
-            .await
-            .expect("接受 OIDC JWKS 测试请求失败");
-        read_http_headers(&mut jwks_socket).await;
-        let jwks_response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            jwks.len(),
-            jwks
-        );
-        jwks_socket
-            .write_all(jwks_response.as_bytes())
-            .await
-            .expect("写入 OIDC JWKS 测试响应失败");
-    });
-
-    let callback = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!(
-                    "/auth/oidc/callback?code=local-code&state={state_value}"
-                ))
-                .header("cookie", &state_cookie)
-                .header("x-forwarded-for", "203.0.113.9")
-                .header("user-agent", "oidc-test-browser")
-                .body(Body::empty())
-                .expect("构造 OIDC 成功回调请求失败"),
-        )
-        .await
-        .expect("执行 OIDC 成功回调请求失败");
-    server.await.expect("OIDC 本地测试服务任务失败");
-
-    assert_eq!(callback.status(), StatusCode::FOUND);
-    assert_eq!(
-        callback
+            .expect("执行 OIDC 成功起始请求失败");
+        assert_eq!(start.status(), StatusCode::FOUND);
+        let location = start
             .headers()
             .get("location")
-            .and_then(|value| value.to_str().ok()),
-        Some("/")
-    );
-    let cookies: Vec<String> = callback
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .map(|value| {
-            value
-                .to_str()
-                .expect("OIDC Set-Cookie 不是合法文本")
-                .to_owned()
-        })
-        .collect();
-    assert_eq!(cookies.len(), 3);
-    assert!(
-        cookies
-            .iter()
-            .any(|value| value.contains("tgm_oidc_state=") && value.contains("Max-Age=0"))
-    );
-    assert!(
-        cookies
-            .iter()
-            .any(|value| value.starts_with("tgm_session=") && value.contains("HttpOnly"))
-    );
-    assert!(
-        cookies
-            .iter()
-            .any(|value| value.starts_with("tgm_csrf=") && !value.contains("HttpOnly"))
-    );
+            .and_then(|value| value.to_str().ok())
+            .expect("OIDC 成功起始响应缺少 Location")
+            .to_owned();
+        let state_value = query_parameter(&location, "state");
+        let state_cookie = start
+            .headers()
+            .get("set-cookie")
+            .and_then(|value| value.to_str().ok())
+            .expect("OIDC 成功起始响应缺少 state cookie")
+            .split(';')
+            .next()
+            .expect("OIDC state cookie 为空")
+            .to_owned();
+        let nonce = query_parameter(&location, "nonce");
+        let (id_token, jwks) = signed_test_id_token(&nonce, user_id);
+        let server = tokio::spawn(async move {
+            let (mut token_socket, _) = listener
+                .accept()
+                .await
+                .expect("接受 OIDC token 测试请求失败");
+            read_http_headers(&mut token_socket).await;
+            let token_body = format!(r#"{{"id_token":{}}}"#, json!(id_token));
+            let token_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                token_body.len(),
+                token_body
+            );
+            token_socket
+                .write_all(token_response.as_bytes())
+                .await
+                .expect("写入 OIDC token 测试响应失败");
 
-    let session_id = cookies
-        .iter()
-        .find_map(|value| value.strip_prefix("tgm_session="))
-        .and_then(|value| value.split(';').next())
-        .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
-        .expect("OIDC session cookie 缺失");
-    let row: Option<(i64, i64, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT tenant_id, user_id, ip::text, user_agent, login_method
+            let (mut jwks_socket, _) = listener
+                .accept()
+                .await
+                .expect("接受 OIDC JWKS 测试请求失败");
+            read_http_headers(&mut jwks_socket).await;
+            let jwks_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                jwks.len(),
+                jwks
+            );
+            jwks_socket
+                .write_all(jwks_response.as_bytes())
+                .await
+                .expect("写入 OIDC JWKS 测试响应失败");
+        });
+
+        let callback = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/auth/oidc/callback?code=local-code&state={state_value}"
+                    ))
+                    .header("cookie", &state_cookie)
+                    .header("x-forwarded-for", "203.0.113.9")
+                    .header("user-agent", "oidc-test-browser")
+                    .body(Body::empty())
+                    .expect("构造 OIDC 成功回调请求失败"),
+            )
+            .await
+            .expect("执行 OIDC 成功回调请求失败");
+        server.await.expect("OIDC 本地测试服务任务失败");
+
+        if !invited {
+            assert_eq!(callback.status(), StatusCode::FORBIDDEN);
+            assert!(
+                callback
+                    .headers()
+                    .get_all("set-cookie")
+                    .iter()
+                    .all(|value| {
+                        !value
+                            .to_str()
+                            .expect("拒绝登录的 Cookie 非法")
+                            .starts_with("tgm_session=")
+                    })
+            );
+            let body = to_bytes(callback.into_body(), 1_048_576)
+                .await
+                .expect("读取未邀请响应失败");
+            let error: serde_json::Value =
+                serde_json::from_slice(&body).expect("解析未邀请响应失败");
+            assert_eq!(error["error"]["code"], "NOT_INVITED");
+            let sessions: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM web_sessions WHERE tenant_id=$1 OR user_id=8002",
+            )
+            .bind(subject_tenant)
+            .fetch_one(admin.raw())
+            .await
+            .expect("读取未邀请 subject 会话反证失败");
+            assert_eq!(sessions, 0);
+            continue;
+        }
+        assert_eq!(callback.status(), StatusCode::FOUND);
+        assert_eq!(
+            callback
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("/")
+        );
+        let cookies: Vec<String> = callback
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .expect("OIDC Set-Cookie 不是合法文本")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(cookies.len(), 3);
+        assert!(
+            cookies
+                .iter()
+                .any(|value| value.contains("tgm_oidc_state=") && value.contains("Max-Age=0"))
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|value| value.starts_with("tgm_session=") && value.contains("HttpOnly"))
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|value| value.starts_with("tgm_csrf=") && !value.contains("HttpOnly"))
+        );
+
+        let session_id = cookies
+            .iter()
+            .find_map(|value| value.strip_prefix("tgm_session="))
+            .and_then(|value| value.split(';').next())
+            .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+            .expect("OIDC session cookie 缺失");
+        let row: Option<(i64, i64, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT tenant_id, user_id, ip::text, user_agent, login_method
            FROM web_sessions
           WHERE id = $1",
-    )
-    .bind(session_id)
-    .fetch_one(admin.raw())
-    .await
-    .map(Some)
-    .expect("读取 OIDC 签发会话失败");
-    assert_eq!(
-        row,
-        Some((
-            tenant.get(),
-            7001,
-            "203.0.113.9/32".to_owned(),
-            Some("oidc-test-browser".to_owned()),
-            "oidc".to_owned(),
-        ))
-    );
-
-    let replay = router(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!(
-                    "/auth/oidc/callback?code=local-code&state={state_value}"
-                ))
-                .header("cookie", &state_cookie)
-                .body(Body::empty())
-                .expect("构造 OIDC 重放回调请求失败"),
         )
+        .bind(session_id)
+        .fetch_one(admin.raw())
         .await
-        .expect("执行 OIDC 重放回调请求失败");
-    assert_eq!(replay.status(), StatusCode::FORBIDDEN);
-    assert_issued_session_lifecycle(
-        state,
-        &cookies,
-        json!({"user_id": 7001, "tenant_id": tenant.get(), "role": "TENANT_OWNER"}),
-    )
-    .await;
+        .map(Some)
+        .expect("读取 OIDC 签发会话失败");
+        assert_eq!(
+            row,
+            Some((
+                tenant.get(),
+                7001,
+                "203.0.113.9/32".to_owned(),
+                Some("oidc-test-browser".to_owned()),
+                "oidc".to_owned(),
+            ))
+        );
+        let decoy_sessions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM web_sessions WHERE tenant_id=$1 OR user_id=8002",
+        )
+        .bind(subject_tenant)
+        .fetch_one(admin.raw())
+        .await
+        .expect("读取 subject 成员会话反证失败");
+        assert_eq!(decoy_sessions, 0);
+
+        let replay = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/auth/oidc/callback?code=local-code&state={state_value}"
+                    ))
+                    .header("cookie", &state_cookie)
+                    .body(Body::empty())
+                    .expect("构造 OIDC 重放回调请求失败"),
+            )
+            .await
+            .expect("执行 OIDC 重放回调请求失败");
+        assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+        assert_issued_session_lifecycle(
+            state,
+            &cookies,
+            json!({"user_id": 7001, "tenant_id": tenant.get(), "role": "TENANT_OWNER"}),
+        )
+        .await;
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations-test")]
