@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -132,6 +133,111 @@ class InputTests(unittest.TestCase):
             path.write_text("NAME=first\nNAME=second\n")
             with self.assertRaises(ValueError):
                 INPUTS.read_env(path)
+
+
+class EvidenceReviewTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.evidence = Path(self.directory.name) / "evidence.txt"
+        self.content = "申请日期：2026-9-25\r\napi_hash：未记录\r\n".encode()
+        self.evidence.write_bytes(self.content)
+        self.evidence.chmod(0o600)
+        self.tenant = {"applied_at": "2026-09-25", "evidence_reference": str(self.evidence)}
+        self.signoff = "目标租户证据 SHA-256：" + hashlib.sha256(self.content).hexdigest() + "\n"
+
+    def test_matching_dates_and_exact_file_bytes_do_not_assert_signoff(self):
+        result = INPUTS.review_tenant_evidence(self.tenant, self.signoff)
+        self.assertEqual(result["status"], "consistent-pending-review")
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(result["formal_signoff"], "not-assessed")
+
+    def test_conflicting_date_and_hash_require_confirmation(self):
+        self.tenant["applied_at"] = "2026-11-17"
+        result = INPUTS.review_tenant_evidence(self.tenant, "目标租户证据 SHA-256：" + "0" * 64)
+        self.assertEqual(result["status"], "blocked-confirmation")
+        self.assertEqual(len(result["issues"]), 2)
+
+    def test_invalid_and_duplicate_dates_are_rejected_without_echoing_content(self):
+        for text in ("申请日期：2026-02-30", "申请日期：secret-value", "申请日期：2026-9-25\n申请日期：2026-9-26"):
+            self.evidence.write_text(text)
+            with self.assertRaises(ValueError) as error:
+                INPUTS.review_tenant_evidence(self.tenant, self.signoff)
+            self.assertNotIn("secret-value", str(error.exception))
+
+    def test_invalid_and_duplicate_signoff_hashes_are_rejected(self):
+        for text in ("目标租户证据 SHA-256：secret-value", self.signoff + self.signoff, ""):
+            with self.assertRaises(ValueError) as error:
+                INPUTS.review_tenant_evidence(self.tenant, text)
+            self.assertNotIn("secret-value", str(error.exception))
+
+    def test_public_or_linked_evidence_is_rejected(self):
+        self.evidence.chmod(0o644)
+        with self.assertRaises(ValueError):
+            INPUTS.review_tenant_evidence(self.tenant, self.signoff)
+        self.evidence.chmod(0o600)
+        linked = self.evidence.with_name("linked.txt")
+        linked.symlink_to(self.evidence)
+        self.tenant["evidence_reference"] = str(linked)
+        with self.assertRaises(ValueError):
+            INPUTS.review_tenant_evidence(self.tenant, self.signoff)
+
+    def test_cli_keeps_readiness_separate_and_returns_two_on_conflict(self):
+        directory = Path(self.directory.name)
+        environment = directory / "oidc.env"
+        values = {
+            "TGM_OIDC_BOT_ID": "123456", "TGM_OIDC_CLIENT_SECRET": "test-value-never-print",
+            "TGM_OIDC_ALG": "RS256", "TGM_OIDC_REDIRECT_URL": "https://login.example/auth/oidc/callback",
+            "TGM_OIDC_ALLOWED_ORIGIN": "https://login.example",
+            "TGM_OIDC_ALLOWED_CALLBACK": "https://login.example/auth/oidc/callback",
+            "TGM_OIDC_BOTFATHER_CONFIRMED": "yes",
+        }
+        environment.write_text("".join(key + "=" + value + "\n" for key, value in values.items()))
+        record = directory / "tenant.json"
+        tenant = dict(self.tenant, operator_reference="operator-a", tenant_reference="tenant-a",
+                      applied_at="2026-11-17", reviewer="reviewer-a", result="pass",
+                      applicant_is_tenant=True, platform_credentials_reused=False)
+        record.write_text(json.dumps(tenant))
+        signoff = directory / "signoff.md"
+        signoff.write_text(self.signoff)
+        for path in (environment, record, signoff):
+            path.chmod(0o600)
+        output = io.StringIO()
+        arguments = ["check", "--env-file", str(environment), "--tenant-record", str(record), "--signoff-file", str(signoff)]
+        with patch("sys.argv", arguments), patch.object(INPUTS, "provider_summary", side_effect=AssertionError("unexpected network")), contextlib.redirect_stdout(output):
+            result = INPUTS.main()
+        self.assertEqual(result, 2)
+        summary = json.loads(output.getvalue())
+        self.assertEqual(summary["input_readiness"], "ready")
+        self.assertEqual(summary["tenant_evidence_file"], "available-review-blocked")
+        self.assertEqual(summary["tenant_evidence_review"]["status"], "blocked-confirmation")
+        self.assertNotIn("test-value-never-print", output.getvalue())
+        self.assertNotIn("operator-a", output.getvalue())
+
+        tenant["applied_at"] = "2026-09-25"
+        record.write_text(json.dumps(tenant))
+        output = io.StringIO()
+        with patch("sys.argv", arguments), patch.object(INPUTS, "provider_summary", side_effect=AssertionError("unexpected network")), contextlib.redirect_stdout(output):
+            result = INPUTS.main()
+        self.assertEqual(result, 0)
+        summary = json.loads(output.getvalue())
+        self.assertEqual(summary["input_readiness"], "ready")
+        self.assertEqual(summary["tenant_evidence_file"], "available-consistency-checked")
+        self.assertEqual(summary["tenant_evidence_review"]["formal_signoff"], "not-assessed")
+
+        for failure in (OSError("private-fault-value"), ValueError("private-fault-value"), KeyError("private-fault-value")):
+            with self.subTest(failure=type(failure).__name__):
+                output = io.StringIO()
+                with patch("sys.argv", arguments + ["--provider"]), patch.object(INPUTS, "provider_summary", side_effect=failure), contextlib.redirect_stdout(output):
+                    result = INPUTS.main()
+                self.assertEqual(result, 1)
+                summary = json.loads(output.getvalue())
+                self.assertEqual(summary["input_readiness"], "ready")
+                self.assertEqual(summary["tenant_evidence_review"]["issues"], [])
+                self.assertEqual(summary["provider"]["status"], "check-error")
+                self.assertEqual(summary["provider"]["provider_rotation"], "not-run")
+                self.assertNotIn("private-fault-value", output.getvalue())
+                self.assertNotIn("test-value-never-print", output.getvalue())
 
 
 class BackupTests(unittest.TestCase):
