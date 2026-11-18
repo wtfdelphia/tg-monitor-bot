@@ -2,9 +2,12 @@
 """Check G1 input readiness without printing credentials or executing an env file."""
 
 import argparse
+from datetime import date
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import stat
 import urllib.parse
@@ -101,6 +104,49 @@ def tenant_evidence_available(tenant):
             and not stat.S_IMODE(metadata.st_mode) & 0o077 and metadata.st_size > 0)
 
 
+def record_field(text, label):
+    matches = re.findall(r"^" + re.escape(label) + r"[：:][ \t]*(.*)$", text, re.MULTILINE)
+    if len(matches) != 1:
+        raise ValueError("复核字段缺失或重复")
+    return matches[0].strip()
+
+
+def application_date(value):
+    if not isinstance(value, str):
+        raise ValueError("申请日期必须为字符串")
+    matched = re.fullmatch(r"([0-9]{4})-([0-9]{1,2})-([0-9]{1,2})", value)
+    if matched is None:
+        raise ValueError("申请日期格式无效")
+    return date(*(int(part) for part in matched.groups())).isoformat()
+
+
+def review_tenant_evidence(tenant, signoff):
+    if not tenant_evidence_available(tenant):
+        raise ValueError("租户证据文件不满足私密输入要求")
+    evidence_bytes = Path(tenant["evidence_reference"]).read_bytes()
+    evidence_text = evidence_bytes.decode("utf-8")
+    index_date = application_date(tenant["applied_at"])
+    evidence_date = application_date(record_field(evidence_text, "申请日期"))
+    evidence_hash = hashlib.sha256(evidence_bytes).hexdigest()
+    signoff_hash = record_field(signoff, "目标租户证据 SHA-256")
+    if re.fullmatch(r"[0-9a-fA-F]{64}", signoff_hash) is None:
+        raise ValueError("签署材料的证据哈希格式无效")
+    issues = []
+    if index_date != evidence_date:
+        issues.append("申请索引与脱敏原件的申请日期不一致，须由责任方确认")
+    if evidence_hash != signoff_hash.lower():
+        issues.append("当前脱敏原件与签署材料的证据哈希不一致，须由责任方确认替代关系")
+    return {
+        "status": "blocked-confirmation" if issues else "consistent-pending-review",
+        "index_applied_at": index_date,
+        "evidence_applied_at": evidence_date,
+        "current_evidence_sha256": evidence_hash,
+        "signoff_evidence_sha256": signoff_hash.lower(),
+        "issues": issues,
+        "formal_signoff": "not-assessed",
+    }
+
+
 def provider_summary():
     with urllib.request.urlopen(DISCOVERY, timeout=20) as response:
         data = json.loads(response.read(131073))
@@ -127,6 +173,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--tenant-record", type=Path, required=True)
+    parser.add_argument("--signoff-file", type=Path, help="只读比对脱敏申请日期和既有签署材料哈希，不代替责任方确认")
     parser.add_argument("--provider", action="store_true", help="只读查询公开 discovery/JWKS，不发送凭据")
     args = parser.parse_args()
     try:
@@ -141,10 +188,29 @@ def main():
         result = {"input_readiness": "blocked-input" if issues else "ready", "missing": issues,
                   "tenant_evidence_file": "available-content-not-reviewed" if evidence_available else "missing-or-invalid",
                   "identity_mapping": "approved-fix-under-validation", "real_login": "not-run"}
+        review_issues = []
+        if args.signoff_file:
+            review = review_tenant_evidence(tenant, private_file(args.signoff_file))
+            result["tenant_evidence_file"] = (
+                "available-consistency-checked" if not review["issues"] else "available-review-blocked"
+            )
+            result["tenant_evidence_review"] = review
+            review_issues = review["issues"]
+        provider_failed = False
         if args.provider:
-            result["provider"] = provider_summary()
+            try:
+                result["provider"] = provider_summary()
+            except (OSError, ValueError, KeyError):
+                provider_failed = True
+                result["provider"] = {
+                    "status": "check-error",
+                    "reason": "公开 discovery/JWKS 检查失败；未输出响应原文",
+                    "real_login": "not-run", "provider_rotation": "not-run",
+                }
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 2 if issues else 0
+        if provider_failed:
+            return 1
+        return 2 if issues or review_issues else 0
     except (OSError, ValueError, KeyError):
         print(json.dumps({"input_readiness": "error", "reason": "输入、权限或 provider 检查失败；未输出原文"}, ensure_ascii=False))
         return 1
