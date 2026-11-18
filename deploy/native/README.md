@@ -90,6 +90,11 @@ Rocky 模式在候选隔离安装后执行 `native-release-preflight.sh --app-se
 伪装成通过。CentOS 7 模式要求原生应用预检按 `systemd 219 -SECCOMP` 能力缺失拒绝，拒绝结果
 是预期的安全结论，不得删除 `RestrictAddressFamilies` 或放宽预检。
 
+当前发行版与原生服务支持边界见
+[`docs/plan/evidence/原生平台支持矩阵-2026-11-18.md`](../../docs/plan/evidence/原生平台支持矩阵-2026-11-18.md)。
+Rocky 9.8 有完整的非生产原生服务验收记录；CentOS 7 仅保留二进制/材料验证，因
+systemd `-SECCOMP` 不支持当前原生服务安全预检。
+
 仓库脚本本身只负责下载和验证候选材料；Rocky 六角色辅助脚本及 `scripts/init/01-roles.sql`
 需从同一来源 `dev` 单独提供。可在已核对的 `dev` 工作树中生成辅助包：
 

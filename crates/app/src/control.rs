@@ -5758,12 +5758,20 @@ mod tests {
         material: &OidcLoginMaterial,
         update: impl FnOnce(&mut JwtPayload),
     ) -> (String, JwkSet) {
+        signed_test_id_token_with_key_id(material, "test-kid", update)
+    }
+
+    fn signed_test_id_token_with_key_id(
+        material: &OidcLoginMaterial,
+        key_id: &str,
+        update: impl FnOnce(&mut JwtPayload),
+    ) -> (String, JwkSet) {
         let mut key_pair = RsaKeyPair::generate(2048).expect("生成测试 RSA 密钥失败");
         key_pair.set_algorithm(Some("RS256"));
-        key_pair.set_key_id(Some("test-kid"));
+        key_pair.set_key_id(Some(key_id));
         let private_jwk = key_pair.to_jwk_key_pair();
         let mut public_jwk = key_pair.to_jwk_public_key();
-        public_jwk.set_key_id("test-kid");
+        public_jwk.set_key_id(key_id);
         public_jwk.set_algorithm("RS256");
         public_jwk.set_key_use("sig");
         public_jwk.set_key_operations(vec!["verify"]);
@@ -5792,7 +5800,7 @@ mod tests {
 
         let mut header = JwsHeader::new();
         header.set_algorithm("RS256");
-        header.set_key_id("test-kid");
+        header.set_key_id(key_id);
         let signer = RS256
             .signer_from_jwk(&private_jwk)
             .expect("创建测试 RSA signer 失败");
@@ -6413,6 +6421,170 @@ mod tests {
             assert_eq!(error.http_status(), 503);
             assert_eq!(error.code(), "OIDC_PROVIDER_UNAVAILABLE");
             server.await.expect("OIDC JWKS payload 测试服务任务失败");
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_jwks_rotation_accepts_overlap_and_rejects_retired_key() {
+        let material = OidcLoginMaterial::generate().expect("生成换钥测试材料失败");
+        let (old_token, old_keys) = signed_test_id_token_with_key_id(&material, "old-kid", |_| {});
+        let (new_token, new_keys) = signed_test_id_token_with_key_id(&material, "new-kid", |_| {});
+        let mut overlap_keys = old_keys.clone();
+        for key in new_keys.keys() {
+            overlap_keys.push_key(key.clone());
+        }
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("启动隔离换钥服务失败");
+        let address = listener.local_addr().expect("读取隔离换钥地址失败");
+        let server = tokio::spawn(async move {
+            for keys in [old_keys, overlap_keys, new_keys] {
+                let (mut socket, _) = listener.accept().await.expect("接受换钥请求失败");
+                let (request, _) = read_http_request(&mut socket).await;
+                assert!(request.starts_with("GET /jwks HTTP/1.1\r\n"));
+                let body = keys.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("写入换钥快照失败");
+            }
+        });
+        let config = oidc_test_config(
+            "http://127.0.0.1:9/token".to_owned(),
+            format!("http://{address}/jwks"),
+        );
+        for expected in [[true, false], [true, true], [false, true]] {
+            let keys = fetch_oidc_jwks(&config).await.expect("读取换钥快照失败");
+            for (token, accepted) in [(&old_token, expected[0]), (&new_token, expected[1])] {
+                let result = validate_oidc_id_token(token, &config, &material, &keys);
+                if accepted {
+                    assert_eq!(result.expect("有效换钥 token 被拒绝"), 7001);
+                } else {
+                    let error = result.expect_err("未知或退役 key 不应继续登录");
+                    assert_eq!(error.http_status(), 503);
+                    assert_eq!(error.code(), "OIDC_PROVIDER_UNAVAILABLE");
+                }
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("隔离换钥服务超时")
+            .expect("隔离换钥服务失败");
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_provider_failures_issue_no_session_and_consume_state() {
+        for scenario in ["unknown_kid", "jwks_failure", "expired_token"] {
+            let material = OidcLoginMaterial::generate().expect("生成回调反证材料失败");
+            let state_value = material.state().to_owned();
+            let (token, keys) = signed_test_id_token(&material, |payload| {
+                if scenario == "expired_token" {
+                    payload
+                        .set_claim("exp", Some(json!(1)))
+                        .expect("设置过期 token 失败");
+                }
+            });
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("启动回调反证服务失败");
+            let address = listener.local_addr().expect("读取回调反证地址失败");
+            let token_body = json!({"id_token": token}).to_string();
+            let keys_body = if scenario == "unknown_kid" {
+                signed_test_id_token_with_key_id(&material, "other-kid", |_| {})
+                    .1
+                    .to_string()
+            } else {
+                keys.to_string()
+            };
+            let jwks_status = if scenario == "jwks_failure" {
+                "503 Service Unavailable"
+            } else {
+                "200 OK"
+            };
+            let server = tokio::spawn(async move {
+                for (method, path, status, body) in [
+                    ("POST", "/token", "200 OK", token_body),
+                    ("GET", "/jwks", jwks_status, keys_body),
+                ] {
+                    let (mut socket, _) = listener.accept().await.expect("接受回调反证请求失败");
+                    let (request, _) = read_http_request(&mut socket).await;
+                    assert!(request.starts_with(&format!("{method} {path} HTTP/1.1\r\n")));
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("写入回调反证响应失败");
+                }
+            });
+            let pool = PgPoolOptions::new()
+                .connect_lazy(&test_database_url())
+                .expect("构造回调反证惰性连接池失败");
+            let state = ControlPlaneState::with_auth_pool_and_oidc(
+                pool.clone(),
+                pool,
+                oidc_test_config(
+                    format!("http://{address}/token"),
+                    format!("http://{address}/jwks"),
+                ),
+            );
+            state.oidc_states.remember(material);
+            let app = router(state);
+            let callback = format!("/auth/oidc/callback?state={state_value}&code=isolated-code");
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                app.clone().oneshot(
+                    Request::builder()
+                        .uri(&callback)
+                        .header(header::COOKIE, format!("{OIDC_STATE_COOKIE}={state_value}"))
+                        .body(Body::empty())
+                        .expect("构造回调反证请求失败"),
+                ),
+            )
+            .await
+            .expect("回调反证超时")
+            .expect("执行回调反证失败");
+            let expected_status = if scenario == "expired_token" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            assert_eq!(response.status(), expected_status, "{scenario}");
+            let cookies: Vec<_> = response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .collect();
+            assert_eq!(cookies.len(), 1);
+            assert_eq!(cookies[0], super::OIDC_STATE_CLEAR_COOKIE);
+            let body = axum::body::to_bytes(response.into_body(), 16_384)
+                .await
+                .expect("读取回调反证结果失败");
+            let body = String::from_utf8(body.to_vec()).expect("回调结果不是 UTF-8");
+            for sensitive in [&token, &state_value, "isolated-code", "test-client-secret"] {
+                assert!(!body.contains(sensitive), "回调错误响应泄漏测试材料");
+            }
+            let replay = app
+                .oneshot(
+                    Request::builder()
+                        .uri(&callback)
+                        .header(header::COOKIE, format!("{OIDC_STATE_COOKIE}={state_value}"))
+                        .body(Body::empty())
+                        .expect("构造回调重放请求失败"),
+                )
+                .await
+                .expect("执行回调重放失败");
+            assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+            tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .expect("回调反证服务超时")
+                .expect("回调反证服务失败");
         }
     }
 
