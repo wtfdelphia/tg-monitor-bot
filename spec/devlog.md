@@ -56,3 +56,63 @@ spec-compliance-check、openspec-verify-change 和 verification-before-completio
 对照提交和受控文件逐项核对 SHA-256，确认批准来源、时间、备份、权限及开放项一致。
 本次仅签署与文档变更，不重复已通过的编译、目标机或 Telegram 验收；此前静态门禁与
 基线 CI 分别保留，不声称本轮重新运行完整门禁。入口 README、AGENTS 和冻结载体无需修改。
+
+## 2026-11-18：G1、WP-8、G4 与原生平台边界复核
+
+Bridge Plan：以 `cloud/dev@ae5977dd6cc7b7443da675cc3c0e6a7f5362b927` 和 CI `44205439842`
+为当前基线，复核 G1 正式 Go/No-Go、SRS v1.1 候选差异、WP-8 外部/生产输入、G4 剩余出口
+以及 Rocky/CentOS 7 原生支持边界。项目内可证明的出口记录为已通过或隔离通过；provider
+异常、生产恢复、跨副本留存、告警和值班及自然 FloodWait 仍按证据边界保留 pending/blocked。
+
+本轮新增收口材料：`G1正式Go-No-Go与SRS-v1.1复核-2026-11-18.md`、
+`WP-8生产外部与运维证据收口-2026-11-18.md`、`G4剩余出口复核-2026-11-18.md` 和
+`原生平台支持矩阵-2026-11-18.md`。新增 `verify-external-closure-evidence.py` 及其
+回归测试，统一校验 G1/WP-8/G4 的脱敏外部证据输入；缺少 provider、生产或自然事件证据时
+只返回 `blocked`。不修改迁移、RLS、GRANT、CI、生产配置、timer 或 Telegram 测试行为；不
+重复 Rocky 验收，不主动制造 FloodWait，不执行生产恢复或真实租户清理。
+
+本轮同时复核 Telegram 官方 OIDC 与测试环境文档：公开文档没有定义 OIDC 专用的换钥、未知
+`kid`、JWKS 故障或过期 token 注入接口，普通测试 Bot 和公开 JWKS 读取不能替代这些外部证据。
+
+随后收紧外部关闭证据校验：G1 provider 项和 G4 FloodWait 项无论处于 `pass`、`not-run` 或
+`blocked`，都必须明确记录 `active_probe=false`；缺失或主动探针标记会被拒绝，避免把主动
+制造的事件混入未决证据。
+
+本轮 G1 追加测试直接覆盖现有生产验签函数和 callback：模拟 old-only、old+new、new-only 的
+JWKS 衔接，以及未知 `kid`、JWKS 503、过期 token 三类失败回调不签发会话、消费 state、拒绝
+重放和错误脱敏。只修改既有测试区域并复用 RSA/JWKS helper，不改认证实现或冻结 TS 文档。
+专项 OIDC 回归通过；公开文档、discovery、JWKS 的只读响应以哈希归档在受控目录。单快照
+不证明换钥，合成 token 和本地 HTTP 不替代真实 provider 事件，四类外部项仍为 `not-run`。
+
+G1 复核记录补齐 SRS 两个载体的基线和完整 SHA-256，并准备受控待签包。Bridge Plan 与
+spec-compliance-check 对照既有 G1 批准提案逐条核对身份来源、错误拒绝及证据边界；
+openspec-verify-change 与 verification-before-completion 采用专项测试、clippy、格式和
+文档摘要核对。责任方未接受本轮具体证据前不代填签名、Go 或冻结日期；原签署保持原样。
+入口 README、AGENTS、SRS/SDD/TS 正文无需修改，本次不引入新产品能力或卡口。
+
+本轮最终验证：OIDC 专项 `17 passed`，G1 输入/预发布脚本回归 `23 passed`，外部关闭清单回归
+`9 passed`；定向 clippy、fmt、`git diff --check` 通过；本轮修改后的
+`ai-gates.sh --static-only` 通过，数据库卡口未运行。日志、测试 diff 和 SRS 两个载体按 SHA-256
+归档在受控目录，测试专属 target 在确认进程结束后清理。未提交、推送或创建 PR。
+
+## 2026-11-18：G1 正式裁定与 SRS v1.1 冻结
+
+维护人明确接受待签包内四类客户端处理行为的隔离证据，并授权按包内具体版本作出责任方
+裁定及符合条件的 SRS 冻结。Bridge Plan：重新核对待签包、测试源码、原始日志、归档 diff、
+租户材料和 SRS 两个载体的哈希；保留历史 No-Go/待签材料并生成本次正式签署；按已允许的
+`approved-isolation` 来源填写关闭清单，统一当前文档引用。
+
+按本次明确授权记录责任方 `WTFGEDelphia` 于 `2026-11-18T12:18:22+08:00` 的签署登记：
+G1 正式 Go，SRS v1.1 两个具体载体冻结，四类真实 provider 异常继续 `not-run`。同 DC QR 和
+X1–X5 沿待签包保留延期状态；技术可行性收口不等于 G3/G4/WP-8 或生产部署放行。
+
+spec-compliance-check、openspec-verify-change 和 verification-before-completion 等价按
+G1 当前签署记录核对批准原文、具体对象、哈希与证据类别，运行关闭清单校验和既有脚本回归。
+本次仅记录已授权的裁定和冻结，不修改 SRS/SDD/TS 正文、生产代码、CI 或数据库；沿用前次
+实际通过的 OIDC 专项及静态门禁，数据库卡口未运行，不重复构建或目标机/Telegram 验收。
+入口 README 与 AGENTS 无需更改；本批继续保留在工作树，等待用户提交/PR 指令。
+
+签署后实际检查：G1 关闭清单返回 `pass/go/signed/frozen`；申请材料一致性检查通过且不代判
+签署；外部关闭清单回归 `9/9`、G1 输入/预发布回归 `23/23` 通过。SRS、测试归档、旧签署与
+待签包摘要匹配，受控文件均为 `0600`；相对链接、围栏及 `git diff --check` 通过。验证摘要
+保存在受控的 `G1-signoff-verification-2026-11-18.json`，本轮未生成 Rust 构建缓存。
