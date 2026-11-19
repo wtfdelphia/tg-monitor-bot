@@ -145,3 +145,19 @@ G3 校验要求同时提供 WP-8 清单，并拒绝 G3 中 WP-8 状态与 WP-8 �
 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_external_closure_evidence -v`
 通过，26 项测试全绿；Python 语法检查与 `git diff --check` 通过。测试只验证结构和状态处理，
 不验证外部引用真实性，不连接生产，也不改变 G3、WP-8 或 G4 的阻塞状态。
+
+## 2026-11-18：PRE-009 dev 候选发布复核
+
+以 `cloud/dev@021ba8a9f5092bfeb74da60bdd71544ad806027f` 和成功 CI `44307806276` 为来源，
+手动触发候选 workflow `44332329757`。CentOS 7 构建与二进制提取、签名与来源证明、不可
+覆盖的 GitHub Pre-release 创建三个 job 全部成功。
+
+候选 tag 为 `candidate-44332329757-a1-021ba8a9f509`，版本为
+`0.1.0-candidate.44332329757.1.021ba8a9f509`，x86_64 GNU 归档 SHA-256 为
+`3a3299659d8e547a060bd6bbe75243fd643b3373043e7103bb764ee84b972233`。候选 BUILDINFO
+明确标记 `channel=candidate`、`stable=false`，并记录来源提交、CI run、候选 run、tag 和
+目标平台。详细清单见 `docs/plan/evidence/PRE-009候选发布-2026-11-18.md`。
+
+本次只收口候选发布子阶段，不重复 Rocky 目标机验收，不改变 CentOS 7 `-SECCOMP` 的
+fail-closed 结论，不连接生产服务、不启用生产 timer、不执行真实租户清理，也不主动制造
+FloodWait。PRE-009/PRE-012 的整体 backlog 状态、G3、G4 和 WP-8 的总体裁决保持不变。
