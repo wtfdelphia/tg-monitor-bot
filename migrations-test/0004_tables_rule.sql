@@ -1,0 +1,1 @@
+../migrations/0004_tables_rule.sql

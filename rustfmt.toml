@@ -1,0 +1,7 @@
+# 只写偏离默认值的项。默认值本身是约定，重复它等于把默认值也变成需要维护的决定。
+edition = "2024"     # 不写则 rustfmt 按 2015 解析，与各 crate 的 edition 不符
+
+# 不要加 wrap_comments / comment_width：实测在稳定版 rustfmt 1.9.0 上是 nightly-only，
+# 只会每次打 "unstable features are only available in nightly channel" 然后忽略，
+# 在 `cargo fmt --check` 的输出里变成常驻噪音。
+# 后果是长注释不受 max_width 约束 —— 本项目注释密度高，需靠评审看，机器管不了。

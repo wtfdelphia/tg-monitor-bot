@@ -1,0 +1,10 @@
+[Unit]
+Description=TGM platform system log retention daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=tgm-platform-cleanup.service
+
+[Install]
+WantedBy=timers.target

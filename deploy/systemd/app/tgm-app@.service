@@ -1,0 +1,33 @@
+[Unit]
+Description=TGM application role (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitInterval=120s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=tgm-%i
+Group=tgm-%i
+WorkingDirectory=/
+ExecStartPre=/usr/bin/env -i /usr/local/bin/tgm serve --role %i --env-file /etc/tgm/app/%i.env --check-config
+ExecStart=/usr/bin/env -i /usr/local/bin/tgm serve --role %i --env-file /etc/tgm/app/%i.env
+Restart=on-failure
+RestartSec=10s
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=30s
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tgm-app-%i
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+//! grammers + teloxide 封装。
+//!
+//! 本 crate 单独存在的理由不是整洁，是依赖退出路径：grammers 是 0.x 且
+//! bus factor 低（spec/08 §1.1），把 raw invoke 收敛在一个 crate 里，
+//! 将来 fork 或替换时改动面可控（eng/00 §一）。
+//!
+//! 所以有一条纪律：**raw invoke 不得出现在本 crate 之外。**
+
+pub mod client;
+pub mod session;
+
+pub use client::{
+    AlbumMedia, IncomingMessage, MediaDownload, MediaReader, TelegramClient, TelegramClientError,
+    TelegramDeliveryAction, UploadMedia, telegram_text_len,
+};
+pub use session::{StoredSession, StoredSessionError};
+
+/// QR 登录状态机。这里只处理纯状态迁移，不接触网络、凭据或数据库。
+pub mod qr;
+
+/// QR 登录驱动：持有一条 grammers 连接，按状态机推进真机登录。
+pub mod qr_login;

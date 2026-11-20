@@ -1,0 +1,70 @@
+services:
+  postgres:
+    image: ${TGM_ACCEPTANCE_PG_IMAGE:-postgres:17.11-alpine3.23@sha256:05aa77262db9277fde6374bb2f901c9604b8a9373029e1a7993440c6aae48736}
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: pw
+      POSTGRES_DB: tgm
+      PGDATA: /dev/shm/tgm-postgres-data
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - export PGDATA=/dev/shm/tgm-postgres-data; exec /usr/local/bin/docker-entrypoint.sh postgres
+    shm_size: "256m"
+    networks:
+      - acceptance
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U postgres -d tgm -c 'SELECT 1' || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: "no"
+
+  tgm-owner:
+    image: ${TGM_ACCEPTANCE_IMAGE:?TGM_ACCEPTANCE_IMAGE is required}
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      TGM_PROFILE: development
+    env_file:
+      - ${TGM_ACCEPTANCE_OWNER_ENV:?TGM_ACCEPTANCE_OWNER_ENV is required}
+    networks:
+      - acceptance
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/usr/local/bin/tgm"]
+    command: ["--help"]
+
+  tgm-purge:
+    image: ${TGM_ACCEPTANCE_IMAGE:?TGM_ACCEPTANCE_IMAGE is required}
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      TGM_PROFILE: development
+    env_file:
+      - ${TGM_ACCEPTANCE_PURGE_ENV:?TGM_ACCEPTANCE_PURGE_ENV is required}
+    networks:
+      - acceptance
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/usr/local/bin/tgm"]
+    command: ["purge-deleted-tenants", "--max-tenants", "1"]
+
+networks:
+  acceptance:
+    internal: true

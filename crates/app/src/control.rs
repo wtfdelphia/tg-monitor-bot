@@ -1,0 +1,7079 @@
+//! WP-5 控制面骨架：统一错误包络、健康探针与 OpenAPI 导出。
+
+use axum::{
+    Json, Router,
+    body::{Body, Bytes},
+    extract::{FromRequestParts, Path, Query, State},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header, request::Parts},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{delete, get, patch, post},
+};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use josekit::jwk::JwkSet;
+use josekit::jws::{ES256, RS256};
+use josekit::jwt::{self, JwtPayload};
+use regex::Regex;
+use reqwest::redirect::Policy;
+use serde::{Deserialize, Serialize, de::Error as DeError};
+use sqlx::PgPool;
+use sqlx::types::chrono::{DateTime, Utc};
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use tgm_core::auth::{AuthContext, AuthSource, TenantRole};
+use tgm_core::error::AppError;
+use tgm_core::kek::Kek;
+use tgm_core::oidc::{
+    OidcClaimsError, OidcIdTokenClaims, OidcLoginMaterial, OidcLoginStateStore,
+    OidcSigningAlgorithm, OidcTokenHeader, validate_id_token_claims,
+};
+use tgm_core::secret::Secret;
+use tokio::net::TcpListener;
+use tracing::Instrument;
+use utoipa::{IntoParams, OpenApi, ToSchema};
+
+use crate::bot_console::BotConsoleConfig;
+use crate::console_login::{ChallengeMaterial, decode_nonce, encode_nonce};
+use crate::pipeline::to_rule;
+use crate::qr_login_control::{Lookup, QrLoginStore, StartRejected, Touch, new_login_id};
+use crate::rule::{KeywordMatchType, RuleKeyword, keyword_matches_text};
+
+#[derive(Clone)]
+pub struct ControlPlaneState {
+    pool: PgPool,
+    auth_pool: Option<PgPool>,
+    bot_console_config: Option<BotConsoleConfig>,
+    oidc_config: Option<OidcConfig>,
+    oidc_states: Arc<OidcLoginStateStore>,
+    credential_intake: Option<CredentialIntake>,
+    qr_logins: Arc<QrLoginStore<QrLoginEntry>>,
+}
+
+/// 凭据录入所需的 KEK 与 Bot API 地址（ADR-0032）。
+///
+/// control-plane 的 KEK 只用 `wrap`：生产上它的 KMS 权限只有 `kms:Encrypt`，
+/// 启动期 `encrypt_only_self_test` 实测这一点。
+#[derive(Clone)]
+pub struct CredentialIntake {
+    pub kek: Arc<dyn Kek>,
+    pub bot_api_base_url: String,
+}
+
+#[derive(Clone)]
+pub struct OidcConfig {
+    pub bot_id: String,
+    pub client_secret: Arc<Secret<String>>,
+    pub signing_algorithm: OidcSigningAlgorithm,
+    pub redirect_url: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub issuer: String,
+    pub jwks_endpoint: String,
+}
+
+impl ControlPlaneState {
+    pub fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            auth_pool: None,
+            bot_console_config: None,
+            oidc_config: None,
+            oidc_states: Arc::new(OidcLoginStateStore::default()),
+            credential_intake: None,
+            qr_logins: Arc::new(QrLoginStore::default()),
+        }
+    }
+
+    pub fn with_auth_pool(pool: PgPool, auth_pool: PgPool) -> Self {
+        Self {
+            pool,
+            auth_pool: Some(auth_pool),
+            bot_console_config: None,
+            oidc_config: None,
+            oidc_states: Arc::new(OidcLoginStateStore::default()),
+            credential_intake: None,
+            qr_logins: Arc::new(QrLoginStore::default()),
+        }
+    }
+
+    pub fn with_auth_pool_and_bot(
+        pool: PgPool,
+        auth_pool: PgPool,
+        bot_console_config: BotConsoleConfig,
+    ) -> Self {
+        Self {
+            pool,
+            auth_pool: Some(auth_pool),
+            bot_console_config: Some(bot_console_config),
+            oidc_config: None,
+            oidc_states: Arc::new(OidcLoginStateStore::default()),
+            credential_intake: None,
+            qr_logins: Arc::new(QrLoginStore::default()),
+        }
+    }
+
+    pub fn with_auth_pool_and_bot_and_oidc(
+        pool: PgPool,
+        auth_pool: PgPool,
+        bot_console_config: BotConsoleConfig,
+        oidc_config: OidcConfig,
+    ) -> Self {
+        Self {
+            pool,
+            auth_pool: Some(auth_pool),
+            bot_console_config: Some(bot_console_config),
+            oidc_config: Some(oidc_config),
+            oidc_states: Arc::new(OidcLoginStateStore::default()),
+            credential_intake: None,
+            qr_logins: Arc::new(QrLoginStore::default()),
+        }
+    }
+
+    pub fn with_auth_pool_and_oidc(
+        pool: PgPool,
+        auth_pool: PgPool,
+        oidc_config: OidcConfig,
+    ) -> Self {
+        Self {
+            pool,
+            auth_pool: Some(auth_pool),
+            bot_console_config: None,
+            oidc_config: Some(oidc_config),
+            oidc_states: Arc::new(OidcLoginStateStore::default()),
+            credential_intake: None,
+            qr_logins: Arc::new(QrLoginStore::default()),
+        }
+    }
+
+    /// 启用 `POST /api/v1/identities/bot`。未调用时该端点 fail closed（500）。
+    pub fn with_credential_intake(mut self, intake: CredentialIntake) -> Self {
+        self.credential_intake = Some(intake);
+        self
+    }
+
+    pub(crate) fn app_pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub(crate) fn auth_pool(&self) -> Option<&PgPool> {
+        self.auth_pool.as_ref()
+    }
+
+    pub(crate) fn bot_console_config(&self) -> Option<&BotConsoleConfig> {
+        self.bot_console_config.as_ref()
+    }
+}
+
+pub const SESSION_COOKIE: &str = "tgm_session";
+pub const CSRF_COOKIE: &str = "tgm_csrf";
+pub const CSRF_HEADER: &str = "x-csrf-token";
+const OIDC_STATE_COOKIE: &str = "tgm_oidc_state";
+const OIDC_STATE_TTL_SECONDS: u64 = 600;
+const OIDC_STATE_CLEAR_COOKIE: &str =
+    "tgm_oidc_state=; Path=/auth/oidc/callback; Max-Age=0; HttpOnly; Secure; SameSite=Lax";
+const SESSION_CLEAR_COOKIE: &str =
+    "tgm_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax";
+const CSRF_CLEAR_COOKIE: &str = "tgm_csrf=; Path=/; Max-Age=0; Secure; SameSite=Lax";
+const OIDC_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const OIDC_MAX_TOKEN_BYTES: u64 = 256 * 1024;
+const OIDC_MAX_JWKS_BYTES: u64 = 1024 * 1024;
+const SESSION_TOKEN_LEN: usize = 32;
+const REQUEST_ID_HEADER: &str = "x-tgm-request-id";
+
+tokio::task_local! {
+    static REQUEST_ID: String;
+}
+
+pub const OIDC_AUTHORIZATION_ENDPOINT: &str = "https://oauth.telegram.org/auth";
+pub const OIDC_TOKEN_ENDPOINT: &str = "https://oauth.telegram.org/token";
+pub const OIDC_ISSUER: &str = "https://oauth.telegram.org";
+pub const OIDC_JWKS_ENDPOINT: &str = "https://oauth.telegram.org/.well-known/jwks.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HealthzResponse {
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HealthResponse {
+    pub pg: &'static str,
+    pub redis: &'static str,
+    pub mtproto: &'static str,
+    pub bot: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DashboardIdentityStatus {
+    pub online: i64,
+    pub offline: i64,
+    pub flood_wait: i64,
+    pub banned: i64,
+    pub unauthorized: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DashboardToday {
+    pub received: i64,
+    pub matched: i64,
+    pub delivered: i64,
+    pub failed: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DashboardResponse {
+    pub status: &'static str,
+    pub identities: DashboardIdentityStatus,
+    pub queue_depth: i64,
+    pub today: DashboardToday,
+    pub flood_wait_until: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct QrChallengeResponse {
+    pub nonce: String,
+    pub confirm_code: String,
+    pub expires_at: String,
+    pub deep_link: String,
+    pub qr_svg: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct QrChallengeStatusResponse {
+    pub state: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct IdentityListQuery {
+    pub kind: Option<String>,
+    pub status: Option<String>,
+    pub page: Option<String>,
+    pub per_page: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct IdentityResponse {
+    pub id: i64,
+    pub kind: String,
+    pub tg_user_id: Option<i64>,
+    pub display_name: Option<String>,
+    pub status: String,
+    pub flood_wait_until: Option<String>,
+}
+
+/// 提交 Bot Token。刻意不派生 `Debug`：token 明文不能经任何格式化路径出去。
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BotIdentityCreateRequest {
+    /// BotFather 发放的 token。只写不读：响应与审计都不回显。
+    pub token: String,
+}
+
+/// 发起 MTProto 用户账号 QR 登录。刻意不派生 `Debug`：`api_hash` 是租户凭据。
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QrLoginStartRequest {
+    /// 租户在 my.telegram.org 申请的 `api_id`（ADR-0013）。落库，worker 握手要用。
+    pub api_id: i32,
+    /// 与 `api_id` 配对的 `api_hash`。只在本次登录的内存里使用，不落库、不回显。
+    pub api_hash: String,
+    /// 租户同意的凭据代持授权文本版本，必须等于当前版本。
+    pub consent_text_version: String,
+    /// 带上时是对该 MTProto 身份重新授权；登录到的账号必须与它原来的账号一致。
+    pub identity_id: Option<i64>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct QrLoginStartResponse {
+    /// 32 字节随机数（base64url）。只对发起者本人有效。
+    pub login_id: String,
+    /// 当前一代二维码（SVG）。内含 bearer 凭据，响应带 `Cache-Control: no-store`。
+    pub qr_svg: String,
+    pub expires_at: String,
+}
+
+/// QR 登录轮询或提交密码后的状态。
+#[derive(Serialize, ToSchema)]
+pub struct QrLoginStatusResponse {
+    /// `pending` | `awaiting_password` | `confirmed` | `expired` | `failed`
+    pub status: String,
+    /// `pending` 时是当前一代二维码；token 轮换后内容会变。
+    pub qr_svg: Option<String>,
+    pub expires_at: Option<String>,
+    /// `awaiting_password` 时，上一次提交的密码是否被拒。
+    pub password_rejected: Option<bool>,
+    /// `confirmed` 时是落库后的身份。
+    pub identity: Option<IdentityResponse>,
+    /// `failed` 时的原因：`api_credential_rejected` | `account_already_registered` |
+    /// `account_mismatch` | `telegram_error`。
+    pub reason: Option<String>,
+}
+
+/// 提交 2FA 密码。刻意不派生 `Debug`。
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QrLoginPasswordRequest {
+    pub login_id: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, ToSchema)]
+pub struct IdentityPatchRequest {
+    pub proxy_url: Option<Option<String>>,
+    pub display_name: Option<Option<String>>,
+}
+
+impl<'de> Deserialize<'de> for IdentityPatchRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("identity patch must be a JSON object"))?;
+        let parse_field = |field: &str| -> Result<Option<Option<String>>, D::Error> {
+            match object.get(field) {
+                None => Ok(None),
+                Some(serde_json::Value::Null) => Ok(Some(None)),
+                Some(serde_json::Value::String(value)) => Ok(Some(Some(value.clone()))),
+                Some(_) => Err(D::Error::custom(format!(
+                    "{field} must be a string or null"
+                ))),
+            }
+        };
+        Ok(Self {
+            proxy_url: parse_field("proxy_url")?,
+            display_name: parse_field("display_name")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct IdentityListResponse {
+    pub items: Vec<IdentityResponse>,
+    pub page: i64,
+    pub per_page: i64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RuleListQuery {
+    pub enabled: Option<String>,
+    pub target_ref: Option<String>,
+    pub source_ref: Option<String>,
+    pub page: Option<String>,
+    pub per_page: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct KeywordListQuery {
+    pub q: Option<String>,
+    pub match_type: Option<String>,
+    pub category: Option<String>,
+    pub page: Option<String>,
+    pub per_page: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct KeywordResponse {
+    pub id: i64,
+    pub word: String,
+    pub match_type: String,
+    pub category: Option<String>,
+    pub priority: i32,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct KeywordListResponse {
+    pub items: Vec<KeywordResponse>,
+    pub page: i64,
+    pub per_page: i64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct KeywordCreateRequest {
+    pub word: String,
+    pub match_type: String,
+    pub category: Option<String>,
+    pub priority: i32,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub struct KeywordPatchRequest {
+    pub word: Option<String>,
+    pub match_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_nullable_patch")]
+    pub category: Option<Option<String>>,
+    pub priority: Option<i32>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct KeywordTestRequest {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct KeywordTestMatch {
+    pub id: i64,
+    pub word: String,
+    pub match_type: String,
+    pub category: Option<String>,
+    pub priority: i32,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct KeywordTestResponse {
+    pub text: String,
+    pub matches: Vec<KeywordTestMatch>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct KeywordImportRuleRequest {
+    pub source_ref: Option<i64>,
+    pub media_type: Option<String>,
+    pub target_ref: i64,
+    pub action: String,
+    pub priority: i32,
+    pub stop_processing: bool,
+    pub template: Option<String>,
+    pub enabled: bool,
+    pub conditions: Vec<RuleConditionRequest>,
+    pub replacements: Vec<RuleReplacementRequest>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct KeywordImportRequest {
+    pub keywords: Vec<KeywordCreateRequest>,
+    pub create_rules_with: Option<KeywordImportRuleRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct KeywordImportResponse {
+    pub items: Vec<KeywordResponse>,
+    pub rule_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct KeywordExportQuery {
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct KeywordExportResponse {
+    pub keywords: Vec<KeywordResponse>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RuleConditionRequest {
+    pub kind: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RuleReplacementRequest {
+    pub seq: i16,
+    pub pattern: String,
+    pub replacement: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RuleReplacementsRequest {
+    pub replacements: Vec<RuleReplacementRequest>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RuleReplacementTestRequest {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RuleReplacementCopyRequest {
+    pub from_rule: i64,
+    pub to_rules: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleReplacementCopyItem {
+    pub rule_id: i64,
+    pub version: i32,
+    pub semantic_changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleReplacementCopyResponse {
+    pub items: Vec<RuleReplacementCopyItem>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RuleCreateRequest {
+    pub keyword_id: i64,
+    pub source_ref: Option<i64>,
+    pub media_type: Option<String>,
+    pub target_ref: i64,
+    pub action: String,
+    pub priority: i32,
+    pub stop_processing: bool,
+    pub template: Option<String>,
+    pub enabled: bool,
+    pub conditions: Vec<RuleConditionRequest>,
+    pub replacements: Vec<RuleReplacementRequest>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub struct RulePatchRequest {
+    pub keyword_id: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_nullable_patch")]
+    pub source_ref: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_patch")]
+    pub media_type: Option<Option<String>>,
+    pub target_ref: Option<i64>,
+    pub action: Option<String>,
+    pub priority: Option<i32>,
+    pub stop_processing: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_nullable_patch")]
+    pub template: Option<Option<String>>,
+    pub enabled: Option<bool>,
+    pub conditions: Option<Vec<RuleConditionRequest>>,
+    pub replacements: Option<Vec<RuleReplacementRequest>>,
+}
+
+fn deserialize_nullable_patch<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RuleCopyRequest {
+    pub target_ref: i64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleResponse {
+    pub id: i64,
+    pub keyword_id: i64,
+    pub keyword: String,
+    pub keyword_match_type: String,
+    pub source_ref: Option<i64>,
+    pub media_type: Option<String>,
+    pub target_ref: i64,
+    pub target_tg_chat_id: i64,
+    pub sender_identity_id: i64,
+    pub action: String,
+    pub priority: i32,
+    pub stop_processing: bool,
+    pub template: Option<String>,
+    pub version: i32,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleConditionResponse {
+    pub kind: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleReplacementResponse {
+    pub seq: i16,
+    pub pattern: String,
+    pub replacement: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleReplacementListResponse {
+    pub items: Vec<RuleReplacementResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleReplacementStepResponse {
+    pub seq: i16,
+    pub pattern: String,
+    pub replacement: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleReplacementTestResponse {
+    pub original: String,
+    pub final_text: String,
+    pub steps: Vec<RuleReplacementStepResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleDetailResponse {
+    pub rule: RuleResponse,
+    pub conditions: Vec<RuleConditionResponse>,
+    pub replacements: Vec<RuleReplacementResponse>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RuleTestRequest {
+    pub text: String,
+    pub source_ref: Option<i64>,
+    pub media_type: Option<String>,
+    pub sender: Option<i64>,
+    pub file_name: Option<String>,
+    pub file_size: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleTestTraceResponse {
+    pub stage: String,
+    pub field: String,
+    pub pass: bool,
+    pub detail: Option<String>,
+    pub matched_at: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleTestRouteResponse {
+    pub target_ref: i64,
+    pub target_tg_chat_id: i64,
+    pub action: String,
+    pub rule_version: i32,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleTestResponse {
+    pub matched: bool,
+    pub trace: Vec<RuleTestTraceResponse>,
+    pub route: Option<RuleTestRouteResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleListResponse {
+    pub items: Vec<RuleResponse>,
+    pub page: i64,
+    pub per_page: i64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleVersionResponse {
+    pub rule_id: i64,
+    pub version: i32,
+    pub snapshot: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RuleVersionListResponse {
+    pub items: Vec<RuleVersionResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErrorDetails {
+    pub existing_id: Option<i64>,
+    pub reason: Option<String>,
+    pub affected_rule_ids: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErrorEnvelope {
+    pub code: String,
+    pub message: String,
+    pub details: Option<ErrorDetails>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErrorResponse {
+    pub error: ErrorEnvelope,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AuthMeResponse {
+    pub user_id: i64,
+    pub tenant_id: i64,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct WebSessionResponse {
+    pub id: String,
+    pub ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub login_method: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct WebSessionListResponse {
+    pub items: Vec<WebSessionResponse>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Authenticated(pub AuthContext);
+
+impl<S> FromRequestParts<S> for Authenticated
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let auth = parts
+            .extensions
+            .get::<AuthContext>()
+            .copied()
+            .map(Self)
+            .ok_or_else(|| ApiError::from(AppError::Unauthenticated))?;
+        record_tenant(auth.0);
+        Ok(auth)
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/auth/me",
+    responses(
+        (status = 200, description = "Current authenticated user", body = AuthMeResponse),
+        (status = 401, description = "Authentication is required", body = ErrorResponse)
+    )
+)]
+async fn auth_me(Authenticated(auth): Authenticated) -> Json<AuthMeResponse> {
+    Json(AuthMeResponse {
+        user_id: auth.actor_user_id(),
+        tenant_id: auth.tenant_id().get(),
+        role: auth.role().as_str().to_owned(),
+    })
+}
+
+#[utoipa::path(
+    post,
+    path = "/auth/logout",
+    responses(
+        (status = 204, description = "Current session revoked"),
+        (status = 401, description = "Authentication is required", body = ErrorResponse),
+        (status = 403, description = "CSRF token is invalid", body = ErrorResponse),
+        (status = 500, description = "Session revocation failed", body = ErrorResponse)
+    )
+)]
+async fn auth_logout(
+    State(state): State<ControlPlaneState>,
+    Authenticated(auth): Authenticated,
+) -> Result<Response, ApiError> {
+    let session_id = auth
+        .web_session_id()
+        .ok_or_else(|| AppError::Unauthenticated)?;
+    let auth_pool = state.auth_pool.as_ref().ok_or_else(|| {
+        AppError::internal(std::io::Error::other("auth lookup pool is not configured"))
+    })?;
+    tgm_db::repo::delete_web_session(auth_pool, &session_id)
+        .await
+        .map_err(AppError::Db)?;
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_static(SESSION_CLEAR_COOKIE),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_static(CSRF_CLEAR_COOKIE),
+    );
+    Ok(response)
+}
+
+#[utoipa::path(
+    get,
+    path = "/auth/sessions",
+    responses(
+        (status = 200, description = "Own active sessions; ids are non-bearer references", body = WebSessionListResponse),
+        (status = 401, description = "Authentication is required", body = ErrorResponse),
+        (status = 500, description = "Session lookup failed", body = ErrorResponse)
+    )
+)]
+async fn auth_sessions(
+    State(state): State<ControlPlaneState>,
+    Authenticated(auth): Authenticated,
+) -> Result<Json<WebSessionListResponse>, ApiError> {
+    let session_id = auth.web_session_id().ok_or(AppError::Unauthenticated)?;
+    let auth_pool = state.auth_pool.as_ref().ok_or_else(|| {
+        AppError::internal(std::io::Error::other("auth lookup pool is not configured"))
+    })?;
+    let sessions = tgm_db::repo::list_web_sessions(auth_pool, auth.actor_user_id(), &session_id)
+        .await
+        .map_err(AppError::Db)?;
+    Ok(Json(WebSessionListResponse {
+        items: sessions
+            .into_iter()
+            .map(|session| WebSessionResponse {
+                id: URL_SAFE_NO_PAD.encode(session.reference),
+                ip: session.ip,
+                user_agent: session.user_agent,
+                login_method: session.login_method,
+                created_at: session.created_at.to_rfc3339(),
+                expires_at: session.expires_at.to_rfc3339(),
+                is_current: session.is_current,
+            })
+            .collect(),
+    }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/auth/sessions/{id}",
+    params(("id" = String, Path, description = "URL-safe non-bearer session reference from the session list")),
+    responses(
+        (status = 204, description = "Session revoked or unavailable"),
+        (status = 400, description = "Invalid session reference", body = ErrorResponse),
+        (status = 401, description = "Authentication is required", body = ErrorResponse),
+        (status = 403, description = "CSRF token is invalid", body = ErrorResponse),
+        (status = 500, description = "Session revocation failed", body = ErrorResponse)
+    )
+)]
+async fn auth_revoke_session(
+    State(state): State<ControlPlaneState>,
+    Authenticated(auth): Authenticated,
+    Path(reference): Path<String>,
+) -> Result<Response, ApiError> {
+    let session_id = auth.web_session_id().ok_or(AppError::Unauthenticated)?;
+    if reference.len() != SESSION_TOKEN_LEN * 4 / 3 + 1 {
+        return Err(AppError::ConditionInvalid("invalid session reference".to_owned()).into());
+    }
+    let reference = decode_token(&reference)
+        .and_then(|value| <[u8; SESSION_TOKEN_LEN]>::try_from(value.as_slice()).ok())
+        .ok_or_else(|| AppError::ConditionInvalid("invalid session reference".to_owned()))?;
+    let auth_pool = state.auth_pool.as_ref().ok_or_else(|| {
+        AppError::internal(std::io::Error::other("auth lookup pool is not configured"))
+    })?;
+    tgm_db::repo::revoke_web_session(auth_pool, auth.actor_user_id(), &reference)
+        .await
+        .map_err(AppError::Db)?;
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    if reference == tgm_db::repo::web_session_reference(&session_id) {
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_static(SESSION_CLEAR_COOKIE),
+        );
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_static(CSRF_CLEAR_COOKIE),
+        );
+    }
+    Ok(response)
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let header = headers.get(header::COOKIE)?.to_str().ok()?;
+    header.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key == name).then(|| value.to_owned())
+    })
+}
+
+fn decode_token(value: &str) -> Option<Vec<u8>> {
+    let decoded = URL_SAFE_NO_PAD.decode(value).ok()?;
+    (decoded.len() == SESSION_TOKEN_LEN).then_some(decoded)
+}
+
+fn unsafe_method(method: &axum::http::Method) -> bool {
+    !matches!(
+        *method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    )
+}
+
+fn request_origin_ip(headers: &HeaderMap) -> String {
+    let candidate = headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| value.parse::<IpAddr>().is_ok());
+    candidate.unwrap_or("0.0.0.0").to_owned()
+}
+
+#[utoipa::path(
+    get,
+    path = "/auth/oidc/start",
+    responses(
+        (status = 302, description = "Redirect to Telegram OIDC authorization endpoint"),
+        (status = 501, description = "OIDC is not configured"),
+        (status = 500, description = "OIDC configuration or challenge generation failed", body = ErrorResponse)
+    )
+)]
+async fn start_oidc_login(State(state): State<ControlPlaneState>) -> Result<Response, ApiError> {
+    let Some(config) = state.oidc_config.as_ref() else {
+        return Ok(StatusCode::NOT_IMPLEMENTED.into_response());
+    };
+    let material = OidcLoginMaterial::generate().map_err(AppError::internal)?;
+    let authorization_url = material.authorization_url(
+        &config.authorization_endpoint,
+        &config.bot_id,
+        &config.redirect_url,
+    );
+    let state_value = material.state().to_owned();
+    state.oidc_states.remember(material);
+    let location = HeaderValue::from_str(&authorization_url).map_err(|error| {
+        AppError::internal(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            error.to_string(),
+        ))
+    })?;
+    let mut response = StatusCode::FOUND.into_response();
+    response.headers_mut().insert(header::LOCATION, location);
+    let state_cookie = format!(
+        "{OIDC_STATE_COOKIE}={}; Path=/auth/oidc/callback; Max-Age={OIDC_STATE_TTL_SECONDS}; HttpOnly; Secure; SameSite=Lax",
+        state_value
+    );
+    let state_cookie = HeaderValue::from_str(&state_cookie).map_err(|error| {
+        AppError::internal(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            error.to_string(),
+        ))
+    })?;
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, state_cookie);
+    Ok(response)
+}
+
+#[utoipa::path(
+    get,
+    path = "/auth/oidc/callback",
+    params(OidcCallbackQuery),
+    responses(
+        (status = 403, description = "OIDC state binding is invalid", body = ErrorResponse),
+        (status = 400, description = "OIDC callback parameters are invalid", body = ErrorResponse),
+        (status = 403, description = "OIDC identity is not an unambiguous tenant member", body = ErrorResponse),
+        (status = 503, description = "OIDC provider is unavailable; retry the login", body = ErrorResponse),
+        (status = 500, description = "OIDC session issuance failed", body = ErrorResponse)
+    )
+)]
+async fn oidc_callback(
+    State(state): State<ControlPlaneState>,
+    headers: HeaderMap,
+    Query(query): Query<OidcCallbackQuery>,
+) -> Result<Response, ApiError> {
+    let browser_state = cookie_value(&headers, OIDC_STATE_COOKIE)
+        .ok_or_else(|| oidc_csrf_rejected("missing_state_cookie"))?;
+    let returned_state = query
+        .state
+        .as_deref()
+        .ok_or_else(|| oidc_csrf_rejected("missing_returned_state"))?;
+    let material = state
+        .oidc_states
+        .take_if_bound(returned_state, &browser_state)
+        .ok_or_else(|| oidc_csrf_rejected("state_binding_mismatch_or_expired"))?;
+
+    let clear_cookie = || OIDC_STATE_CLEAR_COOKIE;
+    if query.error.is_some() {
+        let mut response = ApiError::from(AppError::ConditionInvalid(
+            "OIDC authorization was denied".to_owned(),
+        ))
+        .into_response();
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, HeaderValue::from_static(clear_cookie()));
+        return Ok(response);
+    }
+    if query.code.as_deref().is_none_or(str::is_empty) {
+        let mut response = ApiError::from(AppError::ConditionInvalid(
+            "OIDC callback code is missing".to_owned(),
+        ))
+        .into_response();
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, HeaderValue::from_static(clear_cookie()));
+        return Ok(response);
+    }
+
+    let config = match state.oidc_config.as_ref() {
+        Some(config) => config,
+        None => {
+            return oidc_error_response(AppError::internal(std::io::Error::other(
+                "OIDC configuration is not configured",
+            )));
+        }
+    };
+    let code = query
+        .code
+        .as_deref()
+        .ok_or_else(|| AppError::ConditionInvalid("OIDC callback code is missing".to_owned()))?;
+    let id_token = match exchange_oidc_code(config, code, &material).await {
+        Ok(id_token) => id_token,
+        Err(error) => return oidc_error_response(error),
+    };
+    if let Err(error) = OidcTokenHeader::parse_and_validate(&id_token, config.signing_algorithm) {
+        return oidc_error_response(oidc_header_rejected(error));
+    }
+    let jwks = match fetch_oidc_jwks(config).await {
+        Ok(jwks) => jwks,
+        Err(error) => return oidc_error_response(error),
+    };
+    let user_id = match validate_oidc_id_token(&id_token, config, &material, &jwks) {
+        Ok(user_id) => user_id,
+        Err(error) => return oidc_error_response(error),
+    };
+    let auth_pool = match state.auth_pool.as_ref() {
+        Some(pool) => pool,
+        None => {
+            return oidc_error_response(AppError::internal(std::io::Error::other(
+                "auth lookup pool is not configured",
+            )));
+        }
+    };
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    let issue = match tgm_db::repo::issue_web_session_for_user(
+        auth_pool,
+        user_id,
+        &request_origin_ip(&headers),
+        user_agent,
+        tgm_db::repo::WebSessionLoginMethod::Oidc,
+    )
+    .await
+    {
+        Ok(issue) => issue,
+        Err(error) => return oidc_error_response(AppError::internal(error)),
+    };
+    let Some(issue) = issue else {
+        return oidc_error_response(AppError::NotInvited);
+    };
+    let session_cookie = format!(
+        "{SESSION_COOKIE}={}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax",
+        URL_SAFE_NO_PAD.encode(issue.session_id)
+    );
+    let csrf_cookie = format!(
+        "{CSRF_COOKIE}={}; Path=/; Max-Age=2592000; Secure; SameSite=Lax",
+        URL_SAFE_NO_PAD.encode(issue.csrf_token)
+    );
+    let mut response = StatusCode::FOUND.into_response();
+    response
+        .headers_mut()
+        .insert(header::LOCATION, HeaderValue::from_static("/"));
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_static(OIDC_STATE_CLEAR_COOKIE),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&session_cookie).map_err(|error| {
+            AppError::internal(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                error.to_string(),
+            ))
+        })?,
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&csrf_cookie).map_err(|error| {
+            AppError::internal(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                error.to_string(),
+            ))
+        })?,
+    );
+    Ok(response)
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcTokenResponse {
+    id_token: Option<String>,
+}
+
+fn oidc_http_client() -> Result<reqwest::Client, AppError> {
+    reqwest::Client::builder()
+        .redirect(Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(OIDC_HTTP_TIMEOUT)
+        .build()
+        .map_err(AppError::internal)
+}
+
+fn oidc_authentication_failed(stage: &'static str, reason: &'static str) -> AppError {
+    let request_id = REQUEST_ID.try_with(Clone::clone).ok();
+    tracing::warn!(stage, reason, ?request_id, "OIDC authentication rejected");
+    AppError::ConditionInvalid("OIDC authentication failed".to_owned())
+}
+
+fn oidc_csrf_rejected(reason: &'static str) -> AppError {
+    let request_id = REQUEST_ID.try_with(Clone::clone).ok();
+    tracing::warn!(
+        stage = "csrf",
+        reason,
+        ?request_id,
+        "OIDC callback rejected"
+    );
+    AppError::CsrfInvalid
+}
+
+fn oidc_header_rejected(error: tgm_core::oidc::OidcTokenHeaderError) -> AppError {
+    use tgm_core::oidc::OidcTokenHeaderError;
+
+    let reason = match error {
+        OidcTokenHeaderError::InvalidStructure => "invalid_structure",
+        OidcTokenHeaderError::InvalidEncoding => "invalid_encoding",
+        OidcTokenHeaderError::InvalidJson => "invalid_json",
+        OidcTokenHeaderError::MissingAlgorithm => "missing_algorithm",
+        OidcTokenHeaderError::MissingKeyId => "missing_key_id",
+        OidcTokenHeaderError::Algorithm(_) => "algorithm_mismatch",
+    };
+    oidc_authentication_failed("token_header", reason)
+}
+
+fn oidc_provider_unavailable(stage: &'static str, reason: &'static str) -> AppError {
+    let request_id = REQUEST_ID.try_with(Clone::clone).ok();
+    tracing::warn!(stage, reason, ?request_id, "OIDC provider request failed");
+    AppError::OidcProviderUnavailable
+}
+
+fn oidc_error_response(error: AppError) -> Result<Response, ApiError> {
+    let mut response = ApiError::from(error).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static(OIDC_STATE_CLEAR_COOKIE),
+    );
+    Ok(response)
+}
+
+async fn exchange_oidc_code(
+    config: &OidcConfig,
+    code: &str,
+    material: &OidcLoginMaterial,
+) -> Result<String, AppError> {
+    let client = oidc_http_client()?;
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("client_id", config.bot_id.as_str()),
+        ("redirect_uri", config.redirect_url.as_str()),
+        ("code_verifier", material.code_verifier()),
+    ];
+    let response = client
+        .post(&config.token_endpoint)
+        .basic_auth(&config.bot_id, Some(config.client_secret.expose().as_str()))
+        .form(&form)
+        .send()
+        .await
+        .map_err(|_| oidc_provider_unavailable("token", "transport"))?;
+    if response.status().is_server_error()
+        || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        return Err(oidc_provider_unavailable("token", "overloaded"));
+    }
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = read_response_body(response, OIDC_MAX_TOKEN_BYTES)
+            .await
+            .map_err(|_| oidc_provider_unavailable("token", "body_read_or_size"))?;
+        let error = serde_json::from_slice::<serde_json::Value>(&body).ok();
+        let reason = match error
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("invalid_client") => "invalid_client",
+            Some("invalid_grant") => "invalid_grant",
+            Some("invalid_request") => "invalid_request",
+            Some("unauthorized_client") => "unauthorized_client",
+            Some("unsupported_grant_type") => "unsupported_grant_type",
+            Some("invalid_scope") => "invalid_scope",
+            _ => "provider_rejected",
+        };
+        tracing::warn!(
+            stage = "token",
+            status,
+            reason,
+            "OIDC token endpoint rejected request"
+        );
+        return Err(oidc_authentication_failed("token", reason));
+    }
+    let body = read_response_body(response, OIDC_MAX_TOKEN_BYTES)
+        .await
+        .map_err(|_| oidc_provider_unavailable("token", "body_read_or_size"))?;
+    let token = serde_json::from_slice::<OidcTokenResponse>(&body)
+        .map_err(|_| oidc_authentication_failed("token", "invalid_response_json"))?;
+    token
+        .id_token
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| oidc_authentication_failed("token", "missing_id_token"))
+}
+
+async fn fetch_oidc_jwks(config: &OidcConfig) -> Result<JwkSet, AppError> {
+    let client = oidc_http_client()?;
+    let response = client
+        .get(&config.jwks_endpoint)
+        .send()
+        .await
+        .map_err(|_| oidc_provider_unavailable("jwks", "transport"))?;
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|length| length > OIDC_MAX_JWKS_BYTES)
+    {
+        return Err(oidc_provider_unavailable("jwks", "status_or_size"));
+    }
+    let body = read_response_body(response, OIDC_MAX_JWKS_BYTES)
+        .await
+        .map_err(|_| oidc_provider_unavailable("jwks", "body_read_or_size"))?;
+    JwkSet::from_bytes(body).map_err(|_| oidc_provider_unavailable("jwks", "invalid_key_set"))
+}
+
+async fn read_response_body(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>, AppError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(AppError::internal)? {
+        if body.len() as u64 + chunk.len() as u64 > max_bytes {
+            return Err(AppError::internal(std::io::Error::other(
+                "OIDC provider response is too large",
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn validate_jwk_metadata(
+    jwk: &josekit::jwk::Jwk,
+    algorithm: OidcSigningAlgorithm,
+) -> Result<(), AppError> {
+    if jwk.key_use().is_some_and(|value| value != "sig")
+        || jwk
+            .key_operations()
+            .is_some_and(|operations| !operations.contains(&"verify"))
+        || jwk
+            .algorithm()
+            .is_some_and(|value| value != algorithm.as_str())
+    {
+        return Err(oidc_authentication_failed(
+            "verification",
+            "invalid_key_metadata",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_oidc_id_token(
+    id_token: &str,
+    config: &OidcConfig,
+    jwks: &JwkSet,
+) -> Result<JwtPayload, AppError> {
+    let token_header = OidcTokenHeader::parse_and_validate(id_token, config.signing_algorithm)
+        .map_err(oidc_header_rejected)?;
+    let keys = jwks.get(token_header.key_id());
+    let Some(jwk) = (keys.len() == 1).then(|| keys[0]) else {
+        return Err(oidc_provider_unavailable("verification", "key_not_unique"));
+    };
+    validate_jwk_metadata(jwk, config.signing_algorithm)?;
+    let payload = match config.signing_algorithm {
+        OidcSigningAlgorithm::Rs256 => {
+            let verifier = RS256
+                .verifier_from_jwk(jwk)
+                .map_err(|_| oidc_authentication_failed("verification", "invalid_key"))?;
+            jwt::decode_with_verifier(id_token, &verifier)
+        }
+        OidcSigningAlgorithm::Es256 => {
+            let verifier = ES256
+                .verifier_from_jwk(jwk)
+                .map_err(|_| oidc_authentication_failed("verification", "invalid_key"))?;
+            jwt::decode_with_verifier(id_token, &verifier)
+        }
+    }
+    .map_err(|_| oidc_authentication_failed("verification", "invalid_signature_or_payload"))?;
+    Ok(payload.0)
+}
+
+fn validate_oidc_id_token(
+    id_token: &str,
+    config: &OidcConfig,
+    material: &OidcLoginMaterial,
+    jwks: &JwkSet,
+) -> Result<i64, AppError> {
+    let payload = decode_oidc_id_token(id_token, config, jwks)?;
+    let issuer = payload
+        .issuer()
+        .ok_or_else(|| oidc_authentication_failed("claims", "missing_issuer"))?;
+    let audiences = payload
+        .audience()
+        .ok_or_else(|| oidc_authentication_failed("claims", "invalid_audience"))?;
+    if payload
+        .claim("azp")
+        .is_some_and(|value| value.as_str() != Some(config.bot_id.as_str()))
+        || (audiences.len() > 1
+            && payload.claim("azp").and_then(serde_json::Value::as_str)
+                != Some(config.bot_id.as_str()))
+    {
+        return Err(oidc_authentication_failed(
+            "claims",
+            "invalid_authorized_party",
+        ));
+    }
+    let subject = payload
+        .subject()
+        .ok_or_else(|| oidc_authentication_failed("claims", "missing_subject"))?;
+    let telegram_user_id = payload.claim("id").and_then(|value| match value {
+        serde_json::Value::Number(value) => value.as_i64(),
+        serde_json::Value::String(value)
+            if !value.is_empty()
+                && value.len() <= 19
+                && !value.starts_with('0')
+                && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            value.parse::<i64>().ok()
+        }
+        _ => None,
+    });
+    let nonce = payload
+        .claim("nonce")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| oidc_authentication_failed("claims", "missing_nonce"))?;
+    let exp = payload
+        .claim("exp")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| oidc_authentication_failed("claims", "invalid_expiry"))?;
+    let claims = OidcIdTokenClaims::new(issuer, &audiences, subject, telegram_user_id, nonce, exp);
+    validate_id_token_claims(
+        &claims,
+        &config.issuer,
+        &config.bot_id,
+        Utc::now().timestamp(),
+        material,
+    )
+    .map_err(|error| {
+        let reason = match error {
+            OidcClaimsError::IssuerMismatch => "issuer_mismatch",
+            OidcClaimsError::AudienceMismatch => "audience_mismatch",
+            OidcClaimsError::Expired => "expired",
+            OidcClaimsError::InvalidSubject => "invalid_subject",
+            OidcClaimsError::InvalidUserId => match payload.claim("id") {
+                None => "telegram_id_missing",
+                Some(serde_json::Value::Null) => "telegram_id_null",
+                Some(serde_json::Value::String(_)) => "telegram_id_invalid_string",
+                Some(serde_json::Value::Number(value)) if value.as_i64().is_some() => {
+                    "telegram_id_nonpositive"
+                }
+                Some(serde_json::Value::Number(value)) if value.as_u64().is_some() => {
+                    "telegram_id_overflow"
+                }
+                Some(serde_json::Value::Number(_)) => "telegram_id_not_integer",
+                Some(serde_json::Value::Bool(_)) => "telegram_id_boolean",
+                Some(serde_json::Value::Array(_)) => "telegram_id_array",
+                Some(serde_json::Value::Object(_)) => "telegram_id_object",
+            },
+            OidcClaimsError::Nonce(_) => "nonce_mismatch",
+        };
+        oidc_authentication_failed("claims", reason)
+    })
+}
+
+async fn no_store_sensitive_auth(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct OidcCallbackQuery {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub error: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/auth/qr/challenge",
+    responses(
+        (status = 201, description = "Console QR challenge created", body = QrChallengeResponse),
+        (status = 500, description = "Challenge creation failed", body = ErrorResponse)
+    )
+)]
+async fn create_qr_challenge(
+    State(state): State<ControlPlaneState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<QrChallengeResponse>), ApiError> {
+    let auth_pool = state.auth_pool.as_ref().ok_or_else(|| {
+        AppError::internal(std::io::Error::other("auth lookup pool is not configured"))
+    })?;
+    let config = state.bot_console_config.as_ref().ok_or_else(|| {
+        AppError::internal(std::io::Error::other("control bot is not configured"))
+    })?;
+    let material = ChallengeMaterial::generate().map_err(AppError::internal)?;
+    let expires_at = Utc::now() + Duration::from_secs(120);
+    let encoded_nonce = encode_nonce(material.nonce());
+    let deep_link = format!(
+        "https://t.me/{}?start=login_{encoded_nonce}",
+        config.bot_username
+    );
+    let qr_svg = render_qr_svg(&Secret::new(deep_link.clone()))?;
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    tgm_db::repo::create_console_login_challenge(
+        auth_pool,
+        material.nonce(),
+        material.confirm_code(),
+        &request_origin_ip(&headers),
+        user_agent.as_deref(),
+        expires_at,
+    )
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(QrChallengeResponse {
+            nonce: encoded_nonce.clone(),
+            confirm_code: material.confirm_code().to_owned(),
+            expires_at: expires_at.to_rfc3339(),
+            deep_link,
+            qr_svg,
+        }),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/auth/qr/challenge/{nonce}",
+    params(("nonce" = String, Path, description = "URL-safe base64 challenge nonce")),
+    responses(
+        (status = 200, description = "Challenge status", body = QrChallengeStatusResponse),
+        (status = 404, description = "Challenge not found", body = ErrorResponse),
+        (status = 500, description = "Challenge lookup failed", body = ErrorResponse)
+    )
+)]
+async fn get_qr_challenge(
+    State(state): State<ControlPlaneState>,
+    Path(encoded_nonce): Path<String>,
+) -> Result<Response, ApiError> {
+    let auth_pool = state.auth_pool.as_ref().ok_or_else(|| {
+        AppError::internal(std::io::Error::other("auth lookup pool is not configured"))
+    })?;
+    let nonce = decode_nonce(&encoded_nonce).ok_or(AppError::NotFound)?;
+    let Some(mut challenge) = tgm_db::repo::load_console_login_challenge(auth_pool, &nonce)
+        .await
+        .map_err(AppError::internal)?
+    else {
+        return Err(AppError::NotFound.into());
+    };
+    if matches!(challenge.state.as_str(), "pending" | "awaiting_confirm")
+        && challenge.expires_at <= Utc::now()
+    {
+        let _ = tgm_db::repo::expire_console_login_challenge(auth_pool, &nonce)
+            .await
+            .map_err(AppError::internal)?;
+        if let Some(expired) = tgm_db::repo::load_console_login_challenge(auth_pool, &nonce)
+            .await
+            .map_err(AppError::internal)?
+        {
+            challenge = expired;
+        }
+    }
+    let mut issued = None;
+    if challenge.state == "confirmed" {
+        issued = tgm_db::repo::consume_confirmed_console_login_challenge(auth_pool, &nonce)
+            .await
+            .map_err(AppError::internal)?;
+        if issued.is_none() {
+            if let Some(current) = tgm_db::repo::load_console_login_challenge(auth_pool, &nonce)
+                .await
+                .map_err(AppError::internal)?
+            {
+                challenge = current;
+            } else {
+                challenge.state = "rejected".to_owned();
+            }
+        }
+    }
+    let mut response = Json(QrChallengeStatusResponse {
+        state: challenge.state,
+        expires_at: challenge.expires_at.to_rfc3339(),
+    })
+    .into_response();
+    if let Some(issue) = issued {
+        let session_cookie = format!(
+            "{SESSION_COOKIE}={}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax",
+            URL_SAFE_NO_PAD.encode(issue.session_id)
+        );
+        let csrf_cookie = format!(
+            "{CSRF_COOKIE}={}; Path=/; Max-Age=2592000; Secure; SameSite=Lax",
+            URL_SAFE_NO_PAD.encode(issue.csrf_token)
+        );
+        let headers = response.headers_mut();
+        headers.append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&session_cookie).map_err(|error| {
+                AppError::internal(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    error.to_string(),
+                ))
+            })?,
+        );
+        headers.append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&csrf_cookie).map_err(|error| {
+                AppError::internal(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    error.to_string(),
+                ))
+            })?,
+        );
+    }
+    Ok(response)
+}
+
+async fn authenticate_request(
+    State(state): State<ControlPlaneState>,
+    mut request: axum::http::Request<Body>,
+    next: Next,
+) -> Response {
+    if let Some(auth) = request.extensions().get::<AuthContext>().copied() {
+        record_tenant(auth);
+        if let Err(error) = check_tenant_request(
+            &state.pool,
+            auth,
+            request.uri().path().to_owned(),
+            unsafe_method(request.method()),
+        )
+        .await
+        {
+            close_logins(state.qr_logins.remove_tenant(auth.tenant_id().get()));
+            return ApiError::from(error).into_response();
+        }
+        return next.run(request).await;
+    }
+
+    let Some(auth_pool) = state.auth_pool.as_ref() else {
+        return next.run(request).await;
+    };
+    let Some(session_cookie) = cookie_value(request.headers(), SESSION_COOKIE) else {
+        return next.run(request).await;
+    };
+    let Some(session_id) = decode_token(&session_cookie) else {
+        return next.run(request).await;
+    };
+
+    let session = match tgm_db::repo::load_web_session(auth_pool, &session_id).await {
+        Ok(session) => session,
+        Err(error) => return ApiError::from(AppError::Db(error)).into_response(),
+    };
+    let Some(session) = session else {
+        return next.run(request).await;
+    };
+
+    if unsafe_method(request.method()) {
+        let Some(csrf_cookie) =
+            cookie_value(request.headers(), CSRF_COOKIE).and_then(|value| decode_token(&value))
+        else {
+            return ApiError::from(AppError::CsrfInvalid).into_response();
+        };
+        let Some(csrf_header) = request
+            .headers()
+            .get(CSRF_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(decode_token)
+        else {
+            return ApiError::from(AppError::CsrfInvalid).into_response();
+        };
+        if csrf_cookie != session.csrf_token || csrf_header != session.csrf_token {
+            return ApiError::from(AppError::CsrfInvalid).into_response();
+        }
+    }
+
+    let Some(role) = TenantRole::parse(&session.role) else {
+        return ApiError::from(AppError::Unauthenticated).into_response();
+    };
+    let Ok(session_id) = <[u8; SESSION_TOKEN_LEN]>::try_from(session_id.as_slice()) else {
+        return next.run(request).await;
+    };
+    request.extensions_mut().insert(
+        AuthContext::new(session.tenant_id, session.user_id, role, AuthSource::Web)
+            .with_web_session_id(session_id),
+    );
+    if let Some(auth) = request.extensions().get::<AuthContext>().copied() {
+        record_tenant(auth);
+    }
+    if let Some(auth) = request.extensions().get::<AuthContext>().copied()
+        && let Err(error) = check_tenant_request(
+            &state.pool,
+            auth,
+            request.uri().path().to_owned(),
+            unsafe_method(request.method()),
+        )
+        .await
+    {
+        close_logins(state.qr_logins.remove_tenant(auth.tenant_id().get()));
+        return ApiError::from(error).into_response();
+    }
+    next.run(request).await
+}
+
+fn record_tenant(auth: AuthContext) {
+    tracing::Span::current().record("tenant_id", auth.tenant_id().get());
+}
+
+async fn request_context(request: axum::http::Request<Body>, next: Next) -> Response {
+    let mut random = [0_u8; 16];
+    if let Err(error) = getrandom::fill(&mut random) {
+        tracing::error!(error = %error, "failed to generate request id");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let request_id = URL_SAFE_NO_PAD.encode(random);
+    let method = request.method().as_str().to_owned();
+    let span = tracing::info_span!(
+        "http.request",
+        request_id = %request_id,
+        http_method = %method,
+        tenant_id = tracing::field::Empty,
+    );
+    REQUEST_ID
+        .scope(request_id.clone(), async move {
+            let mut response = next.run(request).await;
+            if let Ok(value) = HeaderValue::from_str(&request_id) {
+                response.headers_mut().insert(REQUEST_ID_HEADER, value);
+            }
+            tracing::info!(
+                http_status_code = response.status().as_u16(),
+                "request completed"
+            );
+            response
+        })
+        .instrument(span)
+        .await
+}
+
+async fn check_tenant_request(
+    pool: &PgPool,
+    auth: AuthContext,
+    path: String,
+    unsafe_request: bool,
+) -> Result<(), AppError> {
+    if path == "/auth/logout" || path == "/auth/sessions" || path.starts_with("/auth/sessions/") {
+        return Ok(());
+    }
+    if !tgm_db::lifecycle::readable(pool, auth.tenant_id()).await? {
+        return Err(AppError::Forbidden);
+    }
+    if unsafe_request && !tgm_db::lifecycle::is_active(pool, auth.tenant_id()).await? {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SourceListQuery {
+    pub status: Option<String>,
+    pub identity_id: Option<String>,
+    pub q: Option<String>,
+    pub page: Option<String>,
+    pub per_page: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct TargetChannelListQuery {
+    pub page: Option<String>,
+    pub per_page: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SourceSubscriptionResponse {
+    pub id: i64,
+    pub tg_chat_id: i64,
+    pub title: Option<String>,
+    pub username: Option<String>,
+    pub receiver_identity_id: i64,
+    pub enabled: bool,
+    pub discovered: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SourceListResponse {
+    pub items: Vec<SourceSubscriptionResponse>,
+    pub page: i64,
+    pub per_page: i64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct SourceCreateRequest {
+    pub chat: String,
+    pub receiver_identity_id: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct SourceUpdateRequest {
+    pub enabled: Option<bool>,
+    pub receiver_identity_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TargetChannelResponse {
+    pub id: i64,
+    pub tg_chat_id: i64,
+    pub title: Option<String>,
+    pub sender_identity_id: i64,
+    pub can_send: Option<bool>,
+    pub checked_at: Option<String>,
+    pub enabled: bool,
+    pub probe: TargetProbeResponse,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TargetProbeResponse {
+    pub generation: i64,
+    pub state: String,
+    pub can_send: Option<bool>,
+    pub content_protected: Option<bool>,
+    pub bot_role: Option<String>,
+    pub checked_at: Option<String>,
+    pub error_code: Option<String>,
+}
+
+fn probe_response(record: tgm_db::target_probe::TargetProbe) -> TargetProbeResponse {
+    TargetProbeResponse {
+        generation: record.generation,
+        state: record.state,
+        can_send: record.can_send,
+        content_protected: record.content_protected,
+        bot_role: record.bot_role,
+        checked_at: record.checked_at.map(format_timestamp),
+        error_code: record.error_code,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TargetChannelListResponse {
+    pub items: Vec<TargetChannelResponse>,
+    pub page: i64,
+    pub per_page: i64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct TargetChannelCreateRequest {
+    pub chat: String,
+    pub title: Option<String>,
+    pub sender_identity_id: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub struct TargetChannelPatchRequest {
+    pub chat: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_nullable_patch")]
+    pub title: Option<Option<String>>,
+    pub sender_identity_id: Option<i64>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct TaskListQuery {
+    pub status: Option<String>,
+    pub target_ref: Option<String>,
+    pub since: Option<String>,
+    pub page: Option<String>,
+    pub per_page: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DeliveryTaskResponse {
+    pub id: i64,
+    pub tenant_event_id: Option<i64>,
+    pub rule_id: Option<i64>,
+    pub rule_version: Option<i32>,
+    pub target_ref: Option<i64>,
+    pub target_tg_chat_id: i64,
+    pub sender_identity_id: i64,
+    pub action: String,
+    pub status: String,
+    pub attempt_count: i32,
+    pub next_retry_at: Option<String>,
+    pub last_error_code: Option<String>,
+    pub telegram_message_id: Option<i64>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DeliveryLogResponse {
+    pub id: i64,
+    pub task_id: i64,
+    pub attempt: i32,
+    pub ok: bool,
+    pub error_code: Option<String>,
+    pub error_msg: Option<String>,
+    pub latency_ms: Option<i32>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TaskListResponse {
+    pub items: Vec<DeliveryTaskResponse>,
+    pub page: i64,
+    pub per_page: i64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TaskDetailResponse {
+    pub task: DeliveryTaskResponse,
+    pub delivery_logs: Vec<DeliveryLogResponse>,
+    pub rule_snapshot: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct AuditLogListQuery {
+    pub actor: Option<String>,
+    pub source: Option<String>,
+    pub since: Option<String>,
+    pub page: Option<String>,
+    pub per_page: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SystemLogListQuery {
+    pub level: Option<String>,
+    pub module: Option<String>,
+    pub page: Option<String>,
+    pub per_page: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AuditLogResponse {
+    pub id: i64,
+    pub actor_user_id: Option<i64>,
+    pub action: String,
+    pub resource: String,
+    pub resource_id: Option<i64>,
+    pub before: Option<serde_json::Value>,
+    pub after: Option<serde_json::Value>,
+    pub source: String,
+    pub ip: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AuditLogListResponse {
+    pub items: Vec<AuditLogResponse>,
+    pub page: i64,
+    pub per_page: i64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SystemLogResponse {
+    pub id: i64,
+    pub level: String,
+    pub module: String,
+    pub event: String,
+    pub context: Option<serde_json::Value>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SystemLogListResponse {
+    pub items: Vec<SystemLogResponse>,
+    pub page: i64,
+    pub per_page: i64,
+    pub has_more: bool,
+}
+
+#[derive(Debug)]
+pub struct ApiError(AppError);
+
+impl From<AppError> for ApiError {
+    fn from(error: AppError) -> Self {
+        Self(error)
+    }
+}
+
+impl ApiError {
+    fn response_body(&self) -> ErrorResponse {
+        let details = match &self.0 {
+            AppError::RuleConflict { existing_id } => Some(ErrorDetails {
+                existing_id: Some(*existing_id),
+                reason: None,
+                affected_rule_ids: None,
+            }),
+            AppError::KeywordConflict { existing_id } => Some(ErrorDetails {
+                existing_id: Some(*existing_id),
+                reason: None,
+                affected_rule_ids: None,
+            }),
+            AppError::TargetConflict { existing_id } => Some(ErrorDetails {
+                existing_id: Some(*existing_id),
+                reason: None,
+                affected_rule_ids: None,
+            }),
+            AppError::KeywordReferenced { rule_ids } => Some(ErrorDetails {
+                existing_id: None,
+                reason: None,
+                affected_rule_ids: Some(rule_ids.clone()),
+            }),
+            AppError::ConditionInvalid(reason) | AppError::RegexInvalid(reason) => {
+                Some(ErrorDetails {
+                    existing_id: None,
+                    reason: Some(reason.clone()),
+                    affected_rule_ids: None,
+                })
+            }
+            _ => None,
+        };
+        ErrorResponse {
+            error: ErrorEnvelope {
+                code: self.0.code().to_string(),
+                message: self.0.public_message(),
+                details,
+            },
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        if self.0.is_internal() {
+            let error_kind = match &self.0 {
+                AppError::Db(_) => "database",
+                AppError::Other(_) => "internal",
+                AppError::OidcProviderUnavailable => "oidc_provider",
+                _ => "internal",
+            };
+            if let Ok(request_id) = REQUEST_ID.try_with(|request_id| request_id.clone()) {
+                tracing::error!(
+                    request_id = %request_id,
+                    error_kind,
+                    code = self.0.code(),
+                    "control plane request failed"
+                );
+            } else {
+                tracing::error!(
+                    error_kind,
+                    code = self.0.code(),
+                    "control plane request failed"
+                );
+            }
+        }
+        let status =
+            StatusCode::from_u16(self.0.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let mut response = (status, Json(self.response_body())).into_response();
+        if let Ok(value) = HeaderValue::from_str(self.0.code()) {
+            response.headers_mut().insert("x-tgm-error-code", value);
+        }
+        response
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    responses((status = 200, description = "Process is alive", body = HealthzResponse))
+)]
+async fn healthz() -> Json<HealthzResponse> {
+    Json(HealthzResponse { status: "ok" })
+}
+
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses(
+        (status = 200, description = "Health status", body = HealthResponse),
+        (status = 503, description = "At least one component is unhealthy", body = HealthResponse)
+    )
+)]
+async fn health(State(state): State<ControlPlaneState>) -> Response {
+    let pg_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.pool)
+        .await
+        .is_ok();
+    let response = HealthResponse {
+        pg: if pg_ok { "ok" } else { "down" },
+        redis: "not_configured",
+        mtproto: "not_configured",
+        bot: "not_configured",
+    };
+    let status = if pg_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(response)).into_response()
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/dashboard/summary",
+    responses(
+        (status = 200, description = "Dashboard summary", body = DashboardResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse)
+    )
+)]
+async fn dashboard(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+) -> Result<Json<DashboardResponse>, ApiError> {
+    let summary = tgm_db::repo::load_dashboard_summary(&state.pool, auth.tenant_id())
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(DashboardResponse {
+        status: "ok",
+        identities: DashboardIdentityStatus {
+            online: summary.identity_online,
+            offline: summary.identity_offline,
+            flood_wait: summary.identity_flood_wait,
+            banned: summary.identity_banned,
+            unauthorized: summary.identity_unauthorized,
+        },
+        queue_depth: summary.queue_depth,
+        today: DashboardToday {
+            received: summary.received_today,
+            matched: summary.matched_today,
+            delivered: summary.delivered_today,
+            failed: summary.failed_today,
+        },
+        flood_wait_until: summary.flood_wait_until,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/identities",
+    params(IdentityListQuery),
+    responses(
+        (status = 200, description = "Tenant identities", body = IdentityListResponse),
+        (status = 400, description = "Invalid filters", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse)
+    )
+)]
+async fn list_identities(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Query(query): Query<IdentityListQuery>,
+) -> Result<Json<IdentityListResponse>, ApiError> {
+    let page = query
+        .page
+        .as_deref()
+        .unwrap_or("1")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("page must be an integer".to_owned()))?
+        .max(1);
+    let per_page = query
+        .per_page
+        .as_deref()
+        .unwrap_or("20")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("per_page must be an integer".to_owned()))?
+        .clamp(1, 100);
+    page.checked_sub(1)
+        .and_then(|value| value.checked_mul(per_page))
+        .ok_or_else(|| AppError::ConditionInvalid("page is too large".to_owned()))?;
+    let kind = match query.kind.as_deref() {
+        None => None,
+        Some("bot") | Some("mtproto") => query.kind.as_deref(),
+        Some(_) => {
+            return Err(
+                AppError::ConditionInvalid("kind must be bot or mtproto".to_owned()).into(),
+            );
+        }
+    };
+    let status = match query.status.as_deref() {
+        None => None,
+        Some("online") | Some("offline") | Some("flood_wait") | Some("banned")
+        | Some("unauthorized") => query.status.as_deref(),
+        Some(_) => {
+            return Err(AppError::ConditionInvalid(
+                "status must be online, offline, flood_wait, banned, or unauthorized".to_owned(),
+            )
+            .into());
+        }
+    };
+    let mut records = tgm_db::repo::list_tenant_identities(
+        &state.pool,
+        auth.tenant_id(),
+        kind,
+        status,
+        per_page + 1,
+        (page - 1) * per_page,
+    )
+    .await
+    .map_err(AppError::from)?;
+    let has_more = records.len() as i64 > per_page;
+    if has_more {
+        records.truncate(per_page as usize);
+    }
+    Ok(Json(IdentityListResponse {
+        items: records.into_iter().map(identity_response).collect(),
+        page,
+        per_page,
+        has_more,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/identities/bot",
+    request_body = BotIdentityCreateRequest,
+    responses(
+        (status = 201, description = "Bot identity created; token is never echoed", body = IdentityResponse),
+        (status = 400, description = "Token rejected by Telegram or bot already registered", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required, or credential submitted via Bot", body = ErrorResponse)
+    )
+)]
+async fn create_bot_identity(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Json(input): Json<BotIdentityCreateRequest>,
+) -> Result<(StatusCode, Json<IdentityResponse>), ApiError> {
+    let token = Arc::new(Secret::new(input.token));
+    // spec/02 §6.3：凭据经 Bot 入口提交会留在 Telegram 聊天记录里，永久拒绝。
+    if auth.source() != AuthSource::Web {
+        return Err(AppError::CredentialViaWebOnly.into());
+    }
+    require_identity_write(auth)?;
+    let bot_id = validate_bot_token(token.expose())?;
+    let Some(intake) = state.credential_intake.as_ref() else {
+        return Err(
+            AppError::internal(std::io::Error::other("control-plane 未配置凭据录入 KEK")).into(),
+        );
+    };
+    let Some(_execution) = tgm_db::lifecycle::WorkerGuard::acquire(&state.pool, auth.tenant_id())
+        .await
+        .map_err(AppError::from)?
+    else {
+        return Err(AppError::Forbidden.into());
+    };
+    let client =
+        crate::bot_console::TelegramBotApiClient::new(Arc::clone(&token), &intake.bot_api_base_url)
+            .map_err(AppError::internal)?;
+    let me = client.get_me().await.map_err(|error| match error {
+        crate::bot_console::TelegramBotApiError::Missing(_)
+        | crate::bot_console::TelegramBotApiError::Server(_)
+        | crate::bot_console::TelegramBotApiError::Rejected { .. } => {
+            AppError::ConditionInvalid("Telegram 拒绝了该 Bot Token".to_owned())
+        }
+        other => AppError::internal(other),
+    })?;
+    if !me.is_bot || me.id != bot_id {
+        return Err(AppError::ConditionInvalid("该 token 不属于一个 Bot".to_owned()).into());
+    }
+
+    let plaintext = Secret::new(token.expose().as_bytes().to_vec());
+    let display_name = Some(me.first_name.clone()).filter(|name| !name.trim().is_empty());
+    let identity_id = tgm_db::credentials::create_bot_identity(
+        &state.pool,
+        intake.kek.as_ref(),
+        auth.tenant_id(),
+        tgm_db::credentials::NewBotIdentity {
+            tg_user_id: me.id,
+            username: me.username,
+            display_name: display_name.clone(),
+            actor_user_id: auth.actor_user_id(),
+            source: auth.source().as_str().to_owned(),
+        },
+        &plaintext,
+    )
+    .await
+    .map_err(|error| match error {
+        tgm_db::credentials::CredentialError::BotAlreadyRegistered => {
+            AppError::ConditionInvalid("该 Bot 已接入".to_owned())
+        }
+        tgm_db::credentials::CredentialError::Db(error) => AppError::from(error),
+        other => AppError::internal(other),
+    })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(IdentityResponse {
+            id: identity_id.get(),
+            kind: "bot".to_owned(),
+            tg_user_id: Some(me.id),
+            display_name,
+            status: "offline".to_owned(),
+            flood_wait_until: None,
+        }),
+    ))
+}
+
+/// Bot Token 形如 `<bot_id>:<secret>`。先在本地拒掉明显不合法的输入，
+/// 免得把任意字符串拼进 Bot API 的 URL 路径；返回 bot_id 供与 getMe 结果比对。
+fn validate_bot_token(token: &str) -> Result<i64, ApiError> {
+    let invalid = || ApiError::from(AppError::ConditionInvalid("Bot Token 格式无效".to_owned()));
+    let (id, secret) = token.split_once(':').ok_or_else(invalid)?;
+    if id.is_empty()
+        || id.len() > 20
+        || !id.bytes().all(|byte| byte.is_ascii_digit())
+        || secret.len() < 20
+        || secret.len() > 128
+        || !secret
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(invalid());
+    }
+    id.parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(invalid)
+}
+
+/// 当前凭据代持授权文本的版本（spec/06 §2.2）。正文属于 WP-8 的法务工作，这一版是占位。
+pub const CUSTODY_CONSENT_TEXT_VERSION: &str = "custody-v0";
+
+/// 登录中的一条 MTProto 连接。进入终态时 `driver` 被取走并关闭。
+pub struct QrLoginEntry {
+    driver: Option<tgm_tg::qr_login::QrLoginDriver>,
+    execution: Option<tgm_db::lifecycle::WorkerGuard>,
+    api_id: i32,
+    identity_id: Option<tgm_core::ids::IdentityId>,
+}
+
+fn close_logins(entries: Vec<Arc<tokio::sync::Mutex<QrLoginEntry>>>) {
+    for entry in entries {
+        tokio::spawn(async move {
+            let mut entry = entry.lock().await;
+            let driver = entry.driver.take();
+            if let Some(driver) = driver {
+                driver.close().await;
+            }
+            entry.execution.take();
+        });
+    }
+}
+
+/// MTProto 凭据录入的共同门槛：仅 Web、owner/admin、pro 档、已配置 KEK。
+async fn require_mtproto_intake(
+    state: &ControlPlaneState,
+    auth: AuthContext,
+) -> Result<(), ApiError> {
+    if auth.source() != AuthSource::Web {
+        return Err(AppError::CredentialViaWebOnly.into());
+    }
+    require_identity_write(auth)?;
+    let plan = tgm_db::repo::load_tenant_plan(&state.pool, auth.tenant_id())
+        .await
+        .map_err(AppError::from)?;
+    if plan != "pro" {
+        return Err(AppError::Forbidden.into());
+    }
+    if state.credential_intake.is_none() {
+        return Err(
+            AppError::internal(std::io::Error::other("control-plane 未配置凭据录入 KEK")).into(),
+        );
+    }
+    Ok(())
+}
+
+fn render_qr_svg(link: &Secret<String>) -> Result<String, ApiError> {
+    let code = qrcode::QrCode::new(link.expose().as_bytes()).map_err(AppError::internal)?;
+    Ok(code
+        .render::<qrcode::render::svg::Color<'_>>()
+        .min_dimensions(256, 256)
+        .build())
+}
+
+fn unix_to_rfc3339(unix: i64) -> String {
+    DateTime::<Utc>::from_timestamp(unix, 0)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339()
+}
+
+fn qr_status(status: &str) -> QrLoginStatusResponse {
+    QrLoginStatusResponse {
+        status: status.to_owned(),
+        qr_svg: None,
+        expires_at: None,
+        password_rejected: None,
+        identity: None,
+        reason: None,
+    }
+}
+
+fn qr_failed(reason: &str) -> QrLoginStatusResponse {
+    QrLoginStatusResponse {
+        reason: Some(reason.to_owned()),
+        ..qr_status("failed")
+    }
+}
+
+fn driver_failure_reason(error: &tgm_tg::qr_login::QrLoginDriverError) -> &'static str {
+    if error.is_api_credential_rejected() {
+        "api_credential_rejected"
+    } else {
+        "telegram_error"
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/identities/login/qr",
+    request_body = QrLoginStartRequest,
+    responses(
+        (status = 201, description = "QR login started; api_hash is never echoed", body = QrLoginStartResponse),
+        (status = 400, description = "Invalid api_id/api_hash, or rejected by Telegram", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin on pro plan required, consent missing, or submitted via Bot", body = ErrorResponse),
+        (status = 404, description = "Identity to reauthorize not found", body = ErrorResponse),
+        (status = 429, description = "Too many QR logins for this tenant", body = ErrorResponse)
+    )
+)]
+async fn start_qr_login(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    headers: HeaderMap,
+    Json(input): Json<QrLoginStartRequest>,
+) -> Result<(StatusCode, Json<QrLoginStartResponse>), ApiError> {
+    let api_hash = Secret::new(input.api_hash);
+    require_mtproto_intake(&state, auth).await?;
+    // spec/06 §2.2：代持授权先于凭据录入，而且必须是当前版本的文本。
+    if input.consent_text_version != CUSTODY_CONSENT_TEXT_VERSION {
+        return Err(AppError::Forbidden.into());
+    }
+    if input.api_id <= 0 {
+        return Err(AppError::ConditionInvalid("api_id 必须为正整数".to_owned()).into());
+    }
+    let hash = api_hash.expose();
+    if hash.len() != 32 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::ConditionInvalid("api_hash 格式无效".to_owned()).into());
+    }
+    let identity_id = match input.identity_id {
+        None => None,
+        Some(identity) => Some(
+            tgm_db::credentials::load_mtproto_identity(&state.pool, auth.tenant_id(), identity)
+                .await
+                .map_err(AppError::from)?
+                .ok_or(AppError::NotFound)?,
+        ),
+    };
+
+    let tenant = auth.tenant_id();
+    let Some(_execution) = tgm_db::lifecycle::WorkerGuard::acquire(&state.pool, tenant)
+        .await
+        .map_err(AppError::from)?
+    else {
+        return Err(AppError::Forbidden.into());
+    };
+    let latest = tgm_db::credentials::latest_custody_consent(&state.pool, tenant)
+        .await
+        .map_err(AppError::from)?;
+    if latest.as_deref() != Some(CUSTODY_CONSENT_TEXT_VERSION) {
+        let user_agent = headers
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        tgm_db::credentials::insert_custody_consent(
+            &state.pool,
+            tenant,
+            tgm_db::credentials::CustodyConsent {
+                text_version: CUSTODY_CONSENT_TEXT_VERSION.to_owned(),
+                user_id: auth.actor_user_id(),
+                ip: request_origin_ip(&headers),
+                user_agent,
+            },
+        )
+        .await
+        .map_err(AppError::from)?;
+    }
+    let now = std::time::Instant::now();
+    close_logins(state.qr_logins.sweep(now));
+    let login_id = new_login_id().map_err(AppError::internal)?;
+    // 先占登记簿名额再建连接：被限流拒掉的请求不该开出一条 MTProto 连接。
+    let entry = state
+        .qr_logins
+        .start(
+            login_id.clone(),
+            tenant.get(),
+            auth.actor_user_id(),
+            now,
+            QrLoginEntry {
+                driver: None,
+                execution: Some(_execution),
+                api_id: input.api_id,
+                identity_id,
+            },
+        )
+        .map_err(|rejected| match rejected {
+            StartRejected::TooManyConcurrent | StartRejected::TooManyPerHour => {
+                AppError::RateLimited
+            }
+        })?;
+    match tgm_tg::qr_login::QrLoginDriver::start(input.api_id, &api_hash) {
+        Ok(driver) => entry.lock().await.driver = Some(driver),
+        Err(_) => {
+            state.qr_logins.remove(&login_id);
+            return Err(AppError::ConditionInvalid("api_id 必须为正整数".to_owned()).into());
+        }
+    }
+
+    let first = {
+        let mut guard = entry.lock().await;
+        match guard.driver.as_mut() {
+            Some(driver) => driver.poll(Utc::now().timestamp()).await,
+            None => return Err(AppError::NotFound.into()),
+        }
+    };
+    match first {
+        Ok(tgm_tg::qr_login::QrPoll::Pending {
+            link,
+            expires_at_unix,
+            ..
+        }) => Ok((
+            StatusCode::CREATED,
+            Json(QrLoginStartResponse {
+                login_id,
+                qr_svg: render_qr_svg(&link)?,
+                expires_at: unix_to_rfc3339(expires_at_unix),
+            }),
+        )),
+        Ok(other) => {
+            close_logins(state.qr_logins.remove(&login_id).into_iter().collect());
+            Err(AppError::internal(std::io::Error::other(format!(
+                "新连接的第一次 exportLoginToken 不是 Token: {other:?}"
+            )))
+            .into())
+        }
+        Err(error) => {
+            close_logins(state.qr_logins.remove(&login_id).into_iter().collect());
+            if error.is_api_credential_rejected() {
+                return Err(AppError::ConditionInvalid(
+                    "Telegram 拒绝了该 api_id/api_hash".to_owned(),
+                )
+                .into());
+            }
+            Err(AppError::internal(error).into())
+        }
+    }
+}
+
+/// 已授权：取 session 落库。落库不成就注销这次登录，不在 Telegram 侧留下悬空设备。
+async fn persist_qr_login(
+    state: &ControlPlaneState,
+    auth: AuthContext,
+    login_id: &str,
+    entry: &mut QrLoginEntry,
+) -> Result<QrLoginStatusResponse, ApiError> {
+    let _execution = entry.execution.take();
+    let Some(driver) = entry.driver.take() else {
+        return Err(AppError::NotFound.into());
+    };
+    state.qr_logins.remove(login_id);
+    let authorized = match driver.finish().await {
+        Ok(authorized) => authorized,
+        Err(error) => {
+            tracing::warn!(error = %error, "QR 登录已授权但取 session 失败");
+            let _ = driver.log_out().await;
+            return Ok(qr_failed(driver_failure_reason(&error)));
+        }
+    };
+    let Some(intake) = state.credential_intake.as_ref() else {
+        let _ = driver.log_out().await;
+        return Err(
+            AppError::internal(std::io::Error::other("control-plane 未配置凭据录入 KEK")).into(),
+        );
+    };
+    let input = tgm_db::credentials::NewMtprotoIdentity {
+        tg_user_id: authorized.tg_user_id,
+        display_name: authorized.display_name.clone(),
+        api_id: entry.api_id,
+        actor_user_id: auth.actor_user_id(),
+        source: auth.source().as_str().to_owned(),
+    };
+    let stored = match entry.identity_id {
+        Some(identity) => tgm_db::credentials::reauthorize_mtproto_identity(
+            &state.pool,
+            intake.kek.as_ref(),
+            auth.tenant_id(),
+            identity,
+            input,
+            &authorized.session,
+        )
+        .await
+        .map(|status| (identity.get(), status)),
+        None => tgm_db::credentials::create_mtproto_identity(
+            &state.pool,
+            intake.kek.as_ref(),
+            auth.tenant_id(),
+            input,
+            &authorized.session,
+        )
+        .await
+        .map(|id| (id.get(), "offline".to_owned())),
+    };
+    match stored {
+        Ok((id, status)) => {
+            driver.close().await;
+            Ok(QrLoginStatusResponse {
+                identity: Some(IdentityResponse {
+                    id,
+                    kind: "mtproto".to_owned(),
+                    tg_user_id: Some(authorized.tg_user_id),
+                    display_name: authorized.display_name,
+                    status,
+                    flood_wait_until: None,
+                }),
+                ..qr_status("confirmed")
+            })
+        }
+        Err(error) => {
+            if let Err(logout) = driver.log_out().await {
+                tracing::warn!(error = %logout, "QR 登录落库失败后注销也失败");
+            }
+            match error {
+                tgm_db::credentials::CredentialError::AccountAlreadyRegistered => {
+                    Ok(qr_failed("account_already_registered"))
+                }
+                tgm_db::credentials::CredentialError::AccountMismatch => {
+                    Ok(qr_failed("account_mismatch"))
+                }
+                tgm_db::credentials::CredentialError::IdentityNotFound => {
+                    Err(AppError::NotFound.into())
+                }
+                tgm_db::credentials::CredentialError::Db(error) => {
+                    Err(AppError::from(error).into())
+                }
+                other => Err(AppError::internal(other).into()),
+            }
+        }
+    }
+}
+
+/// 取一条进行中的登录。别人的登录、不存在、已终结都是 404；超时返回 `expired` 并关闭连接。
+fn lookup_qr_login(
+    state: &ControlPlaneState,
+    auth: AuthContext,
+    login_id: &str,
+    touch: Touch,
+) -> Result<Result<Arc<tokio::sync::Mutex<QrLoginEntry>>, QrLoginStatusResponse>, ApiError> {
+    let now = std::time::Instant::now();
+    close_logins(state.qr_logins.sweep(now));
+    match state.qr_logins.touch(
+        login_id,
+        auth.tenant_id().get(),
+        auth.actor_user_id(),
+        now,
+        touch,
+    ) {
+        Lookup::Live(entry) => Ok(Ok(entry)),
+        Lookup::Expired(entry) => {
+            close_logins(vec![entry]);
+            Ok(Err(qr_status("expired")))
+        }
+        Lookup::NotFound => Err(AppError::NotFound.into()),
+        Lookup::TooFast => Err(AppError::RateLimited.into()),
+    }
+}
+
+fn require_qr_login_caller(auth: AuthContext) -> Result<(), ApiError> {
+    if auth.source() != AuthSource::Web {
+        return Err(AppError::CredentialViaWebOnly.into());
+    }
+    require_identity_write(auth)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/identities/login/qr/{login_id}",
+    params(("login_id" = String, Path, description = "login_id returned by POST /api/v1/identities/login/qr")),
+    responses(
+        (status = 200, description = "QR login status", body = QrLoginStatusResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required, or requested via Bot", body = ErrorResponse),
+        (status = 404, description = "Unknown, finished, or someone else's login", body = ErrorResponse),
+        (status = 429, description = "Polled faster than every 2 seconds", body = ErrorResponse)
+    )
+)]
+async fn poll_qr_login(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(login_id): Path<String>,
+) -> Result<Json<QrLoginStatusResponse>, ApiError> {
+    require_qr_login_caller(auth)?;
+    let entry = match lookup_qr_login(&state, auth, &login_id, Touch::Poll)? {
+        Ok(entry) => entry,
+        Err(status) => return Ok(Json(status)),
+    };
+    let mut guard = entry.lock().await;
+    let Some(_execution) = tgm_db::lifecycle::WorkerGuard::acquire(&state.pool, auth.tenant_id())
+        .await
+        .map_err(AppError::from)?
+    else {
+        state.qr_logins.remove(&login_id);
+        if let Some(driver) = guard.driver.take() {
+            driver.close().await;
+        }
+        guard.execution.take();
+        return Err(AppError::Forbidden.into());
+    };
+    let polled = match guard.driver.as_mut() {
+        Some(driver) => driver.poll(Utc::now().timestamp()).await,
+        None => return Err(AppError::NotFound.into()),
+    };
+    match polled {
+        Ok(tgm_tg::qr_login::QrPoll::Pending {
+            link,
+            expires_at_unix,
+            ..
+        }) => Ok(Json(QrLoginStatusResponse {
+            qr_svg: Some(render_qr_svg(&link)?),
+            expires_at: Some(unix_to_rfc3339(expires_at_unix)),
+            ..qr_status("pending")
+        })),
+        Ok(tgm_tg::qr_login::QrPoll::PasswordNeeded) => Ok(Json(qr_status("awaiting_password"))),
+        Ok(tgm_tg::qr_login::QrPoll::Authorized) => {
+            persist_qr_login(&state, auth, &login_id, &mut guard)
+                .await
+                .map(Json)
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "QR 登录轮询失败");
+            let reason = driver_failure_reason(&error);
+            state.qr_logins.remove(&login_id);
+            if let Some(driver) = guard.driver.take() {
+                driver.close().await;
+            }
+            Ok(Json(qr_failed(reason)))
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/identities/login/password",
+    request_body = QrLoginPasswordRequest,
+    responses(
+        (status = 200, description = "Password checked; wrong password stays in awaiting_password", body = QrLoginStatusResponse),
+        (status = 400, description = "Login is not waiting for a password", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required, or submitted via Bot", body = ErrorResponse),
+        (status = 404, description = "Unknown, finished, or someone else's login", body = ErrorResponse),
+        (status = 429, description = "Submitted faster than every 2 seconds", body = ErrorResponse)
+    )
+)]
+async fn submit_qr_login_password(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Json(input): Json<QrLoginPasswordRequest>,
+) -> Result<Json<QrLoginStatusResponse>, ApiError> {
+    let password = Secret::new(input.password);
+    require_qr_login_caller(auth)?;
+    if password.expose().is_empty() || password.expose().len() > 256 {
+        return Err(AppError::ConditionInvalid("密码长度无效".to_owned()).into());
+    }
+    let entry = match lookup_qr_login(&state, auth, &input.login_id, Touch::Password)? {
+        Ok(entry) => entry,
+        Err(status) => return Ok(Json(status)),
+    };
+    let mut guard = entry.lock().await;
+    let Some(_execution) = tgm_db::lifecycle::WorkerGuard::acquire(&state.pool, auth.tenant_id())
+        .await
+        .map_err(AppError::from)?
+    else {
+        state.qr_logins.remove(&input.login_id);
+        if let Some(driver) = guard.driver.take() {
+            driver.close().await;
+        }
+        guard.execution.take();
+        return Err(AppError::Forbidden.into());
+    };
+    let checked = match guard.driver.as_mut() {
+        Some(driver) => driver.submit_password(&password).await,
+        None => return Err(AppError::NotFound.into()),
+    };
+    match checked {
+        Ok(tgm_tg::qr_login::QrPassword::Accepted) => {
+            persist_qr_login(&state, auth, &input.login_id, &mut guard)
+                .await
+                .map(Json)
+        }
+        Ok(tgm_tg::qr_login::QrPassword::Rejected) => Ok(Json(QrLoginStatusResponse {
+            password_rejected: Some(true),
+            ..qr_status("awaiting_password")
+        })),
+        Err(tgm_tg::qr_login::QrLoginDriverError::WrongStep) => {
+            Err(AppError::ConditionInvalid("该登录当前不需要密码".to_owned()).into())
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "QR 登录提交密码失败");
+            let reason = driver_failure_reason(&error);
+            state.qr_logins.remove(&input.login_id);
+            if let Some(driver) = guard.driver.take() {
+                driver.close().await;
+            }
+            Ok(Json(qr_failed(reason)))
+        }
+    }
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/identities/{id}",
+    params(("id" = i64, Path, description = "Identity id")),
+    request_body = IdentityPatchRequest,
+    responses(
+        (status = 200, description = "Identity updated", body = IdentityResponse),
+        (status = 400, description = "Invalid identity update", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Identity not found", body = ErrorResponse)
+    )
+)]
+async fn update_identity(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+    Json(input): Json<IdentityPatchRequest>,
+) -> Result<Json<IdentityResponse>, ApiError> {
+    require_identity_write(auth)?;
+    validate_identity_patch(&input)?;
+    let record = tgm_db::repo::update_identity(
+        &state.pool,
+        auth.tenant_id(),
+        id,
+        tgm_db::repo::IdentityUpdateInput {
+            proxy_url: input.proxy_url,
+            display_name: input.display_name,
+            actor_user_id: auth.actor_user_id(),
+            source: auth.source().as_str().to_owned(),
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok(Json(identity_response(record)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/identities/{id}/reset-status",
+    params(("id" = i64, Path, description = "Identity id")),
+    responses(
+        (status = 200, description = "Identity status reset", body = IdentityResponse),
+        (status = 400, description = "Identity cannot be reset", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Identity not found", body = ErrorResponse)
+    )
+)]
+async fn reset_identity_status(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<Json<IdentityResponse>, ApiError> {
+    require_identity_write(auth)?;
+    let record = tgm_db::repo::reset_identity_status(
+        &state.pool,
+        auth.tenant_id(),
+        id,
+        auth.actor_user_id(),
+        auth.source().as_str(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok(Json(identity_response(record)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/identities/{id}",
+    params(("id" = i64, Path, description = "Identity id")),
+    responses(
+        (status = 204, description = "Identity deleted"),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Identity not found", body = ErrorResponse),
+        (status = 409, description = "Identity is still referenced", body = ErrorResponse)
+    )
+)]
+async fn delete_identity(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_identity_write(auth)?;
+    tgm_db::repo::delete_identity(
+        &state.pool,
+        auth.tenant_id(),
+        id,
+        auth.actor_user_id(),
+        auth.source().as_str(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn identity_response(record: tgm_db::repo::IdentityRecord) -> IdentityResponse {
+    IdentityResponse {
+        id: record.id.get(),
+        kind: record.kind,
+        tg_user_id: record.tg_user_id,
+        display_name: record.display_name,
+        status: record.status,
+        flood_wait_until: record.flood_wait_until,
+    }
+}
+
+fn require_identity_write(auth: AuthContext) -> Result<(), ApiError> {
+    match auth.role() {
+        TenantRole::Owner | TenantRole::Admin => Ok(()),
+        TenantRole::Member | TenantRole::Viewer | TenantRole::SuperAdmin => {
+            Err(AppError::Forbidden.into())
+        }
+    }
+}
+
+fn validate_identity_patch(input: &IdentityPatchRequest) -> Result<(), ApiError> {
+    if input.proxy_url.is_none() && input.display_name.is_none() {
+        return Err(AppError::ConditionInvalid("至少提供一个身份字段".to_owned()).into());
+    }
+    if let Some(Some(proxy_url)) = &input.proxy_url {
+        validate_proxy_url(proxy_url)?;
+    }
+    if let Some(Some(display_name)) = &input.display_name
+        && display_name.trim().is_empty()
+    {
+        return Err(AppError::ConditionInvalid("display_name 不能为空".to_owned()).into());
+    }
+    Ok(())
+}
+
+fn validate_proxy_url(value: &str) -> Result<(), ApiError> {
+    let value = value.trim();
+    let Some((scheme, authority_and_path)) = value.split_once("://") else {
+        return Err(AppError::ConditionInvalid(
+            "proxy_url 必须使用 http、https、socks5 或 socks5h scheme".to_owned(),
+        )
+        .into());
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https" | "socks5" | "socks5h")
+        || value.chars().any(char::is_whitespace)
+    {
+        return Err(AppError::ConditionInvalid(
+            "proxy_url 必须使用 http、https、socks5 或 socks5h scheme".to_owned(),
+        )
+        .into());
+    }
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host_port.is_empty() {
+        return Err(AppError::ConditionInvalid("proxy_url 必须包含代理主机".to_owned()).into());
+    }
+    let port = if host_port.starts_with('[') {
+        let end = host_port.find(']').ok_or_else(|| {
+            AppError::ConditionInvalid("proxy_url 的 IPv6 主机格式无效".to_owned())
+        })?;
+        match host_port.as_bytes().get(end + 1) {
+            None => None,
+            Some(b':') => Some(&host_port[end + 2..]),
+            Some(_) => {
+                return Err(
+                    AppError::ConditionInvalid("proxy_url 的端口格式无效".to_owned()).into(),
+                );
+            }
+        }
+    } else {
+        host_port.rsplit_once(':').map(|(_, port)| port)
+    };
+    if let Some(port) = port
+        && (port.is_empty()
+            || !port.chars().all(|character| character.is_ascii_digit())
+            || port.parse::<u16>().is_err())
+    {
+        return Err(AppError::ConditionInvalid("proxy_url 的端口格式无效".to_owned()).into());
+    }
+    Ok(())
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/keywords",
+    params(KeywordListQuery),
+    responses(
+        (status = 200, description = "Tenant keywords", body = KeywordListResponse),
+        (status = 400, description = "Invalid keyword filters", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse)
+    )
+)]
+async fn list_keywords(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Query(query): Query<KeywordListQuery>,
+) -> Result<Json<KeywordListResponse>, ApiError> {
+    let (page, per_page) = keyword_pagination(&query)?;
+    let match_type = keyword_match_type(query.match_type.as_deref())?;
+    let mut records = tgm_db::repo::list_keywords(
+        &state.pool,
+        auth.tenant_id(),
+        query.q.as_deref(),
+        match_type,
+        query.category.as_deref(),
+        per_page + 1,
+        (page - 1) * per_page,
+    )
+    .await
+    .map_err(AppError::from)?;
+    let has_more = records.len() as i64 > per_page;
+    if has_more {
+        records.truncate(per_page as usize);
+    }
+    Ok(Json(KeywordListResponse {
+        items: records.into_iter().map(keyword_response).collect(),
+        page,
+        per_page,
+        has_more,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/keywords/test",
+    request_body = KeywordTestRequest,
+    responses(
+        (status = 200, description = "Enabled keywords matched against sample text", body = KeywordTestResponse),
+        (status = 400, description = "Invalid sample text or unsupported match type", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse)
+    )
+)]
+async fn test_keywords(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Json(input): Json<KeywordTestRequest>,
+) -> Result<Json<KeywordTestResponse>, ApiError> {
+    let text = input.text.trim().to_owned();
+    if text.is_empty() {
+        return Err(AppError::ConditionInvalid("text 不能为空".to_owned()).into());
+    }
+
+    let keywords = tgm_db::repo::list_enabled_keywords(&state.pool, auth.tenant_id())
+        .await
+        .map_err(AppError::from)?;
+    let mut matches = Vec::new();
+    for keyword in keywords {
+        let match_type = match keyword.match_type.as_str() {
+            "exact" => KeywordMatchType::Exact,
+            "regex" => KeywordMatchType::Regex,
+            "fuzzy" => {
+                return Err(
+                    AppError::ConditionInvalid("暂不支持关键词匹配类型: fuzzy".to_owned()).into(),
+                );
+            }
+            other => {
+                return Err(
+                    AppError::ConditionInvalid(format!("暂不支持关键词匹配类型: {other}")).into(),
+                );
+            }
+        };
+        if keyword_matches_text(
+            &text,
+            &RuleKeyword {
+                id: keyword.id,
+                word: keyword.word.clone(),
+                match_type,
+            },
+        )? {
+            matches.push(KeywordTestMatch {
+                id: keyword.id,
+                word: keyword.word,
+                match_type: keyword.match_type,
+                category: keyword.category,
+                priority: keyword.priority,
+            });
+        }
+    }
+
+    Ok(Json(KeywordTestResponse { text, matches }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/keywords/import",
+    request_body = KeywordImportRequest,
+    responses(
+        (status = 201, description = "Keywords imported", body = KeywordImportResponse),
+        (status = 400, description = "Invalid keyword import", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 409, description = "Keyword or rule conflict", body = ErrorResponse)
+    )
+)]
+async fn import_keywords(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<KeywordImportResponse>), ApiError> {
+    require_keyword_write(auth)?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let input = if content_type.starts_with("text/csv") {
+        parse_keyword_csv(&body)?
+    } else if content_type.starts_with("application/json") || content_type.is_empty() {
+        serde_json::from_slice::<KeywordImportRequest>(&body)
+            .map_err(|error| AppError::ConditionInvalid(format!("导入 JSON 无效: {error}")))?
+    } else {
+        return Err(AppError::ConditionInvalid(
+            "Content-Type 必须是 application/json 或 text/csv".to_owned(),
+        )
+        .into());
+    };
+
+    let mut keyword_inputs = Vec::with_capacity(input.keywords.len());
+    for keyword in input.keywords {
+        keyword_inputs.push(keyword_create_input(keyword)?);
+    }
+    let rule_template = input
+        .create_rules_with
+        .map(keyword_import_rule_input)
+        .transpose()?;
+    let write =
+        tgm_db::repo::import_keywords(&state.pool, auth.tenant_id(), keyword_inputs, rule_template)
+            .await
+            .map_err(ApiError::from)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(KeywordImportResponse {
+            items: write.keywords.into_iter().map(keyword_response).collect(),
+            rule_ids: write.rule_ids,
+        }),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/keywords/export",
+    params(KeywordExportQuery),
+    responses(
+        (status = 200, description = "Tenant keywords export", body = KeywordExportResponse),
+        (status = 400, description = "Invalid export format", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse)
+    )
+)]
+async fn export_keywords(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Query(query): Query<KeywordExportQuery>,
+) -> Result<Response, ApiError> {
+    let format = query.format.as_deref().unwrap_or("json");
+    if !matches!(format, "json" | "csv") {
+        return Err(AppError::ConditionInvalid("format must be json or csv".to_owned()).into());
+    }
+    let records =
+        tgm_db::repo::list_keywords(&state.pool, auth.tenant_id(), None, None, None, i64::MAX, 0)
+            .await
+            .map_err(AppError::from)?;
+    let items: Vec<_> = records.into_iter().map(keyword_response).collect();
+    if format == "csv" {
+        let body = keyword_csv(&items);
+        return Ok((
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=keywords.csv",
+                ),
+            ],
+            body,
+        )
+            .into_response());
+    }
+
+    let body = serde_json::to_vec(&KeywordExportResponse { keywords: items })
+        .map_err(AppError::internal)?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=keywords.json",
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/keywords",
+    request_body = KeywordCreateRequest,
+    responses(
+        (status = 201, description = "Keyword created", body = KeywordResponse),
+        (status = 400, description = "Invalid keyword", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 409, description = "Keyword already exists", body = ErrorResponse)
+    )
+)]
+async fn create_keyword(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Json(input): Json<KeywordCreateRequest>,
+) -> Result<(StatusCode, Json<KeywordResponse>), ApiError> {
+    require_keyword_write(auth)?;
+    let input = keyword_create_input(input)?;
+    let record = tgm_db::repo::create_keyword(&state.pool, auth.tenant_id(), input)
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(keyword_response(record))))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/keywords/{id}",
+    params(("id" = i64, Path, description = "Keyword id")),
+    request_body = KeywordPatchRequest,
+    responses(
+        (status = 200, description = "Keyword updated", body = KeywordResponse),
+        (status = 400, description = "Invalid keyword", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Keyword not found", body = ErrorResponse),
+        (status = 409, description = "Keyword already exists", body = ErrorResponse)
+    )
+)]
+async fn update_keyword(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+    Json(input): Json<KeywordPatchRequest>,
+) -> Result<Json<KeywordResponse>, ApiError> {
+    require_keyword_write(auth)?;
+    let current = tgm_db::repo::load_keyword(&state.pool, auth.tenant_id(), id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
+    let word = input.word.as_deref().unwrap_or(current.word.as_str());
+    let match_type = input
+        .match_type
+        .as_deref()
+        .unwrap_or(current.match_type.as_str());
+    validate_keyword_word(word, match_type)?;
+    let record = tgm_db::repo::update_keyword(
+        &state.pool,
+        auth.tenant_id(),
+        id,
+        tgm_db::repo::KeywordUpdateInput {
+            word: input.word.map(|word| word.trim().to_owned()),
+            match_type: input.match_type,
+            category: input.category,
+            priority: input.priority,
+            enabled: input.enabled,
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok(Json(keyword_response(record)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/keywords/{id}",
+    params(("id" = i64, Path, description = "Keyword id")),
+    responses(
+        (status = 204, description = "Keyword deleted"),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Keyword not found", body = ErrorResponse),
+        (status = 409, description = "Keyword is referenced by rules", body = ErrorResponse)
+    )
+)]
+async fn delete_keyword(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_keyword_write(auth)?;
+    let (deleted, _) = tgm_db::repo::delete_keyword(&state.pool, auth.tenant_id(), id)
+        .await
+        .map_err(ApiError::from)?;
+    if !deleted {
+        return Err(AppError::NotFound.into());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/rules",
+    params(RuleListQuery),
+    responses(
+        (status = 200, description = "Tenant rules", body = RuleListResponse),
+        (status = 400, description = "Invalid rule filters", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse)
+    )
+)]
+async fn list_rules(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Query(query): Query<RuleListQuery>,
+) -> Result<Json<RuleListResponse>, ApiError> {
+    let (page, per_page) = rule_pagination(&query)?;
+    let enabled = rule_enabled(&query)?;
+    let target_ref = rule_ref(query.target_ref.as_deref(), "target_ref")?;
+    let source_ref = rule_ref(query.source_ref.as_deref(), "source_ref")?;
+    let mut records = tgm_db::repo::list_rules(
+        &state.pool,
+        auth.tenant_id(),
+        enabled,
+        target_ref,
+        source_ref,
+        per_page + 1,
+        (page - 1) * per_page,
+    )
+    .await
+    .map_err(AppError::from)?;
+    let has_more = records.len() as i64 > per_page;
+    if has_more {
+        records.truncate(per_page as usize);
+    }
+    Ok(Json(RuleListResponse {
+        items: records.into_iter().map(rule_response).collect(),
+        page,
+        per_page,
+        has_more,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/rules/{id}",
+    params(("id" = i64, Path, description = "Rule id")),
+    responses(
+        (status = 200, description = "Rule detail", body = RuleDetailResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 404, description = "Rule not found", body = ErrorResponse)
+    )
+)]
+async fn get_rule(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<Json<RuleDetailResponse>, ApiError> {
+    let (rule, conditions, replacements) =
+        tgm_db::repo::load_rule_detail(&state.pool, auth.tenant_id(), id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or(AppError::NotFound)?;
+    Ok(Json(rule_detail_response(rule, conditions, replacements)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/rules/{id}/test",
+    params(("id" = i64, Path, description = "Rule id")),
+    request_body = RuleTestRequest,
+    responses(
+        (status = 200, description = "Rule evaluation with trace", body = RuleTestResponse),
+        (status = 400, description = "Invalid rule test input", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 404, description = "Rule not found", body = ErrorResponse)
+    )
+)]
+async fn test_rule(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+    Json(input): Json<RuleTestRequest>,
+) -> Result<Json<RuleTestResponse>, ApiError> {
+    let (record, conditions, _replacements) =
+        tgm_db::repo::load_rule_detail(&state.pool, auth.tenant_id(), id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or(AppError::NotFound)?;
+    let rule = to_rule(record.clone(), conditions)?;
+    let evaluation = crate::rule::evaluate_rule(
+        &crate::rule::RuleEvent {
+            source_ref: input.source_ref.unwrap_or_default(),
+            media_type: input.media_type,
+            sender_id: input.sender,
+            text: Some(input.text),
+            caption: None,
+            file_name: input.file_name,
+            file_size: input.file_size,
+        },
+        &rule,
+    )?;
+    let route = evaluation.matched.then_some(RuleTestRouteResponse {
+        target_ref: record.target_ref,
+        target_tg_chat_id: record.target_tg_chat_id,
+        action: record.action,
+        rule_version: record.version,
+    });
+    Ok(Json(RuleTestResponse {
+        matched: evaluation.matched,
+        trace: evaluation
+            .trace
+            .into_iter()
+            .map(|step| RuleTestTraceResponse {
+                stage: step.stage.to_owned(),
+                field: step.field,
+                pass: step.pass,
+                detail: step.detail,
+                matched_at: step.matched_at.map(|values| {
+                    values
+                        .into_iter()
+                        .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
+                        .collect()
+                }),
+            })
+            .collect(),
+        route,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/rules/{id}/replacements",
+    params(("id" = i64, Path, description = "Rule id")),
+    responses(
+        (status = 200, description = "Rule replacements", body = RuleReplacementListResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 404, description = "Rule not found", body = ErrorResponse)
+    )
+)]
+async fn list_rule_replacements(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<Json<RuleReplacementListResponse>, ApiError> {
+    let (_rule, _conditions, replacements) =
+        tgm_db::repo::load_rule_detail(&state.pool, auth.tenant_id(), id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or(AppError::NotFound)?;
+    Ok(Json(RuleReplacementListResponse {
+        items: replacements
+            .into_iter()
+            .map(rule_replacement_response)
+            .collect(),
+    }))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/rules/{id}/replacements",
+    params(("id" = i64, Path, description = "Rule id")),
+    request_body = RuleReplacementsRequest,
+    responses(
+        (status = 200, description = "Rule replacements replaced", body = RuleReplacementListResponse),
+        (status = 400, description = "Invalid replacements", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Rule not found", body = ErrorResponse)
+    )
+)]
+async fn replace_rule_replacements(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+    Json(input): Json<RuleReplacementsRequest>,
+) -> Result<Json<RuleReplacementListResponse>, ApiError> {
+    require_rule_write(auth)?;
+    let (current, conditions, _replacements) =
+        tgm_db::repo::load_rule_detail(&state.pool, auth.tenant_id(), id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or(AppError::NotFound)?;
+    tgm_db::repo::update_rule(
+        &state.pool,
+        auth.tenant_id(),
+        id,
+        tgm_db::repo::RuleUpdateInput {
+            keyword_id: current.keyword_id,
+            source_ref: current.source_ref,
+            media_type: current.media_type,
+            target_ref: current.target_ref,
+            action: current.action,
+            priority: current.priority,
+            stop_processing: current.stop_processing,
+            template: current.template,
+            enabled: current.enabled,
+            conditions: conditions
+                .into_iter()
+                .map(rule_condition_record_input)
+                .collect(),
+            replacements: input
+                .replacements
+                .into_iter()
+                .map(rule_replacement_input)
+                .collect(),
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    let (_rule, _conditions, replacements) =
+        tgm_db::repo::load_rule_detail(&state.pool, auth.tenant_id(), id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or(AppError::NotFound)?;
+    Ok(Json(RuleReplacementListResponse {
+        items: replacements
+            .into_iter()
+            .map(rule_replacement_response)
+            .collect(),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/rules/{id}/replacements/test",
+    params(("id" = i64, Path, description = "Rule id")),
+    request_body = RuleReplacementTestRequest,
+    responses(
+        (status = 200, description = "Replacement preview with intermediate steps", body = RuleReplacementTestResponse),
+        (status = 400, description = "Invalid replacement pattern", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 404, description = "Rule not found", body = ErrorResponse)
+    )
+)]
+async fn test_rule_replacements(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+    Json(input): Json<RuleReplacementTestRequest>,
+) -> Result<Json<RuleReplacementTestResponse>, ApiError> {
+    let (_rule, _conditions, mut replacements) =
+        tgm_db::repo::load_rule_detail(&state.pool, auth.tenant_id(), id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or(AppError::NotFound)?;
+    replacements.retain(|replacement| replacement.enabled);
+    replacements.sort_by_key(|replacement| replacement.seq);
+
+    let original = input.text;
+    let mut current = original.clone();
+    let mut steps = Vec::with_capacity(replacements.len());
+    for replacement in replacements {
+        let regex = Regex::new(&replacement.pattern)
+            .map_err(|error| AppError::RegexInvalid(error.to_string()))?;
+        current = regex
+            .replace_all(&current, replacement.replacement.as_str())
+            .into_owned();
+        steps.push(RuleReplacementStepResponse {
+            seq: replacement.seq,
+            pattern: replacement.pattern,
+            replacement: replacement.replacement,
+            text: current.clone(),
+        });
+    }
+
+    Ok(Json(RuleReplacementTestResponse {
+        original,
+        final_text: current,
+        steps,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/replacements/copy",
+    request_body = RuleReplacementCopyRequest,
+    responses(
+        (status = 200, description = "Replacement rules copied", body = RuleReplacementCopyResponse),
+        (status = 400, description = "Invalid replacement copy request", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Rule not found", body = ErrorResponse)
+    )
+)]
+async fn copy_rule_replacements(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Json(input): Json<RuleReplacementCopyRequest>,
+) -> Result<Json<RuleReplacementCopyResponse>, ApiError> {
+    require_rule_write(auth)?;
+    let writes = tgm_db::repo::copy_rule_replacements(
+        &state.pool,
+        auth.tenant_id(),
+        input.from_rule,
+        input.to_rules,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok(Json(RuleReplacementCopyResponse {
+        items: writes
+            .into_iter()
+            .map(|write| RuleReplacementCopyItem {
+                rule_id: write.rule_id,
+                version: write.version,
+                semantic_changed: write.semantic_changed,
+            })
+            .collect(),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/rules/{id}/versions",
+    params(("id" = i64, Path, description = "Rule id")),
+    responses(
+        (status = 200, description = "Rule version history", body = RuleVersionListResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 404, description = "Rule not found", body = ErrorResponse)
+    )
+)]
+async fn list_rule_versions(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<Json<RuleVersionListResponse>, ApiError> {
+    let items = tgm_db::repo::list_rule_versions(&state.pool, auth.tenant_id(), id)
+        .await
+        .map_err(AppError::from)?;
+    if items.is_empty()
+        && tgm_db::repo::load_rule_detail(&state.pool, auth.tenant_id(), id)
+            .await
+            .map_err(AppError::from)?
+            .is_none()
+    {
+        return Err(AppError::NotFound.into());
+    }
+    Ok(Json(RuleVersionListResponse {
+        items: items.into_iter().map(rule_version_response).collect(),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/rules/{id}/versions/{version}",
+    params(
+        ("id" = i64, Path, description = "Rule id"),
+        ("version" = i32, Path, description = "Rule version")
+    ),
+    responses(
+        (status = 200, description = "Rule version snapshot", body = RuleVersionResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 404, description = "Rule or version not found", body = ErrorResponse)
+    )
+)]
+async fn get_rule_version(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path((id, version)): Path<(i64, i32)>,
+) -> Result<Json<RuleVersionResponse>, ApiError> {
+    let record = tgm_db::repo::load_rule_version(&state.pool, auth.tenant_id(), id, version)
+        .await
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(rule_version_response(record)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/rules",
+    request_body = RuleCreateRequest,
+    responses(
+        (status = 201, description = "Rule created", body = RuleDetailResponse),
+        (status = 400, description = "Invalid rule", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 409, description = "Conflicting rule", body = ErrorResponse)
+    )
+)]
+async fn create_rule(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Json(input): Json<RuleCreateRequest>,
+) -> Result<(StatusCode, Json<RuleDetailResponse>), ApiError> {
+    require_rule_write(auth)?;
+    validate_rule_fields(&input.action, input.media_type.as_deref())?;
+    let write = tgm_db::repo::create_rule(
+        &state.pool,
+        auth.tenant_id(),
+        tgm_db::repo::RuleCreateInput {
+            keyword_id: input.keyword_id,
+            source_ref: input.source_ref,
+            media_type: input.media_type,
+            target_ref: input.target_ref,
+            action: input.action,
+            priority: input.priority,
+            stop_processing: input.stop_processing,
+            template: input.template,
+            enabled: input.enabled,
+            conditions: input
+                .conditions
+                .into_iter()
+                .map(rule_condition_input)
+                .collect(),
+            replacements: input
+                .replacements
+                .into_iter()
+                .map(rule_replacement_input)
+                .collect(),
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    let detail = load_rule_detail_response(&state.pool, auth.tenant_id(), write.id).await?;
+    Ok((StatusCode::CREATED, Json(detail)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/rules/{id}/copy",
+    params(("id" = i64, Path, description = "Source rule id")),
+    request_body = RuleCopyRequest,
+    responses(
+        (status = 201, description = "Rule copied", body = RuleDetailResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Rule or target not found", body = ErrorResponse),
+        (status = 409, description = "Conflicting rule", body = ErrorResponse)
+    )
+)]
+async fn copy_rule(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+    Json(input): Json<RuleCopyRequest>,
+) -> Result<(StatusCode, Json<RuleDetailResponse>), ApiError> {
+    require_rule_write(auth)?;
+    let write = tgm_db::repo::copy_rule(&state.pool, auth.tenant_id(), id, input.target_ref)
+        .await
+        .map_err(ApiError::from)?;
+    let detail = load_rule_detail_response(&state.pool, auth.tenant_id(), write.id).await?;
+    Ok((StatusCode::CREATED, Json(detail)))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/rules/{id}",
+    params(("id" = i64, Path, description = "Rule id")),
+    request_body = RulePatchRequest,
+    responses(
+        (status = 200, description = "Rule updated", body = RuleDetailResponse),
+        (status = 400, description = "Invalid rule", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Rule not found", body = ErrorResponse),
+        (status = 409, description = "Conflicting rule", body = ErrorResponse)
+    )
+)]
+async fn update_rule(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+    Json(input): Json<RulePatchRequest>,
+) -> Result<Json<RuleDetailResponse>, ApiError> {
+    require_rule_write(auth)?;
+    let (current, conditions, replacements) =
+        tgm_db::repo::load_rule_detail(&state.pool, auth.tenant_id(), id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or(AppError::NotFound)?;
+    let action = input.action.unwrap_or(current.action);
+    let media_type = input.media_type.unwrap_or(current.media_type);
+    validate_rule_fields(&action, media_type.as_deref())?;
+    let update = tgm_db::repo::update_rule(
+        &state.pool,
+        auth.tenant_id(),
+        id,
+        tgm_db::repo::RuleUpdateInput {
+            keyword_id: input.keyword_id.unwrap_or(current.keyword_id),
+            source_ref: input.source_ref.unwrap_or(current.source_ref),
+            media_type,
+            target_ref: input.target_ref.unwrap_or(current.target_ref),
+            action,
+            priority: input.priority.unwrap_or(current.priority),
+            stop_processing: input.stop_processing.unwrap_or(current.stop_processing),
+            template: input.template.unwrap_or(current.template),
+            enabled: input.enabled.unwrap_or(current.enabled),
+            conditions: input
+                .conditions
+                .map(|items| items.into_iter().map(rule_condition_input).collect())
+                .unwrap_or_else(|| {
+                    conditions
+                        .into_iter()
+                        .map(rule_condition_record_input)
+                        .collect()
+                }),
+            replacements: input
+                .replacements
+                .map(|items| items.into_iter().map(rule_replacement_input).collect())
+                .unwrap_or_else(|| {
+                    replacements
+                        .into_iter()
+                        .map(rule_replacement_record_input)
+                        .collect()
+                }),
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    let _ = update;
+    Ok(Json(
+        load_rule_detail_response(&state.pool, auth.tenant_id(), id).await?,
+    ))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/rules/{id}",
+    params(("id" = i64, Path, description = "Rule id")),
+    responses(
+        (status = 204, description = "Rule deleted"),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Rule not found", body = ErrorResponse)
+    )
+)]
+async fn delete_rule(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_rule_write(auth)?;
+    if !tgm_db::repo::delete_rule(&state.pool, auth.tenant_id(), id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Err(AppError::NotFound.into());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn pagination(query: &SourceListQuery) -> Result<(i64, i64), ApiError> {
+    let page = query
+        .page
+        .as_deref()
+        .unwrap_or("1")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("page must be an integer".to_owned()))?
+        .max(1);
+    let per_page = query
+        .per_page
+        .as_deref()
+        .unwrap_or("20")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("per_page must be an integer".to_owned()))?
+        .clamp(1, 100);
+    page.checked_sub(1)
+        .and_then(|value| value.checked_mul(per_page))
+        .ok_or_else(|| AppError::ConditionInvalid("page is too large".to_owned()))?;
+    Ok((page, per_page))
+}
+
+fn keyword_pagination(query: &KeywordListQuery) -> Result<(i64, i64), ApiError> {
+    let page = query
+        .page
+        .as_deref()
+        .unwrap_or("1")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("page must be an integer".to_owned()))?
+        .max(1);
+    let per_page = query
+        .per_page
+        .as_deref()
+        .unwrap_or("20")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("per_page must be an integer".to_owned()))?
+        .clamp(1, 100);
+    page.checked_sub(1)
+        .and_then(|value| value.checked_mul(per_page))
+        .ok_or_else(|| AppError::ConditionInvalid("page is too large".to_owned()))?;
+    Ok((page, per_page))
+}
+
+fn keyword_match_type(value: Option<&str>) -> Result<Option<&str>, ApiError> {
+    match value {
+        None => Ok(None),
+        Some("exact") | Some("regex") | Some("fuzzy") => Ok(value),
+        Some(_) => Err(AppError::ConditionInvalid(
+            "match_type must be exact, regex, or fuzzy".to_owned(),
+        )
+        .into()),
+    }
+}
+
+fn validate_keyword_word(word: &str, match_type: &str) -> Result<String, ApiError> {
+    let word = word.trim();
+    if word.is_empty() {
+        return Err(AppError::ConditionInvalid("word 不能为空".to_owned()).into());
+    }
+    if !matches!(match_type, "exact" | "regex" | "fuzzy") {
+        return Err(AppError::ConditionInvalid(
+            "match_type must be exact, regex, or fuzzy".to_owned(),
+        )
+        .into());
+    }
+    if match_type == "regex" {
+        Regex::new(word).map_err(|error| AppError::RegexInvalid(error.to_string()))?;
+    }
+    Ok(word.to_owned())
+}
+
+fn keyword_create_input(
+    input: KeywordCreateRequest,
+) -> Result<tgm_db::repo::KeywordCreateInput, ApiError> {
+    let match_type = input.match_type.trim().to_owned();
+    let word = validate_keyword_word(&input.word, &match_type)?;
+    Ok(tgm_db::repo::KeywordCreateInput {
+        word,
+        match_type,
+        category: input.category.map(|value| value.trim().to_owned()),
+        priority: input.priority,
+        enabled: input.enabled,
+    })
+}
+
+fn keyword_import_rule_input(
+    input: KeywordImportRuleRequest,
+) -> Result<tgm_db::repo::KeywordImportRuleInput, ApiError> {
+    validate_rule_fields(&input.action, input.media_type.as_deref())?;
+    Ok(tgm_db::repo::KeywordImportRuleInput {
+        source_ref: input.source_ref,
+        media_type: input.media_type,
+        target_ref: input.target_ref,
+        action: input.action,
+        priority: input.priority,
+        stop_processing: input.stop_processing,
+        template: input.template,
+        enabled: input.enabled,
+        conditions: input
+            .conditions
+            .into_iter()
+            .map(rule_condition_input)
+            .collect(),
+        replacements: input
+            .replacements
+            .into_iter()
+            .map(rule_replacement_input)
+            .collect(),
+    })
+}
+
+fn parse_keyword_csv(body: &[u8]) -> Result<KeywordImportRequest, ApiError> {
+    let text = std::str::from_utf8(body)
+        .map_err(|error| AppError::ConditionInvalid(format!("CSV 编码无效: {error}")))?;
+    let mut rows = csv_rows(text)?;
+    let header = rows
+        .next()
+        .ok_or_else(|| AppError::ConditionInvalid("CSV 不能为空".to_owned()))?;
+    let header: Vec<_> = header
+        .into_iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect();
+    if header.first().map(String::as_str) != Some("word") {
+        return Err(AppError::ConditionInvalid("CSV 第一列必须是 word".to_owned()).into());
+    }
+    let column = |name: &str| header.iter().position(|value| value == name);
+    let match_type_column = column("match_type");
+    let category_column = column("category");
+    let priority_column = column("priority");
+    let enabled_column = column("enabled");
+    let mut keywords = Vec::new();
+    for row in rows {
+        if row.iter().all(|value| value.trim().is_empty()) {
+            continue;
+        }
+        let value_at = |position: Option<usize>| {
+            position
+                .and_then(|index| row.get(index))
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        let word = row
+            .first()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::ConditionInvalid("CSV 关键词不能为空".to_owned()))?;
+        let priority = value_at(priority_column)
+            .map(|value| {
+                value
+                    .parse::<i32>()
+                    .map_err(|_| AppError::ConditionInvalid("CSV priority 必须是整数".to_owned()))
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let enabled = value_at(enabled_column)
+            .map(|value| match value.as_str() {
+                "true" | "TRUE" | "1" => Ok(true),
+                "false" | "FALSE" | "0" => Ok(false),
+                _ => Err(AppError::ConditionInvalid(
+                    "CSV enabled 必须是 true/false".to_owned(),
+                )),
+            })
+            .transpose()?
+            .unwrap_or(true);
+        keywords.push(KeywordCreateRequest {
+            word,
+            match_type: value_at(match_type_column).unwrap_or_else(|| "exact".to_owned()),
+            category: value_at(category_column),
+            priority,
+            enabled,
+        });
+    }
+    Ok(KeywordImportRequest {
+        keywords,
+        create_rules_with: None,
+    })
+}
+
+fn csv_rows(text: &str) -> Result<impl Iterator<Item = Vec<String>> + '_, ApiError> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        match (quoted, character) {
+            (true, '"') if chars.peek() == Some(&'"') => {
+                field.push('"');
+                let _ = chars.next();
+            }
+            (true, '"') => quoted = false,
+            (false, '"') if field.is_empty() => quoted = true,
+            (false, ',') => {
+                row.push(std::mem::take(&mut field));
+            }
+            (false, '\n') => {
+                row.push(std::mem::take(&mut field));
+                rows.push(std::mem::take(&mut row));
+            }
+            (_, '\r') => {}
+            (_, character) => field.push(character),
+        }
+    }
+    if quoted {
+        return Err(AppError::ConditionInvalid("CSV 引号未闭合".to_owned()).into());
+    }
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
+    }
+    Ok(rows.into_iter())
+}
+
+fn keyword_csv(items: &[KeywordResponse]) -> String {
+    let mut output =
+        String::from("word,match_type,category,priority,enabled,created_at,updated_at\n");
+    for item in items {
+        output.push_str(
+            &[
+                csv_field(&item.word),
+                csv_field(&item.match_type),
+                csv_field(item.category.as_deref().unwrap_or("")),
+                item.priority.to_string(),
+                item.enabled.to_string(),
+                csv_field(&item.created_at),
+                csv_field(&item.updated_at),
+            ]
+            .join(","),
+        );
+        output.push('\n');
+    }
+    output
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn keyword_response(record: tgm_db::repo::KeywordRecord) -> KeywordResponse {
+    KeywordResponse {
+        id: record.id,
+        word: record.word,
+        match_type: record.match_type,
+        category: record.category,
+        priority: record.priority,
+        enabled: record.enabled,
+        created_at: format_timestamp(record.created_at),
+        updated_at: format_timestamp(record.updated_at),
+    }
+}
+
+fn target_pagination(query: &TargetChannelListQuery) -> Result<(i64, i64), ApiError> {
+    let page = query
+        .page
+        .as_deref()
+        .unwrap_or("1")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("page must be an integer".to_owned()))?
+        .max(1);
+    let per_page = query
+        .per_page
+        .as_deref()
+        .unwrap_or("20")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("per_page must be an integer".to_owned()))?
+        .clamp(1, 100);
+    page.checked_sub(1)
+        .and_then(|value| value.checked_mul(per_page))
+        .ok_or_else(|| AppError::ConditionInvalid("page is too large".to_owned()))?;
+    Ok((page, per_page))
+}
+
+fn target_response(record: tgm_db::repo::TargetChannelRecord) -> TargetChannelResponse {
+    TargetChannelResponse {
+        probe: TargetProbeResponse {
+            generation: record.probe_generation,
+            state: record.probe_state,
+            can_send: record.can_send,
+            content_protected: record.content_protected,
+            bot_role: record.bot_role,
+            checked_at: record.checked_at.map(format_timestamp),
+            error_code: record.probe_error_code,
+        },
+        id: record.id,
+        tg_chat_id: record.tg_chat_id,
+        title: record.title,
+        sender_identity_id: record.sender_identity_id.get(),
+        can_send: record.can_send,
+        checked_at: record.checked_at.map(format_timestamp),
+        enabled: record.enabled,
+    }
+}
+
+fn task_pagination(query: &TaskListQuery) -> Result<(i64, i64), ApiError> {
+    let page = query
+        .page
+        .as_deref()
+        .unwrap_or("1")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("page must be an integer".to_owned()))?
+        .max(1);
+    let per_page = query
+        .per_page
+        .as_deref()
+        .unwrap_or("20")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("per_page must be an integer".to_owned()))?
+        .clamp(1, 100);
+    page.checked_sub(1)
+        .and_then(|value| value.checked_mul(per_page))
+        .ok_or_else(|| AppError::ConditionInvalid("page is too large".to_owned()))?;
+    Ok((page, per_page))
+}
+
+fn rule_pagination(query: &RuleListQuery) -> Result<(i64, i64), ApiError> {
+    let page = query
+        .page
+        .as_deref()
+        .unwrap_or("1")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("page must be an integer".to_owned()))?
+        .max(1);
+    let per_page = query
+        .per_page
+        .as_deref()
+        .unwrap_or("20")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("per_page must be an integer".to_owned()))?
+        .clamp(1, 100);
+    page.checked_sub(1)
+        .and_then(|value| value.checked_mul(per_page))
+        .ok_or_else(|| AppError::ConditionInvalid("page is too large".to_owned()))?;
+    Ok((page, per_page))
+}
+
+fn rule_enabled(query: &RuleListQuery) -> Result<Option<bool>, ApiError> {
+    query
+        .enabled
+        .as_deref()
+        .map(|value| match value {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(AppError::ConditionInvalid(
+                "enabled must be true or false".to_owned(),
+            )),
+        })
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn rule_ref(value: Option<&str>, name: &str) -> Result<Option<i64>, ApiError> {
+    value
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| AppError::ConditionInvalid(format!("{name} must be an integer")))
+        })
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn rule_response(record: tgm_db::repo::RuleRecord) -> RuleResponse {
+    RuleResponse {
+        id: record.id,
+        keyword_id: record.keyword_id,
+        keyword: record.keyword,
+        keyword_match_type: record.keyword_match_type,
+        source_ref: record.source_ref,
+        media_type: record.media_type,
+        target_ref: record.target_ref,
+        target_tg_chat_id: record.target_tg_chat_id,
+        sender_identity_id: record.sender_identity_id.get(),
+        action: record.action,
+        priority: record.priority,
+        stop_processing: record.stop_processing,
+        template: record.template,
+        version: record.version,
+        enabled: record.enabled,
+    }
+}
+
+fn rule_detail_response(
+    rule: tgm_db::repo::RuleRecord,
+    conditions: Vec<tgm_db::repo::RuleConditionRecord>,
+    replacements: Vec<tgm_db::repo::RuleReplacementRecord>,
+) -> RuleDetailResponse {
+    RuleDetailResponse {
+        rule: rule_response(rule),
+        conditions: conditions
+            .into_iter()
+            .map(|condition| RuleConditionResponse {
+                kind: condition.kind,
+                value: condition.value,
+            })
+            .collect(),
+        replacements: replacements
+            .into_iter()
+            .map(rule_replacement_response)
+            .collect(),
+    }
+}
+
+fn rule_replacement_response(
+    replacement: tgm_db::repo::RuleReplacementRecord,
+) -> RuleReplacementResponse {
+    RuleReplacementResponse {
+        seq: replacement.seq,
+        pattern: replacement.pattern,
+        replacement: replacement.replacement,
+        enabled: replacement.enabled,
+    }
+}
+
+fn rule_version_response(record: tgm_db::repo::RuleVersionRecord) -> RuleVersionResponse {
+    RuleVersionResponse {
+        rule_id: record.rule_id,
+        version: record.version,
+        snapshot: record.snapshot,
+        created_at: format_timestamp(record.created_at),
+    }
+}
+
+async fn load_rule_detail_response(
+    pool: &PgPool,
+    tenant: tgm_core::ids::TenantId,
+    rule_id: i64,
+) -> Result<RuleDetailResponse, ApiError> {
+    let (rule, conditions, replacements) = tgm_db::repo::load_rule_detail(pool, tenant, rule_id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
+    Ok(rule_detail_response(rule, conditions, replacements))
+}
+
+fn rule_condition_input(condition: RuleConditionRequest) -> tgm_db::repo::RuleConditionInput {
+    tgm_db::repo::RuleConditionInput {
+        kind: condition.kind,
+        value: condition.value,
+    }
+}
+
+fn rule_condition_record_input(
+    condition: tgm_db::repo::RuleConditionRecord,
+) -> tgm_db::repo::RuleConditionInput {
+    tgm_db::repo::RuleConditionInput {
+        kind: condition.kind,
+        value: condition.value,
+    }
+}
+
+fn rule_replacement_input(
+    replacement: RuleReplacementRequest,
+) -> tgm_db::repo::RuleReplacementInput {
+    tgm_db::repo::RuleReplacementInput {
+        seq: replacement.seq,
+        pattern: replacement.pattern,
+        replacement: replacement.replacement,
+        enabled: replacement.enabled,
+    }
+}
+
+fn rule_replacement_record_input(
+    replacement: tgm_db::repo::RuleReplacementRecord,
+) -> tgm_db::repo::RuleReplacementInput {
+    tgm_db::repo::RuleReplacementInput {
+        seq: replacement.seq,
+        pattern: replacement.pattern,
+        replacement: replacement.replacement,
+        enabled: replacement.enabled,
+    }
+}
+
+fn validate_rule_fields(action: &str, media_type: Option<&str>) -> Result<(), ApiError> {
+    if !matches!(action, "COPY" | "FORWARD" | "RESEND") {
+        return Err(AppError::ConditionInvalid(
+            "action must be COPY, FORWARD, or RESEND".to_owned(),
+        )
+        .into());
+    }
+    if let Some(media_type) = media_type
+        && !matches!(
+            media_type,
+            "ANY"
+                | "TEXT"
+                | "PHOTO"
+                | "VIDEO"
+                | "AUDIO"
+                | "VOICE"
+                | "VIDEO_NOTE"
+                | "DOCUMENT"
+                | "STICKER"
+                | "ANIMATION"
+                | "OTHER"
+        )
+    {
+        return Err(AppError::ConditionInvalid("media_type is not supported".to_owned()).into());
+    }
+    Ok(())
+}
+
+fn require_rule_write(auth: AuthContext) -> Result<(), ApiError> {
+    match auth.role() {
+        TenantRole::Owner | TenantRole::Admin => Ok(()),
+        TenantRole::Member | TenantRole::Viewer | TenantRole::SuperAdmin => {
+            Err(AppError::Forbidden.into())
+        }
+    }
+}
+
+fn require_keyword_write(auth: AuthContext) -> Result<(), ApiError> {
+    match auth.role() {
+        TenantRole::Owner | TenantRole::Admin => Ok(()),
+        TenantRole::Member | TenantRole::Viewer | TenantRole::SuperAdmin => {
+            Err(AppError::Forbidden.into())
+        }
+    }
+}
+
+fn require_target_write(auth: AuthContext) -> Result<(), ApiError> {
+    match auth.role() {
+        TenantRole::Owner | TenantRole::Admin => Ok(()),
+        TenantRole::Member | TenantRole::Viewer | TenantRole::SuperAdmin => {
+            Err(AppError::Forbidden.into())
+        }
+    }
+}
+
+fn task_status(query: &TaskListQuery) -> Result<Option<&str>, ApiError> {
+    match query.status.as_deref() {
+        None => Ok(None),
+        Some("PENDING") | Some("SENDING") | Some("DONE") | Some("FAILED") | Some("DEAD")
+        | Some("CANCELLED") => Ok(query.status.as_deref()),
+        Some(_) => Err(AppError::ConditionInvalid(
+            "status must be PENDING, SENDING, DONE, FAILED, DEAD, or CANCELLED".to_owned(),
+        )
+        .into()),
+    }
+}
+
+fn task_target_ref(query: &TaskListQuery) -> Result<Option<i64>, ApiError> {
+    query
+        .target_ref
+        .as_deref()
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| AppError::ConditionInvalid("target_ref must be an integer".to_owned()))
+        })
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn task_since(query: &TaskListQuery) -> Result<Option<DateTime<Utc>>, ApiError> {
+    query
+        .since
+        .as_deref()
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .map_err(|_| {
+                    AppError::ConditionInvalid("since must be an RFC3339 timestamp".to_owned())
+                })
+        })
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn audit_pagination(query: &AuditLogListQuery) -> Result<(i64, i64), ApiError> {
+    let page = query
+        .page
+        .as_deref()
+        .unwrap_or("1")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("page must be an integer".to_owned()))?
+        .max(1);
+    let per_page = query
+        .per_page
+        .as_deref()
+        .unwrap_or("20")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("per_page must be an integer".to_owned()))?
+        .clamp(1, 100);
+    page.checked_sub(1)
+        .and_then(|value| value.checked_mul(per_page))
+        .ok_or_else(|| AppError::ConditionInvalid("page is too large".to_owned()))?;
+    Ok((page, per_page))
+}
+
+fn system_log_pagination(query: &SystemLogListQuery) -> Result<(i64, i64), ApiError> {
+    let page = query
+        .page
+        .as_deref()
+        .unwrap_or("1")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("page must be an integer".to_owned()))?
+        .max(1);
+    let per_page = query
+        .per_page
+        .as_deref()
+        .unwrap_or("20")
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("per_page must be an integer".to_owned()))?
+        .clamp(1, 100);
+    page.checked_sub(1)
+        .and_then(|value| value.checked_mul(per_page))
+        .ok_or_else(|| AppError::ConditionInvalid("page is too large".to_owned()))?;
+    Ok((page, per_page))
+}
+
+fn audit_actor(query: &AuditLogListQuery) -> Result<Option<i64>, ApiError> {
+    query
+        .actor
+        .as_deref()
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| AppError::ConditionInvalid("actor must be an integer".to_owned()))
+        })
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn audit_source(query: &AuditLogListQuery) -> Result<Option<&str>, ApiError> {
+    match query.source.as_deref() {
+        None => Ok(None),
+        Some("web") | Some("bot") | Some("system") => Ok(query.source.as_deref()),
+        Some(_) => {
+            Err(AppError::ConditionInvalid("source must be web, bot, or system".to_owned()).into())
+        }
+    }
+}
+
+fn audit_since(query: &AuditLogListQuery) -> Result<Option<DateTime<Utc>>, ApiError> {
+    query
+        .since
+        .as_deref()
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .map_err(|_| {
+                    AppError::ConditionInvalid("since must be an RFC3339 timestamp".to_owned())
+                })
+        })
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn format_timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339()
+}
+
+fn task_response(record: tgm_db::repo::DeliveryTaskListRecord) -> DeliveryTaskResponse {
+    DeliveryTaskResponse {
+        id: record.id,
+        tenant_event_id: record.tenant_event_id,
+        rule_id: record.rule_id,
+        rule_version: record.rule_version,
+        target_ref: record.target_ref,
+        target_tg_chat_id: record.target_tg_chat_id,
+        sender_identity_id: record.sender_identity_id.get(),
+        action: record.action,
+        status: record.status,
+        attempt_count: record.attempt_count,
+        next_retry_at: record.next_retry_at.map(format_timestamp),
+        last_error_code: record.last_error_code,
+        telegram_message_id: record.telegram_message_id,
+        created_at: format_timestamp(record.created_at),
+        completed_at: record.completed_at.map(format_timestamp),
+        updated_at: format_timestamp(record.updated_at),
+    }
+}
+
+fn task_detail_response(
+    task: tgm_db::repo::DeliveryTaskDetailRecord,
+    logs: Vec<tgm_db::repo::DeliveryLogRecord>,
+) -> TaskDetailResponse {
+    let task_response = DeliveryTaskResponse {
+        id: task.id,
+        tenant_event_id: task.tenant_event_id,
+        rule_id: task.rule_id,
+        rule_version: task.rule_version,
+        target_ref: task.target_ref,
+        target_tg_chat_id: task.target_tg_chat_id,
+        sender_identity_id: task.sender_identity_id.get(),
+        action: task.action,
+        status: task.status,
+        attempt_count: task.attempt_count,
+        next_retry_at: task.next_retry_at.map(format_timestamp),
+        last_error_code: task.last_error_code,
+        telegram_message_id: task.telegram_message_id,
+        created_at: format_timestamp(task.created_at),
+        completed_at: task.completed_at.map(format_timestamp),
+        updated_at: format_timestamp(task.updated_at),
+    };
+    TaskDetailResponse {
+        task: task_response,
+        delivery_logs: logs
+            .into_iter()
+            .map(|log| DeliveryLogResponse {
+                id: log.id,
+                task_id: log.task_id,
+                attempt: log.attempt,
+                ok: log.ok,
+                error_code: log.error_code,
+                error_msg: log.error_msg,
+                latency_ms: log.latency_ms,
+                created_at: format_timestamp(log.created_at),
+            })
+            .collect(),
+        rule_snapshot: task.rule_snapshot,
+    }
+}
+
+fn audit_log_response(record: tgm_db::repo::AuditLogRecord) -> AuditLogResponse {
+    AuditLogResponse {
+        id: record.id,
+        actor_user_id: record.actor_user_id,
+        action: record.action,
+        resource: record.resource,
+        resource_id: record.resource_id,
+        before: record.before,
+        after: record.after,
+        source: record.source,
+        ip: record.ip,
+        created_at: format_timestamp(record.created_at),
+    }
+}
+
+fn system_log_response(record: tgm_db::repo::SystemLogRecord) -> SystemLogResponse {
+    SystemLogResponse {
+        id: record.id,
+        level: record.level,
+        module: record.module,
+        event: record.event,
+        context: record.context,
+        created_at: format_timestamp(record.created_at),
+    }
+}
+
+fn source_status(query: &SourceListQuery) -> Result<Option<&str>, ApiError> {
+    match query.status.as_deref() {
+        None => Ok(None),
+        Some("enabled") | Some("disabled") => Ok(query.status.as_deref()),
+        Some(_) => {
+            Err(AppError::ConditionInvalid("status must be enabled or disabled".to_owned()).into())
+        }
+    }
+}
+
+fn source_identity_id(query: &SourceListQuery) -> Result<Option<i64>, ApiError> {
+    query
+        .identity_id
+        .as_deref()
+        .map(|value| {
+            value.parse::<i64>().map_err(|_| {
+                AppError::ConditionInvalid("identity_id must be an integer".to_owned())
+            })
+        })
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn source_response(record: tgm_db::repo::SourceSubscriptionRecord) -> SourceSubscriptionResponse {
+    SourceSubscriptionResponse {
+        id: record.id,
+        tg_chat_id: record.tg_chat_id,
+        title: record.title,
+        username: record.username,
+        receiver_identity_id: record.receiver_identity_id,
+        enabled: record.enabled,
+        discovered: record.discovered,
+    }
+}
+
+fn require_source_write(auth: AuthContext) -> Result<(), ApiError> {
+    match auth.role() {
+        TenantRole::Owner | TenantRole::Admin => Ok(()),
+        TenantRole::Member | TenantRole::Viewer | TenantRole::SuperAdmin => {
+            Err(AppError::Forbidden.into())
+        }
+    }
+}
+
+fn parse_source_chat(value: &str) -> Result<i64, ApiError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AppError::ConditionInvalid("chat 不能为空".to_owned()).into());
+    }
+    if value.starts_with('@') {
+        return Err(AppError::ConditionInvalid(
+            "chat 当前必须是已解析的 Telegram chat_id；@username 解析将在 probe 链路接入"
+                .to_owned(),
+        )
+        .into());
+    }
+    let chat_id = value
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("chat 必须是 Telegram chat_id".to_owned()))?;
+    if chat_id == 0 {
+        return Err(AppError::ConditionInvalid("chat 不能为 0".to_owned()).into());
+    }
+    Ok(chat_id)
+}
+
+fn parse_target_chat(value: &str) -> Result<i64, ApiError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AppError::ConditionInvalid("chat 不能为空".to_owned()).into());
+    }
+    if value.starts_with('@') {
+        return Err(AppError::ConditionInvalid(
+            "chat 当前必须是已解析的 Telegram chat_id；@username 解析将在 probe 链路接入"
+                .to_owned(),
+        )
+        .into());
+    }
+    let chat_id = value
+        .parse::<i64>()
+        .map_err(|_| AppError::ConditionInvalid("chat 必须是 Telegram chat_id".to_owned()))?;
+    if chat_id == 0 {
+        return Err(AppError::ConditionInvalid("chat 不能为 0".to_owned()).into());
+    }
+    Ok(chat_id)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/sources",
+    request_body = SourceCreateRequest,
+    responses(
+        (status = 201, description = "Source subscription created or reused", body = SourceSubscriptionResponse),
+        (status = 400, description = "Invalid source", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Identity not found", body = ErrorResponse)
+    )
+)]
+async fn create_source(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Json(input): Json<SourceCreateRequest>,
+) -> Result<(StatusCode, Json<SourceSubscriptionResponse>), ApiError> {
+    require_source_write(auth)?;
+    let tg_chat_id = parse_source_chat(&input.chat)?;
+    let receiver_identity_id = tgm_db::repo::load_source_identity(
+        &state.pool,
+        auth.tenant_id(),
+        input.receiver_identity_id,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    let record = tgm_db::repo::create_source_subscription(
+        &state.pool,
+        auth.tenant_id(),
+        tgm_db::repo::SourceSubscriptionCreateInput {
+            tg_chat_id,
+            receiver_identity_id,
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(source_response(record))))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/sources/{id}",
+    params(("id" = i64, Path, description = "Source subscription id")),
+    request_body = SourceUpdateRequest,
+    responses(
+        (status = 200, description = "Source subscription updated", body = SourceSubscriptionResponse),
+        (status = 400, description = "Invalid source update", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Source or identity not found", body = ErrorResponse)
+    )
+)]
+async fn update_source(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+    Json(input): Json<SourceUpdateRequest>,
+) -> Result<Json<SourceSubscriptionResponse>, ApiError> {
+    require_source_write(auth)?;
+    if let Some(receiver_identity_id) = input.receiver_identity_id {
+        tgm_db::repo::load_source_subscription(&state.pool, auth.tenant_id(), id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or(AppError::NotFound)?;
+        tgm_db::repo::load_source_identity(&state.pool, auth.tenant_id(), receiver_identity_id)
+            .await
+            .map_err(ApiError::from)?;
+    }
+    let record = tgm_db::repo::update_source_subscription(
+        &state.pool,
+        auth.tenant_id(),
+        id,
+        tgm_db::repo::SourceSubscriptionUpdateInput {
+            enabled: input.enabled,
+            receiver_identity_id: input.receiver_identity_id,
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok(Json(source_response(record)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/sources",
+    params(SourceListQuery),
+    responses(
+        (status = 200, description = "Tenant source subscriptions", body = SourceListResponse),
+        (status = 400, description = "Invalid filters", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse)
+    )
+)]
+async fn list_sources(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Query(query): Query<SourceListQuery>,
+) -> Result<Json<SourceListResponse>, ApiError> {
+    let (page, per_page) = pagination(&query)?;
+    let status = source_status(&query)?;
+    let identity_id = source_identity_id(&query)?;
+    let mut records = tgm_db::repo::list_source_subscriptions(
+        &state.pool,
+        auth.tenant_id(),
+        status,
+        identity_id,
+        query.q.as_deref(),
+        per_page + 1,
+        (page - 1) * per_page,
+    )
+    .await
+    .map_err(AppError::from)?;
+    let has_more = records.len() as i64 > per_page;
+    if has_more {
+        records.truncate(per_page as usize);
+    }
+    Ok(Json(SourceListResponse {
+        items: records.into_iter().map(source_response).collect(),
+        page,
+        per_page,
+        has_more,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/sources/{id}",
+    params(("id" = i64, Path, description = "Source subscription id")),
+    responses(
+        (status = 200, description = "Tenant source subscription", body = SourceSubscriptionResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 404, description = "Source not found", body = ErrorResponse)
+    )
+)]
+async fn get_source(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<Json<SourceSubscriptionResponse>, ApiError> {
+    let record = tgm_db::repo::load_source_subscription(&state.pool, auth.tenant_id(), id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(source_response(record)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/targets",
+    params(TargetChannelListQuery),
+    responses(
+        (status = 200, description = "Tenant target channels", body = TargetChannelListResponse),
+        (status = 400, description = "Invalid pagination", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse)
+    )
+)]
+async fn list_targets(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Query(query): Query<TargetChannelListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (page, per_page) = target_pagination(&query)?;
+    let mut records = tgm_db::repo::list_target_channels(
+        &state.pool,
+        auth.tenant_id(),
+        per_page + 1,
+        (page - 1) * per_page,
+    )
+    .await
+    .map_err(AppError::from)?;
+    let has_more = records.len() as i64 > per_page;
+    if has_more {
+        records.truncate(per_page as usize);
+    }
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(TargetChannelListResponse {
+            items: records.into_iter().map(target_response).collect(),
+            page,
+            per_page,
+            has_more,
+        }),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/targets",
+    request_body = TargetChannelCreateRequest,
+    responses(
+        (status = 201, description = "Target channel created; Telegram probe pending", body = TargetChannelResponse),
+        (status = 400, description = "Invalid target", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Sender identity not found", body = ErrorResponse),
+        (status = 409, description = "Target channel already exists", body = ErrorResponse)
+    )
+)]
+async fn create_target(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Json(input): Json<TargetChannelCreateRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_target_write(auth)?;
+    let tg_chat_id = parse_target_chat(&input.chat)?;
+    let sender_identity_id =
+        tgm_db::repo::load_tenant_identity(&state.pool, auth.tenant_id(), input.sender_identity_id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or(AppError::NotFound)?;
+    let record = tgm_db::repo::create_target_channel(
+        &state.pool,
+        auth.tenant_id(),
+        tgm_db::repo::TargetChannelCreateInput {
+            tg_chat_id,
+            title: input.title.map(|value| value.trim().to_owned()),
+            sender_identity_id,
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok((
+        StatusCode::CREATED,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(target_response(record)),
+    ))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/targets/{id}/probe",
+    params(("id" = i64, Path, description = "Target channel id")),
+    responses(
+        (status = 200, description = "Current target probe", body = TargetProbeResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 404, description = "Target not found", body = ErrorResponse)
+    )
+)]
+async fn get_target_probe(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let probe = tgm_db::target_probe::read_probe(&state.pool, auth.tenant_id(), id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(probe_response(probe)),
+    ))
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/targets/{id}/probe",
+    params(("id" = i64, Path, description = "Target channel id")),
+    responses(
+        (status = 202, description = "Probe queued or already in progress", body = TargetProbeResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Target not found", body = ErrorResponse)
+    )
+)]
+async fn start_target_probe(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_target_write(auth)?;
+    let probe = tgm_db::target_probe::request_probe(&state.pool, auth.tenant_id(), id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(probe_response(probe)),
+    ))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/targets/{id}",
+    params(("id" = i64, Path, description = "Target channel id")),
+    request_body = TargetChannelPatchRequest,
+    responses(
+        (status = 200, description = "Target channel updated; probe state cleared when routing fields change", body = TargetChannelResponse),
+        (status = 400, description = "Invalid target update", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Target or sender identity not found", body = ErrorResponse),
+        (status = 409, description = "Target channel already exists", body = ErrorResponse)
+    )
+)]
+async fn update_target(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+    Json(input): Json<TargetChannelPatchRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_target_write(auth)?;
+    let chat = input.chat.as_deref().map(parse_target_chat).transpose()?;
+    let record = tgm_db::repo::update_target_channel(
+        &state.pool,
+        auth.tenant_id(),
+        id,
+        tgm_db::repo::TargetChannelUpdateInput {
+            tg_chat_id: chat,
+            title: input
+                .title
+                .map(|value| value.map(|title| title.trim().to_owned())),
+            sender_identity_id: input.sender_identity_id,
+            enabled: input.enabled,
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(target_response(record)),
+    ))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/targets/{id}",
+    params(("id" = i64, Path, description = "Target channel id")),
+    responses(
+        (status = 204, description = "Target channel disabled"),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Target channel not found", body = ErrorResponse)
+    )
+)]
+async fn delete_target(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_target_write(auth)?;
+    if !tgm_db::repo::delete_target_channel(&state.pool, auth.tenant_id(), id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Err(AppError::NotFound.into());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/tasks",
+    params(TaskListQuery),
+    responses(
+        (status = 200, description = "Tenant delivery tasks", body = TaskListResponse),
+        (status = 400, description = "Invalid task filters", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse)
+    )
+)]
+async fn list_tasks(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Query(query): Query<TaskListQuery>,
+) -> Result<Json<TaskListResponse>, ApiError> {
+    let (page, per_page) = task_pagination(&query)?;
+    let status = task_status(&query)?;
+    let target_ref = task_target_ref(&query)?;
+    let since = task_since(&query)?;
+    let mut records = tgm_db::repo::list_delivery_tasks(
+        &state.pool,
+        auth.tenant_id(),
+        status,
+        target_ref,
+        since,
+        per_page + 1,
+        (page - 1) * per_page,
+    )
+    .await
+    .map_err(AppError::from)?;
+    let has_more = records.len() as i64 > per_page;
+    if has_more {
+        records.truncate(per_page as usize);
+    }
+    Ok(Json(TaskListResponse {
+        items: records.into_iter().map(task_response).collect(),
+        page,
+        per_page,
+        has_more,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/tasks/{id}",
+    params(("id" = i64, Path, description = "Delivery task id")),
+    responses(
+        (status = 200, description = "Delivery task with logs and rule snapshot", body = TaskDetailResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 404, description = "Task not found", body = ErrorResponse)
+    )
+)]
+async fn get_task(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<Json<TaskDetailResponse>, ApiError> {
+    let (task, logs) = tgm_db::repo::load_delivery_task_detail(&state.pool, auth.tenant_id(), id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(task_detail_response(task, logs)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/audit-logs",
+    params(AuditLogListQuery),
+    responses(
+        (status = 200, description = "Tenant audit logs", body = AuditLogListResponse),
+        (status = 400, description = "Invalid audit log filters", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse)
+    )
+)]
+async fn list_audit_logs(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Query(query): Query<AuditLogListQuery>,
+) -> Result<Json<AuditLogListResponse>, ApiError> {
+    let (page, per_page) = audit_pagination(&query)?;
+    let actor_user_id = audit_actor(&query)?;
+    let source = audit_source(&query)?;
+    let since = audit_since(&query)?;
+    let mut records = tgm_db::repo::list_audit_logs(
+        &state.pool,
+        auth.tenant_id(),
+        actor_user_id,
+        source,
+        since,
+        per_page + 1,
+        (page - 1) * per_page,
+    )
+    .await
+    .map_err(AppError::from)?;
+    let has_more = records.len() as i64 > per_page;
+    if has_more {
+        records.truncate(per_page as usize);
+    }
+    Ok(Json(AuditLogListResponse {
+        items: records.into_iter().map(audit_log_response).collect(),
+        page,
+        per_page,
+        has_more,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/logs",
+    params(SystemLogListQuery),
+    responses(
+        (status = 200, description = "Tenant system logs", body = SystemLogListResponse),
+        (status = 400, description = "Invalid log pagination", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse)
+    )
+)]
+async fn list_system_logs(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Query(query): Query<SystemLogListQuery>,
+) -> Result<Json<SystemLogListResponse>, ApiError> {
+    let (page, per_page) = system_log_pagination(&query)?;
+    let mut records = tgm_db::repo::list_system_logs(
+        &state.pool,
+        auth.tenant_id(),
+        query.level.as_deref(),
+        query.module.as_deref(),
+        per_page + 1,
+        (page - 1) * per_page,
+    )
+    .await
+    .map_err(AppError::from)?;
+    let has_more = records.len() as i64 > per_page;
+    if has_more {
+        records.truncate(per_page as usize);
+    }
+    Ok(Json(SystemLogListResponse {
+        items: records.into_iter().map(system_log_response).collect(),
+        page,
+        per_page,
+        has_more,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/tasks/{id}/retry",
+    params(("id" = i64, Path, description = "Delivery task id")),
+    responses(
+        (status = 200, description = "Delivery task queued for retry", body = TaskDetailResponse),
+        (status = 400, description = "Task is not retryable", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Owner or admin required", body = ErrorResponse),
+        (status = 404, description = "Task not found", body = ErrorResponse)
+    )
+)]
+async fn retry_task(
+    Authenticated(auth): Authenticated,
+    State(state): State<ControlPlaneState>,
+    Path(id): Path<i64>,
+) -> Result<Json<TaskDetailResponse>, ApiError> {
+    require_source_write(auth)?;
+    let Some((task, _logs)) =
+        tgm_db::repo::load_delivery_task_detail(&state.pool, auth.tenant_id(), id)
+            .await
+            .map_err(AppError::from)?
+    else {
+        return Err(AppError::NotFound.into());
+    };
+    if task.status != "DEAD" && task.status != "FAILED" {
+        return Err(AppError::ConditionInvalid(
+            "only DEAD or FAILED tasks can be retried".to_owned(),
+        )
+        .into());
+    }
+    if !tgm_db::repo::retry_delivery_task(&state.pool, auth.tenant_id(), id)
+        .await
+        .map_err(AppError::from)?
+    {
+        return Err(
+            AppError::ConditionInvalid("task changed state before retry".to_owned()).into(),
+        );
+    }
+    let (task, logs) = tgm_db::repo::load_delivery_task_detail(&state.pool, auth.tenant_id(), id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(task_detail_response(task, logs)))
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Telegram Monitor Control Plane",
+        version = "0.1.0",
+        description = "Tenant-scoped control plane contract"
+    ),
+    paths(
+        healthz,
+        health,
+        dashboard,
+        list_identities,
+        create_bot_identity,
+        start_qr_login,
+        poll_qr_login,
+        submit_qr_login_password,
+        update_identity,
+        reset_identity_status,
+        delete_identity,
+        list_keywords,
+        test_keywords,
+        import_keywords,
+        export_keywords,
+        create_keyword,
+        update_keyword,
+        delete_keyword,
+        list_targets,
+        get_target_probe,
+        start_target_probe,
+        create_target,
+        update_target,
+        delete_target,
+        list_rules,
+        get_rule,
+        test_rule,
+        create_rule,
+        update_rule,
+        delete_rule,
+        list_rule_versions,
+        get_rule_version,
+        copy_rule,
+        list_rule_replacements,
+        replace_rule_replacements,
+        test_rule_replacements,
+        copy_rule_replacements,
+        list_sources,
+        get_source,
+        create_source,
+        update_source,
+        list_tasks,
+        get_task,
+        retry_task,
+        list_audit_logs,
+        list_system_logs,
+        create_qr_challenge,
+        get_qr_challenge,
+        auth_me,
+        auth_logout,
+        auth_sessions,
+        auth_revoke_session,
+        start_oidc_login,
+        oidc_callback
+    ),
+    components(schemas(
+        HealthzResponse,
+        HealthResponse,
+        DashboardResponse,
+        DashboardIdentityStatus,
+        DashboardToday,
+        IdentityResponse,
+        IdentityListResponse,
+        BotIdentityCreateRequest,
+        QrLoginStartRequest,
+        QrLoginStartResponse,
+        QrLoginStatusResponse,
+        QrLoginPasswordRequest,
+        IdentityPatchRequest,
+        KeywordResponse,
+        KeywordListResponse,
+        KeywordCreateRequest,
+        KeywordPatchRequest,
+        KeywordTestRequest,
+        KeywordTestMatch,
+        KeywordTestResponse,
+        KeywordImportRuleRequest,
+        KeywordImportRequest,
+        KeywordImportResponse,
+        KeywordExportResponse,
+        TargetChannelResponse,
+        TargetProbeResponse,
+        TargetChannelListResponse,
+        TargetChannelCreateRequest,
+        TargetChannelPatchRequest,
+        RuleResponse,
+        RuleListResponse,
+        RuleConditionRequest,
+        RuleReplacementRequest,
+        RuleReplacementsRequest,
+        RuleReplacementTestRequest,
+        RuleReplacementCopyRequest,
+        RuleReplacementCopyItem,
+        RuleReplacementCopyResponse,
+        RuleCreateRequest,
+        RulePatchRequest,
+        RuleCopyRequest,
+        RuleConditionResponse,
+        RuleReplacementResponse,
+        RuleReplacementListResponse,
+        RuleReplacementStepResponse,
+        RuleReplacementTestResponse,
+        RuleDetailResponse,
+        RuleTestRequest,
+        RuleTestTraceResponse,
+        RuleTestRouteResponse,
+        RuleTestResponse,
+        RuleVersionResponse,
+        RuleVersionListResponse,
+        SourceSubscriptionResponse,
+        SourceListResponse,
+        SourceCreateRequest,
+        SourceUpdateRequest,
+        DeliveryTaskResponse,
+        DeliveryLogResponse,
+        TaskListResponse,
+        TaskDetailResponse,
+        AuditLogResponse,
+        AuditLogListResponse,
+        SystemLogResponse,
+        SystemLogListResponse,
+        ErrorDetails,
+        ErrorEnvelope,
+        ErrorResponse,
+        AuthMeResponse,
+        WebSessionResponse,
+        WebSessionListResponse,
+        QrChallengeResponse,
+        QrChallengeStatusResponse
+    ))
+)]
+pub struct PublicApiDoc;
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Telegram Monitor Platform Admin Control Plane",
+        version = "0.1.0",
+        description = "Platform-only contract; tenant routes are intentionally excluded"
+    ),
+    components(schemas(ErrorDetails, ErrorEnvelope, ErrorResponse))
+)]
+pub struct AdminApiDoc;
+
+pub fn public_openapi_json() -> Result<String, serde_json::Error> {
+    let mut openapi = PublicApiDoc::openapi();
+    add_request_id_response_headers(&mut openapi);
+    serde_json::to_string_pretty(&openapi)
+}
+
+pub fn admin_openapi_json() -> Result<String, serde_json::Error> {
+    let mut openapi = AdminApiDoc::openapi();
+    add_request_id_response_headers(&mut openapi);
+    serde_json::to_string_pretty(&openapi)
+}
+
+fn add_request_id_response_headers(openapi: &mut utoipa::openapi::OpenApi) {
+    use utoipa::openapi::{RefOr, header::HeaderBuilder};
+
+    for path in openapi.paths.paths.values_mut() {
+        for operation in [
+            path.get.as_mut(),
+            path.put.as_mut(),
+            path.post.as_mut(),
+            path.delete.as_mut(),
+            path.options.as_mut(),
+            path.head.as_mut(),
+            path.patch.as_mut(),
+            path.trace.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for response in operation.responses.responses.values_mut() {
+                if let RefOr::T(response) = response {
+                    response.headers.insert(
+                        "X-Tgm-Request-Id".to_owned(),
+                        HeaderBuilder::new()
+                            .description(Some("服务端生成的请求关联标识"))
+                            .build(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub fn router(state: ControlPlaneState) -> Router {
+    Router::new()
+        .merge(crate::console::route())
+        .merge(crate::bot_console::route(state.clone()))
+        .route(
+            "/auth/oidc/start",
+            get(start_oidc_login).route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/auth/oidc/callback",
+            get(oidc_callback).route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/auth/qr/challenge",
+            post(create_qr_challenge).route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/auth/qr/challenge/{nonce}",
+            get(get_qr_challenge).route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/auth/me",
+            get(auth_me).route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/auth/logout",
+            post(auth_logout).route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/auth/sessions",
+            get(auth_sessions).route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/auth/sessions/{id}",
+            delete(auth_revoke_session).route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route("/healthz", get(healthz))
+        .route("/health", get(health))
+        .route("/api/v1/dashboard/summary", get(dashboard))
+        .route("/api/v1/identities", get(list_identities))
+        .route("/api/v1/identities/bot", post(create_bot_identity))
+        .route(
+            "/api/v1/identities/login/qr",
+            post(start_qr_login).route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/api/v1/identities/login/qr/{login_id}",
+            get(poll_qr_login).route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/api/v1/identities/login/password",
+            post(submit_qr_login_password)
+                .route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/api/v1/identities/{id}",
+            patch(update_identity).delete(delete_identity),
+        )
+        .route(
+            "/api/v1/identities/{id}/reset-status",
+            post(reset_identity_status),
+        )
+        .route("/api/v1/keywords", get(list_keywords).post(create_keyword))
+        .route("/api/v1/keywords/test", post(test_keywords))
+        .route("/api/v1/keywords/import", post(import_keywords))
+        .route("/api/v1/keywords/export", get(export_keywords))
+        .route(
+            "/api/v1/keywords/{id}",
+            patch(update_keyword).delete(delete_keyword),
+        )
+        .route(
+            "/api/v1/targets",
+            get(list_targets)
+                .post(create_target)
+                .route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/api/v1/targets/{id}/probe",
+            get(get_target_probe)
+                .post(start_target_probe)
+                .route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route(
+            "/api/v1/targets/{id}",
+            patch(update_target)
+                .delete(delete_target)
+                .route_layer(middleware::from_fn(no_store_sensitive_auth)),
+        )
+        .route("/api/v1/rules", get(list_rules).post(create_rule))
+        .route(
+            "/api/v1/rules/{id}",
+            get(get_rule).patch(update_rule).delete(delete_rule),
+        )
+        .route("/api/v1/rules/{id}/copy", post(copy_rule))
+        .route("/api/v1/rules/{id}/test", post(test_rule))
+        .route(
+            "/api/v1/rules/{id}/replacements",
+            get(list_rule_replacements).put(replace_rule_replacements),
+        )
+        .route(
+            "/api/v1/rules/{id}/replacements/test",
+            post(test_rule_replacements),
+        )
+        .route("/api/v1/replacements/copy", post(copy_rule_replacements))
+        .route("/api/v1/rules/{id}/versions", get(list_rule_versions))
+        .route(
+            "/api/v1/rules/{id}/versions/{version}",
+            get(get_rule_version),
+        )
+        .route("/api/v1/sources", get(list_sources).post(create_source))
+        .route("/api/v1/sources/{id}", get(get_source).patch(update_source))
+        .route("/api/v1/tasks", get(list_tasks))
+        .route("/api/v1/tasks/{id}", get(get_task))
+        .route("/api/v1/tasks/{id}/retry", post(retry_task))
+        .route("/api/v1/audit-logs", get(list_audit_logs))
+        .route("/api/v1/logs", get(list_system_logs))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_request,
+        ))
+        .layer(middleware::from_fn(request_context))
+        .with_state(state)
+}
+
+pub async fn serve(pool: PgPool, listener: TcpListener) -> Result<(), std::io::Error> {
+    let app = router(ControlPlaneState::new(pool));
+    axum::serve(listener, app)
+        .with_graceful_shutdown(crate::shutdown_signal())
+        .await
+}
+
+pub async fn serve_with_auth(
+    pool: PgPool,
+    auth_pool: PgPool,
+    listener: TcpListener,
+) -> Result<(), std::io::Error> {
+    let app = router(ControlPlaneState::with_auth_pool(pool, auth_pool));
+    axum::serve(listener, app)
+        .with_graceful_shutdown(crate::shutdown_signal())
+        .await
+}
+
+pub async fn serve_with_auth_and_bot(
+    pool: PgPool,
+    auth_pool: PgPool,
+    bot_console_config: BotConsoleConfig,
+    listener: TcpListener,
+) -> Result<(), std::io::Error> {
+    let app = router(ControlPlaneState::with_auth_pool_and_bot(
+        pool,
+        auth_pool,
+        bot_console_config,
+    ));
+    axum::serve(listener, app)
+        .with_graceful_shutdown(crate::shutdown_signal())
+        .await
+}
+
+pub async fn serve_with_auth_and_bot_and_oidc(
+    pool: PgPool,
+    auth_pool: PgPool,
+    bot_console_config: BotConsoleConfig,
+    oidc_config: OidcConfig,
+    credential_intake: CredentialIntake,
+    listener: TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), std::io::Error> {
+    let state = ControlPlaneState::with_auth_pool_and_bot_and_oidc(
+        pool,
+        auth_pool,
+        bot_console_config,
+        oidc_config,
+    )
+    .with_credential_intake(credential_intake);
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let monitor_state = state.clone();
+    let monitor = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                changed = stopped.changed() => { let _ = changed; break; }
+                _ = interval.tick() => {}
+            }
+            for id in monitor_state.qr_logins.tenants() {
+                let active = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM tenants WHERE id=$1 AND status='active')",
+                )
+                .bind(id)
+                .fetch_one(&monitor_state.pool)
+                .await;
+                if matches!(active, Ok(false)) {
+                    close_logins(monitor_state.qr_logins.remove_tenant(id));
+                }
+            }
+        }
+    });
+    let app = router(state.clone());
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await;
+    let _ = stop.send(true);
+    let _ = monitor.await;
+    for id in state.qr_logins.tenants() {
+        close_logins(state.qr_logins.remove_tenant(id));
+    }
+    result
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::{
+        ApiError, ControlPlaneState, ErrorResponse, KeywordPatchRequest,
+        OIDC_AUTHORIZATION_ENDPOINT, OIDC_ISSUER, OIDC_JWKS_ENDPOINT, OIDC_STATE_COOKIE,
+        OIDC_TOKEN_ENDPOINT, OidcConfig, RulePatchRequest, TargetChannelPatchRequest,
+        exchange_oidc_code, fetch_oidc_jwks, router, validate_oidc_id_token,
+    };
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use josekit::jwk::alg::rsa::RsaKeyPair;
+    use josekit::jwk::{JwkSet, KeyPair};
+    use josekit::jws::{JwsHeader, RS256};
+    use josekit::jwt::{self, JwtPayload};
+    use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+    use std::{io, sync::Mutex};
+    use tgm_core::error::AppError;
+    use tgm_core::oidc::{OidcLoginMaterial, OidcSigningAlgorithm};
+    use tgm_core::secret::Secret;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tower::ServiceExt;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedWriterGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedWriterGuard {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let mut output = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("test output lock poisoned"))?;
+            output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedWriter {
+        type Writer = SharedWriterGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedWriterGuard(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_subscriber(output: Arc<Mutex<Vec<u8>>>) -> tracing::Dispatch {
+        tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_current_span(true)
+                    .with_span_list(true)
+                    .with_writer(SharedWriter(output)),
+            ),
+        )
+    }
+
+    fn test_database_url() -> String {
+        let port = std::env::var("TGM_TEST_PG_PORT").unwrap_or_else(|_| "55432".to_owned());
+        format!("postgres://app_user:apw@127.0.0.1:{port}/tgm_test_control")
+    }
+
+    #[test]
+    fn metadata_patch_distinguishes_omitted_null_and_strings() {
+        for (value, expected) in [
+            (None, None),
+            (Some(json!(null)), Some(None)),
+            (Some(json!("ops")), Some(Some("ops".to_owned()))),
+            (Some(json!("")), Some(Some(String::new()))),
+        ] {
+            let mut keyword = json!({});
+            let mut target = json!({});
+            if let Some(value) = value {
+                keyword["category"] = value.clone();
+                target["title"] = value;
+            }
+            let keyword: KeywordPatchRequest =
+                serde_json::from_value(keyword).expect("解析关键词分类 PATCH 失败");
+            let target: TargetChannelPatchRequest =
+                serde_json::from_value(target).expect("解析目标名称 PATCH 失败");
+            assert_eq!(keyword.category, expected);
+            assert_eq!(target.title, expected);
+        }
+    }
+
+    #[test]
+    fn metadata_patch_rejects_invalid_types() {
+        for value in [json!(42), json!(false), json!([]), json!({})] {
+            assert!(
+                serde_json::from_value::<KeywordPatchRequest>(json!({"category": value})).is_err()
+            );
+            assert!(
+                serde_json::from_value::<TargetChannelPatchRequest>(json!({"title": value}))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_patch_schema_keeps_nullable_strings_optional() {
+        let document: serde_json::Value = serde_json::from_str(
+            &super::public_openapi_json().expect("生成分类和名称 PATCH 契约失败"),
+        )
+        .expect("解析分类和名称 PATCH 契约失败");
+        for (schema_name, field) in [
+            ("KeywordPatchRequest", "category"),
+            ("TargetChannelPatchRequest", "title"),
+        ] {
+            let schema = &document["components"]["schemas"][schema_name];
+            assert_eq!(
+                schema["properties"][field]["type"],
+                json!(["string", "null"])
+            );
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .is_none_or(|fields| !fields.contains(&json!(field)))
+            );
+        }
+    }
+
+    #[test]
+    fn rule_patch_distinguishes_omitted_null_and_values() {
+        let omitted: RulePatchRequest =
+            serde_json::from_value(json!({})).expect("解析省略字段的规则 PATCH 失败");
+        assert_eq!(omitted.source_ref, None);
+        assert_eq!(omitted.media_type, None);
+        assert_eq!(omitted.template, None);
+
+        let cleared: RulePatchRequest = serde_json::from_value(json!({
+            "source_ref": null, "media_type": null, "template": null
+        }))
+        .expect("解析清空字段的规则 PATCH 失败");
+        assert_eq!(cleared.source_ref, Some(None));
+        assert_eq!(cleared.media_type, Some(None));
+        assert_eq!(cleared.template, Some(None));
+
+        let replaced: RulePatchRequest = serde_json::from_value(json!({
+            "source_ref": 42, "media_type": "TEXT", "template": ""
+        }))
+        .expect("解析赋值字段的规则 PATCH 失败");
+        assert_eq!(replaced.source_ref, Some(Some(42)));
+        assert_eq!(replaced.media_type, Some(Some("TEXT".to_owned())));
+        assert_eq!(replaced.template, Some(Some(String::new())));
+    }
+
+    #[test]
+    fn rule_patch_rejects_invalid_nullable_field_types() {
+        for payload in [
+            json!({"source_ref": "42"}),
+            json!({"source_ref": 1.5}),
+            json!({"source_ref": true}),
+            json!({"source_ref": []}),
+            json!({"source_ref": {}}),
+            json!({"media_type": 42}),
+            json!({"media_type": false}),
+            json!({"media_type": []}),
+            json!({"media_type": {}}),
+            json!({"template": 42}),
+            json!({"template": false}),
+            json!({"template": []}),
+            json!({"template": {}}),
+        ] {
+            assert!(
+                serde_json::from_value::<RulePatchRequest>(payload.clone()).is_err(),
+                "无效字段类型未被拒绝：{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_patch_schema_keeps_nullable_fields_optional() {
+        let document: serde_json::Value =
+            serde_json::from_str(&super::public_openapi_json().expect("生成规则 PATCH 契约失败"))
+                .expect("解析规则 PATCH 契约失败");
+        let schema = &document["components"]["schemas"]["RulePatchRequest"];
+        for (field, kind) in [
+            ("source_ref", "integer"),
+            ("media_type", "string"),
+            ("template", "string"),
+        ] {
+            assert_eq!(schema["properties"][field]["type"], json!([kind, "null"]));
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .is_none_or(|fields| !fields.contains(&json!(field)))
+            );
+        }
+        assert_eq!(schema["properties"]["source_ref"]["format"], "int64");
+    }
+
+    fn oidc_test_config(token_endpoint: String, jwks_endpoint: String) -> OidcConfig {
+        OidcConfig {
+            bot_id: "12345".to_owned(),
+            client_secret: Arc::new(Secret::new("test-client-secret".to_owned())),
+            signing_algorithm: OidcSigningAlgorithm::Rs256,
+            redirect_url: "https://console.example/auth/oidc/callback".to_owned(),
+            authorization_endpoint: OIDC_AUTHORIZATION_ENDPOINT.to_owned(),
+            token_endpoint,
+            issuer: OIDC_ISSUER.to_owned(),
+            jwks_endpoint,
+        }
+    }
+
+    fn signed_test_id_token(
+        material: &OidcLoginMaterial,
+        update: impl FnOnce(&mut JwtPayload),
+    ) -> (String, JwkSet) {
+        signed_test_id_token_with_key_id(material, "test-kid", update)
+    }
+
+    fn signed_test_id_token_with_key_id(
+        material: &OidcLoginMaterial,
+        key_id: &str,
+        update: impl FnOnce(&mut JwtPayload),
+    ) -> (String, JwkSet) {
+        let mut key_pair = RsaKeyPair::generate(2048).expect("生成测试 RSA 密钥失败");
+        key_pair.set_algorithm(Some("RS256"));
+        key_pair.set_key_id(Some(key_id));
+        let private_jwk = key_pair.to_jwk_key_pair();
+        let mut public_jwk = key_pair.to_jwk_public_key();
+        public_jwk.set_key_id(key_id);
+        public_jwk.set_algorithm("RS256");
+        public_jwk.set_key_use("sig");
+        public_jwk.set_key_operations(vec!["verify"]);
+
+        let mut payload = JwtPayload::new();
+        payload.set_issuer(OIDC_ISSUER);
+        payload.set_subject("8002");
+        payload
+            .set_claim("id", Some(json!(7001)))
+            .expect("写入测试 Telegram id 失败");
+        payload.set_audience(vec!["12345"]);
+        payload.set_expires_at(
+            &(SystemTime::UNIX_EPOCH
+                + Duration::from_secs(
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .expect("读取测试时间失败")
+                        .as_secs()
+                        + 600,
+                )),
+        );
+        payload
+            .set_claim("nonce", Some(json!(material.nonce())))
+            .expect("写入测试 nonce 失败");
+        update(&mut payload);
+
+        let mut header = JwsHeader::new();
+        header.set_algorithm("RS256");
+        header.set_key_id(key_id);
+        let signer = RS256
+            .signer_from_jwk(&private_jwk)
+            .expect("创建测试 RSA signer 失败");
+        let token =
+            jwt::encode_with_signer(&payload, &header, &signer).expect("签发测试 id_token 失败");
+
+        let mut jwks = JwkSet::new();
+        jwks.push_key(public_jwk);
+        (token, jwks)
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = socket
+                .read(&mut chunk)
+                .await
+                .expect("读取 HTTP 测试请求失败");
+            assert!(read > 0, "HTTP 测试请求意外提前结束");
+            buffer.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let header_text = String::from_utf8_lossy(&buffer[..header_end]);
+            let content_length = header_text
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length:")
+                        .or_else(|| line.strip_prefix("content-length:"))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let body_start = header_end + 4;
+            if buffer.len() >= body_start + content_length {
+                return (
+                    header_text.into_owned(),
+                    buffer[body_start..body_start + content_length].to_vec(),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_error_response_is_opaque_but_input_details_survive() {
+        const SENTINEL: &str = "credential-response-sentinel";
+        let api_error = ApiError::from(AppError::internal(sqlx::Error::ColumnNotFound(
+            SENTINEL.into(),
+        )));
+        let internal = api_error.response_body();
+        assert_eq!(internal.error.code, "INTERNAL");
+        assert_eq!(internal.error.message, "internal error");
+        assert!(internal.error.details.is_none());
+
+        let response = ApiError::from(AppError::internal(sqlx::Error::ColumnNotFound(
+            SENTINEL.into(),
+        )))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-tgm-error-code")
+                .and_then(|value| value.to_str().ok()),
+            Some("INTERNAL")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("读取内部错误响应失败");
+        let encoded = String::from_utf8(bytes.to_vec()).expect("内部错误响应不是 UTF-8");
+        assert!(
+            !encoded.contains(SENTINEL),
+            "内部错误细节泄漏到响应：{encoded}"
+        );
+        assert!(!encoded.contains("identity_secrets"));
+
+        let invalid =
+            ApiError::from(AppError::RegexInvalid("unclosed group".into())).response_body();
+        assert_eq!(invalid.error.code, "REGEX_INVALID");
+        assert_eq!(
+            invalid.error.details.expect("details").reason.as_deref(),
+            Some("unclosed group")
+        );
+    }
+
+    #[test]
+    fn error_response_keeps_single_outer_envelope() {
+        let body = ApiError::from(AppError::NotFound).response_body();
+        let encoded = serde_json::to_value(ErrorResponse { error: body.error }).expect("json");
+        assert_eq!(encoded["error"]["code"], "NOT_FOUND");
+        assert!(encoded.get("tenant_id").is_none());
+    }
+
+    #[test]
+    fn openapi_documents_request_id_on_every_response() {
+        for encoded in [
+            super::public_openapi_json().expect("生成 public OpenAPI 失败"),
+            super::admin_openapi_json().expect("生成 admin OpenAPI 失败"),
+        ] {
+            let document: serde_json::Value =
+                serde_json::from_str(&encoded).expect("解析 OpenAPI 失败");
+            let paths = document["paths"].as_object().expect("OpenAPI paths");
+            for (path, path_item) in paths {
+                let operations = path_item.as_object().expect("path item");
+                for (method, operation) in operations {
+                    let Some(responses) = operation.get("responses").and_then(|v| v.as_object())
+                    else {
+                        continue;
+                    };
+                    for (status, response) in responses {
+                        assert!(
+                            response["headers"]["X-Tgm-Request-Id"].is_object(),
+                            "{method} {path} {status} 未声明 X-Tgm-Request-Id"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_context_replaces_spoofed_ids_and_correlates_redacted_errors() {
+        use tracing::instrument::WithSubscriber;
+
+        const SENTINEL: &str = "internal-error-secret-sentinel";
+        const QUERY_SENTINEL: &str = "query-secret-sentinel";
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = capture_subscriber(Arc::clone(&output));
+        let app = axum::Router::new()
+            .route("/ok", get(|| async { StatusCode::NO_CONTENT }))
+            .route(
+                "/internal",
+                get(|| async move {
+                    Err::<StatusCode, ApiError>(
+                        AppError::internal(io::Error::other(SENTINEL)).into(),
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(super::request_context));
+
+        let success = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ok")
+                    .header("x-tgm-request-id", "caller-controlled")
+                    .header("x-tgm-request-id", "second-caller-value")
+                    .body(Body::empty())
+                    .expect("构造请求失败"),
+            )
+            .with_subscriber(dispatch.clone())
+            .await
+            .expect("执行成功请求失败");
+        assert_eq!(success.status(), StatusCode::NO_CONTENT);
+        let success_id = success
+            .headers()
+            .get(super::REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("成功响应缺少 request id")
+            .to_owned();
+        assert_ne!(success_id, "caller-controlled");
+        assert_ne!(success_id, "second-caller-value");
+
+        let without_client_id = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ok?value={QUERY_SENTINEL}"))
+                    .body(Body::empty())
+                    .expect("构造无 request ID 请求失败"),
+            )
+            .with_subscriber(dispatch.clone())
+            .await
+            .expect("执行无 request ID 请求失败");
+        let generated_id = without_client_id
+            .headers()
+            .get(super::REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("无 request ID 请求的响应缺少 request ID");
+        assert_ne!(success_id, generated_id);
+
+        let not_found = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/missing")
+                    .body(Body::empty())
+                    .expect("构造未知路径请求失败"),
+            )
+            .with_subscriber(dispatch.clone())
+            .await
+            .expect("执行未知路径请求失败");
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        assert!(not_found.headers().contains_key(super::REQUEST_ID_HEADER));
+
+        let internal = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/internal?value={QUERY_SENTINEL}"))
+                    .header("x-tgm-request-id", "caller-controlled")
+                    .header("x-tgm-request-id", "second-caller-value")
+                    .body(Body::empty())
+                    .expect("构造内部错误请求失败"),
+            )
+            .with_subscriber(dispatch)
+            .await
+            .expect("执行内部错误请求失败");
+        assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let internal_id = internal
+            .headers()
+            .get(super::REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("错误响应缺少 request id")
+            .to_owned();
+        assert_ne!(success_id, internal_id);
+        let internal_body = axum::body::to_bytes(internal.into_body(), 1_048_576)
+            .await
+            .expect("读取内部错误响应失败");
+        let internal_body =
+            String::from_utf8(internal_body.to_vec()).expect("内部错误响应不是 UTF-8");
+        assert!(!internal_body.contains(SENTINEL));
+        assert!(!internal_body.contains(QUERY_SENTINEL));
+
+        let logs = String::from_utf8(output.lock().expect("读取测试日志失败").clone())
+            .expect("测试日志不是 UTF-8");
+        assert!(
+            logs.contains(&internal_id),
+            "内部错误日志未关联响应 ID：{logs}"
+        );
+        assert!(!logs.contains(SENTINEL), "内部错误细节泄漏到日志：{logs}");
+        assert!(!logs.contains(QUERY_SENTINEL), "query 串泄漏到日志：{logs}");
+        assert!(
+            !logs.contains("caller-controlled"),
+            "伪造 request ID 泄漏到日志：{logs}"
+        );
+        assert!(
+            !logs.contains("second-caller-value"),
+            "重复 request ID 泄漏到日志：{logs}"
+        );
+        assert!(logs.contains("database") || logs.contains("internal"));
+    }
+
+    #[tokio::test]
+    async fn oidc_token_exchange_sends_basic_auth_and_pkce_fields() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("启动 OIDC token 测试服务失败");
+        let address = listener.local_addr().expect("读取 token 测试地址失败");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("接受 token 测试请求失败");
+            let (headers, body) = read_http_request(&mut socket).await;
+            let authorization = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("authorization")
+                        .then_some(value.trim())
+                })
+                .expect("OIDC 换码缺少客户端认证头");
+            let expected =
+                base64::engine::general_purpose::STANDARD.encode("12345:test-client-secret");
+            assert_eq!(authorization, format!("Basic {expected}"));
+            let body = String::from_utf8(body).expect("解析 token 测试请求体失败");
+            assert!(body.contains("grant_type=authorization_code"));
+            assert!(body.contains("code=auth-code"));
+            assert!(body.contains("client_id=12345"));
+            assert!(!body.contains("client_secret"));
+            assert!(!body.contains("test-client-secret"));
+            assert!(
+                body.contains(
+                    "redirect_uri=https%3A%2F%2Fconsole.example%2Fauth%2Foidc%2Fcallback"
+                )
+            );
+            assert!(body.contains("code_verifier="));
+            let response_body = br#"{"id_token":"signed-token"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                std::str::from_utf8(response_body).expect("构造 token 测试响应失败")
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("写入 token 测试响应失败");
+        });
+
+        let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+        let config = oidc_test_config(
+            format!("http://{address}/token"),
+            "http://127.0.0.1:9/jwks".to_owned(),
+        );
+        let token = exchange_oidc_code(&config, "auth-code", &material)
+            .await
+            .expect("OIDC token exchange 测试失败");
+        assert_eq!(token, "signed-token");
+        server.await.expect("token 测试服务任务失败");
+    }
+
+    async fn gzip_oidc_provider(body: &[u8]) -> (String, tokio::task::JoinHandle<()>) {
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).expect("压缩 OIDC 测试响应失败");
+        let compressed = encoder.finish().expect("完成 OIDC 测试响应压缩失败");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("启动 OIDC gzip 测试服务失败");
+        let address = listener.local_addr().expect("读取 OIDC gzip 测试地址失败");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("接受 OIDC gzip 测试请求失败");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket
+                    .read(&mut chunk)
+                    .await
+                    .expect("读取 OIDC gzip 测试请求失败");
+                assert!(read > 0, "OIDC gzip 测试请求提前结束");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                compressed.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("写入 OIDC gzip 响应头失败");
+            socket
+                .write_all(&compressed)
+                .await
+                .expect("写入 OIDC gzip 响应失败");
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn oidc_token_exchange_accepts_gzip_and_rejects_oversized_decompressed_body() {
+        for oversized in [false, true] {
+            let expected = if oversized {
+                "x".repeat(super::OIDC_MAX_TOKEN_BYTES as usize)
+            } else {
+                "signed-token".to_owned()
+            };
+            let body = serde_json::to_vec(&json!({ "id_token": expected }))
+                .expect("构造 OIDC gzip token 响应失败");
+            let (base_url, server) = gzip_oidc_provider(&body).await;
+            let config = oidc_test_config(
+                format!("{base_url}/token"),
+                "http://127.0.0.1:9/jwks".to_owned(),
+            );
+            let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+            let result = exchange_oidc_code(&config, "auth-code", &material).await;
+            if oversized {
+                assert_eq!(
+                    result.expect_err("解压后超大的 token 必须拒绝").code(),
+                    "OIDC_PROVIDER_UNAVAILABLE"
+                );
+            } else {
+                assert_eq!(result.expect("解压 OIDC token 失败"), expected);
+            }
+            server.await.expect("OIDC gzip token 测试服务失败");
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_jwks_accepts_gzip_and_rejects_oversized_decompressed_body() {
+        let body = br#"{"keys":[{"kty":"RSA","kid":"gzip-key","n":"AQAB","e":"AQAB"}]}"#;
+        for oversized in [false, true] {
+            let mut body = body.to_vec();
+            if oversized {
+                body.resize(super::OIDC_MAX_JWKS_BYTES as usize + 1, b' ');
+            }
+            let (base_url, server) = gzip_oidc_provider(&body).await;
+            let config = oidc_test_config(
+                "http://127.0.0.1:9/token".to_owned(),
+                format!("{base_url}/jwks"),
+            );
+            let result = fetch_oidc_jwks(&config).await;
+            if oversized {
+                assert_eq!(
+                    result.expect_err("解压后超大的 JWKS 必须拒绝").code(),
+                    "OIDC_PROVIDER_UNAVAILABLE"
+                );
+            } else {
+                assert_eq!(result.expect("解压 JWKS 失败").get("gzip-key").len(), 1);
+            }
+            server.await.expect("OIDC gzip JWKS 测试服务失败");
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_provider_failure_logs_exclude_credentials_urls_and_response_bodies() {
+        use tracing::instrument::WithSubscriber;
+
+        const SENTINEL: &str = "oidc-private-payload-must-not-be-logged";
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("启动 OIDC 脱敏测试服务失败");
+        let address = listener.local_addr().expect("读取 OIDC 脱敏测试地址失败");
+        let server = tokio::spawn(async move {
+            let rejected_client =
+                format!(r#"{{"error":"invalid_client","error_description":"{SENTINEL}"}}"#);
+            let unknown_error = format!(r#"{{"error":"{SENTINEL}"}}"#);
+            for (status, body) in [
+                ("400 Bad Request", rejected_client.as_str()),
+                ("503 Service Unavailable", SENTINEL),
+                ("400 Bad Request", unknown_error.as_str()),
+            ] {
+                let (mut socket, _) = listener.accept().await.expect("接受 OIDC 脱敏测试请求失败");
+                let _ = read_http_request(&mut socket).await;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("写入 OIDC 脱敏测试响应失败");
+            }
+        });
+        let config = oidc_test_config(
+            format!("http://{address}/token?secret={SENTINEL}"),
+            format!("http://{address}/jwks?secret={SENTINEL}"),
+        );
+        let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(SharedWriter(Arc::clone(&output)))
+                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            ),
+        );
+        super::REQUEST_ID
+            .scope("oidc-safe-request-id".to_owned(), async {
+                assert!(
+                    exchange_oidc_code(&config, SENTINEL, &material)
+                        .await
+                        .is_err()
+                );
+                assert!(fetch_oidc_jwks(&config).await.is_err());
+                assert!(
+                    exchange_oidc_code(&config, SENTINEL, &material)
+                        .await
+                        .is_err()
+                );
+            })
+            .with_subscriber(dispatch)
+            .await;
+        server.await.expect("OIDC 脱敏测试服务失败");
+        let logs = String::from_utf8(output.lock().expect("读取 OIDC 测试日志失败").clone())
+            .expect("OIDC 测试日志不是 UTF-8");
+        assert!(logs.contains("oidc-safe-request-id"));
+        assert!(logs.contains("\"stage\":\"token\""));
+        assert!(logs.contains("\"stage\":\"jwks\""));
+        assert!(logs.contains("\"reason\":\"invalid_client\""));
+        assert!(logs.contains("\"reason\":\"provider_rejected\""));
+        for value in [
+            SENTINEL,
+            "test-client-secret",
+            material.code_verifier(),
+            material.nonce(),
+            &address.to_string(),
+        ] {
+            assert!(!logs.contains(value), "OIDC 日志泄漏敏感输入");
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_token_exchange_maps_provider_overload_to_503() {
+        for status in ["429 Too Many Requests", "503 Service Unavailable"] {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("启动 OIDC provider 错误测试服务失败");
+            let address = listener
+                .local_addr()
+                .expect("读取 OIDC provider 错误测试地址失败");
+            let status = status.to_owned();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("接受 OIDC provider 错误测试请求失败");
+                let _ = read_http_request(&mut socket).await;
+                let response =
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("写入 OIDC provider 错误测试响应失败");
+            });
+
+            let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+            let config = oidc_test_config(
+                format!("http://{address}/token"),
+                "http://127.0.0.1:9/jwks".to_owned(),
+            );
+            let error = exchange_oidc_code(&config, "auth-code", &material)
+                .await
+                .expect_err("provider 过载不应被当作认证失败");
+            assert_eq!(error.http_status(), 503);
+            assert_eq!(error.code(), "OIDC_PROVIDER_UNAVAILABLE");
+            server.await.expect("OIDC provider 错误测试服务任务失败");
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_token_exchange_keeps_provider_rejected_code_as_authentication_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("启动 OIDC token 拒绝测试服务失败");
+        let address = listener
+            .local_addr()
+            .expect("读取 OIDC token 拒绝测试地址失败");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("接受 OIDC token 拒绝测试请求失败");
+            let _ = read_http_request(&mut socket).await;
+            let response =
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("写入 OIDC token 拒绝测试响应失败");
+        });
+
+        let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+        let config = oidc_test_config(
+            format!("http://{address}/token"),
+            "http://127.0.0.1:9/jwks".to_owned(),
+        );
+        let error = exchange_oidc_code(&config, "auth-code", &material)
+            .await
+            .expect_err("provider 拒绝授权码不应变成 503");
+        assert_eq!(error.http_status(), 400);
+        assert_eq!(error.code(), "CONDITION_INVALID");
+        server.await.expect("OIDC token 拒绝测试服务任务失败");
+    }
+
+    #[tokio::test]
+    async fn oidc_jwks_provider_statuses_are_unavailable() {
+        for status in ["429 Too Many Requests", "503 Service Unavailable"] {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("启动 OIDC JWKS provider 错误测试服务失败");
+            let address = listener
+                .local_addr()
+                .expect("读取 OIDC JWKS provider 错误测试地址失败");
+            let status = status.to_owned();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("接受 OIDC JWKS provider 错误测试请求失败");
+                let response =
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("写入 OIDC JWKS provider 错误测试响应失败");
+            });
+
+            let config = oidc_test_config(
+                "http://127.0.0.1:9/token".to_owned(),
+                format!("http://{address}/jwks"),
+            );
+            let error = fetch_oidc_jwks(&config)
+                .await
+                .expect_err("JWKS provider 过载不应被当作空密钥集");
+            assert_eq!(error.http_status(), 503);
+            assert_eq!(error.code(), "OIDC_PROVIDER_UNAVAILABLE");
+            server
+                .await
+                .expect("OIDC JWKS provider 错误测试服务任务失败");
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_jwks_provider_rejects_invalid_or_oversized_payloads() {
+        let responses = [
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"not\":\"jwks\"}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1048577\r\nConnection: close\r\n\r\n",
+        ];
+        for response in responses {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("启动 OIDC JWKS payload 测试服务失败");
+            let address = listener
+                .local_addr()
+                .expect("读取 OIDC JWKS payload 测试地址失败");
+            let response = response.to_owned();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("接受 OIDC JWKS payload 测试请求失败");
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("写入 OIDC JWKS payload 测试响应失败");
+            });
+
+            let config = oidc_test_config(
+                "http://127.0.0.1:9/token".to_owned(),
+                format!("http://{address}/jwks"),
+            );
+            let error = fetch_oidc_jwks(&config)
+                .await
+                .expect_err("非法或超大 JWKS 不应被接受");
+            assert_eq!(error.http_status(), 503);
+            assert_eq!(error.code(), "OIDC_PROVIDER_UNAVAILABLE");
+            server.await.expect("OIDC JWKS payload 测试服务任务失败");
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_jwks_rotation_accepts_overlap_and_rejects_retired_key() {
+        let material = OidcLoginMaterial::generate().expect("生成换钥测试材料失败");
+        let (old_token, old_keys) = signed_test_id_token_with_key_id(&material, "old-kid", |_| {});
+        let (new_token, new_keys) = signed_test_id_token_with_key_id(&material, "new-kid", |_| {});
+        let mut overlap_keys = old_keys.clone();
+        for key in new_keys.keys() {
+            overlap_keys.push_key(key.clone());
+        }
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("启动隔离换钥服务失败");
+        let address = listener.local_addr().expect("读取隔离换钥地址失败");
+        let server = tokio::spawn(async move {
+            for keys in [old_keys, overlap_keys, new_keys] {
+                let (mut socket, _) = listener.accept().await.expect("接受换钥请求失败");
+                let (request, _) = read_http_request(&mut socket).await;
+                assert!(request.starts_with("GET /jwks HTTP/1.1\r\n"));
+                let body = keys.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("写入换钥快照失败");
+            }
+        });
+        let config = oidc_test_config(
+            "http://127.0.0.1:9/token".to_owned(),
+            format!("http://{address}/jwks"),
+        );
+        for expected in [[true, false], [true, true], [false, true]] {
+            let keys = fetch_oidc_jwks(&config).await.expect("读取换钥快照失败");
+            for (token, accepted) in [(&old_token, expected[0]), (&new_token, expected[1])] {
+                let result = validate_oidc_id_token(token, &config, &material, &keys);
+                if accepted {
+                    assert_eq!(result.expect("有效换钥 token 被拒绝"), 7001);
+                } else {
+                    let error = result.expect_err("未知或退役 key 不应继续登录");
+                    assert_eq!(error.http_status(), 503);
+                    assert_eq!(error.code(), "OIDC_PROVIDER_UNAVAILABLE");
+                }
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("隔离换钥服务超时")
+            .expect("隔离换钥服务失败");
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_provider_failures_issue_no_session_and_consume_state() {
+        for scenario in ["unknown_kid", "jwks_failure", "expired_token"] {
+            let material = OidcLoginMaterial::generate().expect("生成回调反证材料失败");
+            let state_value = material.state().to_owned();
+            let (token, keys) = signed_test_id_token(&material, |payload| {
+                if scenario == "expired_token" {
+                    payload
+                        .set_claim("exp", Some(json!(1)))
+                        .expect("设置过期 token 失败");
+                }
+            });
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("启动回调反证服务失败");
+            let address = listener.local_addr().expect("读取回调反证地址失败");
+            let token_body = json!({"id_token": token}).to_string();
+            let keys_body = if scenario == "unknown_kid" {
+                signed_test_id_token_with_key_id(&material, "other-kid", |_| {})
+                    .1
+                    .to_string()
+            } else {
+                keys.to_string()
+            };
+            let jwks_status = if scenario == "jwks_failure" {
+                "503 Service Unavailable"
+            } else {
+                "200 OK"
+            };
+            let server = tokio::spawn(async move {
+                for (method, path, status, body) in [
+                    ("POST", "/token", "200 OK", token_body),
+                    ("GET", "/jwks", jwks_status, keys_body),
+                ] {
+                    let (mut socket, _) = listener.accept().await.expect("接受回调反证请求失败");
+                    let (request, _) = read_http_request(&mut socket).await;
+                    assert!(request.starts_with(&format!("{method} {path} HTTP/1.1\r\n")));
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("写入回调反证响应失败");
+                }
+            });
+            let pool = PgPoolOptions::new()
+                .connect_lazy(&test_database_url())
+                .expect("构造回调反证惰性连接池失败");
+            let state = ControlPlaneState::with_auth_pool_and_oidc(
+                pool.clone(),
+                pool,
+                oidc_test_config(
+                    format!("http://{address}/token"),
+                    format!("http://{address}/jwks"),
+                ),
+            );
+            state.oidc_states.remember(material);
+            let app = router(state);
+            let callback = format!("/auth/oidc/callback?state={state_value}&code=isolated-code");
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                app.clone().oneshot(
+                    Request::builder()
+                        .uri(&callback)
+                        .header(header::COOKIE, format!("{OIDC_STATE_COOKIE}={state_value}"))
+                        .body(Body::empty())
+                        .expect("构造回调反证请求失败"),
+                ),
+            )
+            .await
+            .expect("回调反证超时")
+            .expect("执行回调反证失败");
+            let expected_status = if scenario == "expired_token" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            assert_eq!(response.status(), expected_status, "{scenario}");
+            let cookies: Vec<_> = response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .collect();
+            assert_eq!(cookies.len(), 1);
+            assert_eq!(cookies[0], super::OIDC_STATE_CLEAR_COOKIE);
+            let body = axum::body::to_bytes(response.into_body(), 16_384)
+                .await
+                .expect("读取回调反证结果失败");
+            let body = String::from_utf8(body.to_vec()).expect("回调结果不是 UTF-8");
+            for sensitive in [&token, &state_value, "isolated-code", "test-client-secret"] {
+                assert!(!body.contains(sensitive), "回调错误响应泄漏测试材料");
+            }
+            let replay = app
+                .oneshot(
+                    Request::builder()
+                        .uri(&callback)
+                        .header(header::COOKIE, format!("{OIDC_STATE_COOKIE}={state_value}"))
+                        .body(Body::empty())
+                        .expect("构造回调重放请求失败"),
+                )
+                .await
+                .expect("执行回调重放失败");
+            assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+            tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .expect("回调反证服务超时")
+                .expect("回调反证服务失败");
+        }
+    }
+
+    #[test]
+    fn oidc_rs256_jwks_verification_rejects_tampered_algorithm() {
+        let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+        let (token, jwks) = signed_test_id_token(&material, |_| {});
+        let config = oidc_test_config(
+            "http://127.0.0.1:9/token".to_owned(),
+            "http://127.0.0.1:9/jwks".to_owned(),
+        );
+        let jwk = jwks
+            .get("test-kid")
+            .into_iter()
+            .next()
+            .expect("测试 JWKS 缺少 kid");
+        let verifier = RS256
+            .verifier_from_jwk(jwk)
+            .expect("创建测试 verifier 失败");
+        let (payload, header) =
+            jwt::decode_with_verifier(&token, &verifier).expect("josekit 直接验签失败");
+        assert_eq!(header.algorithm(), Some("RS256"));
+        assert_eq!(payload.subject(), Some("8002"));
+        assert_eq!(payload.claim("id"), Some(&json!(7001)));
+        assert_eq!(
+            validate_oidc_id_token(&token, &config, &material, &jwks)
+                .expect("RS256 测试 token 验签失败"),
+            7001
+        );
+        let missing_kid_error = validate_oidc_id_token(&token, &config, &material, &JwkSet::new())
+            .expect_err("JWKS 缺少 kid 时不应继续验签");
+        assert_eq!(missing_kid_error.http_status(), 503);
+        assert_eq!(missing_kid_error.code(), "OIDC_PROVIDER_UNAVAILABLE");
+
+        let mut parts = token.split('.');
+        let _header = parts.next().expect("测试 token 缺少 header");
+        let payload = parts.next().expect("测试 token 缺少 payload");
+        let signature = parts.next().expect("测试 token 缺少 signature");
+        let tampered_header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","kid":"test-kid"}"#);
+        let tampered = format!("{tampered_header}.{payload}.{signature}");
+        assert!(validate_oidc_id_token(&tampered, &config, &material, &jwks).is_err());
+    }
+
+    #[test]
+    fn oidc_verified_token_accepts_integer_and_canonical_decimal_string_ids() {
+        let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+        let config = oidc_test_config(
+            "http://127.0.0.1:9/token".to_owned(),
+            "http://127.0.0.1:9/jwks".to_owned(),
+        );
+        for (user_id, expected) in [
+            (json!(1), 1),
+            (json!(7001), 7001),
+            (json!(i64::MAX), i64::MAX),
+            (json!("1"), 1),
+            (json!("7001"), 7001),
+            (json!(i64::MAX.to_string()), i64::MAX),
+        ] {
+            let (token, jwks) = signed_test_id_token(&material, |payload| {
+                payload
+                    .set_claim("id", Some(user_id))
+                    .expect("设置整数或字符串 id 失败");
+            });
+            assert_eq!(
+                validate_oidc_id_token(&token, &config, &material, &jwks)
+                    .expect("已验签的规范正整数 id 应通过"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_verified_token_rejects_invalid_ids_without_subject_fallback_or_log_disclosure() {
+        let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+        let config = oidc_test_config(
+            "http://127.0.0.1:9/token".to_owned(),
+            "http://127.0.0.1:9/jwks".to_owned(),
+        );
+        for (user_id, expected_reason) in [
+            (None, "telegram_id_missing"),
+            (Some(json!(null)), "telegram_id_null"),
+            (Some(json!("")), "telegram_id_invalid_string"),
+            (Some(json!("0")), "telegram_id_invalid_string"),
+            (Some(json!("00")), "telegram_id_invalid_string"),
+            (Some(json!("07001")), "telegram_id_invalid_string"),
+            (Some(json!("+7001")), "telegram_id_invalid_string"),
+            (Some(json!("-7001")), "telegram_id_invalid_string"),
+            (Some(json!(" 7001")), "telegram_id_invalid_string"),
+            (Some(json!("7001 ")), "telegram_id_invalid_string"),
+            (Some(json!("7001\n")), "telegram_id_invalid_string"),
+            (Some(json!("7e3")), "telegram_id_invalid_string"),
+            (Some(json!("7001.0")), "telegram_id_invalid_string"),
+            (Some(json!("７００１")), "telegram_id_invalid_string"),
+            (Some(json!("٧٠٠١")), "telegram_id_invalid_string"),
+            (
+                Some(json!("9223372036854775808")),
+                "telegram_id_invalid_string",
+            ),
+            (
+                Some(json!("18446744073709551615")),
+                "telegram_id_invalid_string",
+            ),
+            (
+                Some(json!("7001must-not-be-logged")),
+                "telegram_id_invalid_string",
+            ),
+            (Some(json!(0)), "telegram_id_nonpositive"),
+            (Some(json!(-1)), "telegram_id_nonpositive"),
+            (Some(json!(1.5)), "telegram_id_not_integer"),
+            (Some(json!(true)), "telegram_id_boolean"),
+            (Some(json!(9223372036854775808_u64)), "telegram_id_overflow"),
+            (Some(json!([])), "telegram_id_array"),
+            (Some(json!({})), "telegram_id_object"),
+            (
+                Some(json!({"private": "must-not-be-logged"})),
+                "telegram_id_object",
+            ),
+        ] {
+            let (token, jwks) = signed_test_id_token(&material, |payload| {
+                payload.set_subject("7001");
+                payload.set_claim("id", user_id).expect("设置反证 id 失败");
+            });
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let dispatch = capture_subscriber(Arc::clone(&output));
+            let error = tracing::dispatcher::with_default(&dispatch, || {
+                validate_oidc_id_token(&token, &config, &material, &jwks)
+                    .expect_err("非法 id 不得回退使用有效数字 subject")
+            });
+            assert_eq!(error.code(), "CONDITION_INVALID");
+            assert_eq!(error.http_status(), 400);
+            let logs = output.lock().expect("读取 OIDC 身份字段诊断失败");
+            let events: Vec<serde_json::Value> = logs
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).expect("诊断日志必须为 JSON"))
+                .collect();
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0]["fields"],
+                json!({
+                    "message": "OIDC authentication rejected",
+                    "stage": "claims",
+                    "reason": expected_reason,
+                    "request_id": "None",
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_verified_token_rejects_invalid_bound_claims() {
+        let material = OidcLoginMaterial::generate().expect("生成 OIDC 测试材料失败");
+        let config = oidc_test_config(
+            "http://127.0.0.1:9/token".to_owned(),
+            "http://127.0.0.1:9/jwks".to_owned(),
+        );
+        for (claim, value) in [
+            ("sub", None),
+            ("sub", Some(json!(""))),
+            ("iss", Some(json!("https://evil.example"))),
+            ("aud", Some(json!(["99999"]))),
+            ("exp", Some(json!(1))),
+            ("nonce", Some(json!("wrong-nonce"))),
+            ("azp", Some(json!("99999"))),
+            ("azp", Some(json!(12345))),
+            ("aud", Some(json!(["12345", "99999"]))),
+        ] {
+            let (token, jwks) = signed_test_id_token(&material, |payload| {
+                payload
+                    .set_claim("id", Some(json!("7001")))
+                    .expect("设置 provider 字符串 id 失败");
+                payload
+                    .set_claim(claim, value)
+                    .expect("设置 claims 反证失败");
+            });
+            assert!(validate_oidc_id_token(&token, &config, &material, &jwks).is_err());
+        }
+        let (token, jwks) = signed_test_id_token(&material, |payload| {
+            payload.set_subject("opaque-subject");
+            payload
+                .set_claim("aud", Some(json!(["12345", "99999"])))
+                .expect("设置多 audience 失败");
+            payload
+                .set_claim("azp", Some(json!("12345")))
+                .expect("设置合法 azp 失败");
+        });
+        assert_eq!(
+            validate_oidc_id_token(&token, &config, &material, &jwks)
+                .expect("合法 opaque sub 验证失败"),
+            7001
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_start_returns_server_side_pkce_redirect() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy(&test_database_url())
+            .expect("构造惰性测试连接池失败");
+        let state = ControlPlaneState::with_auth_pool_and_oidc(
+            pool.clone(),
+            pool,
+            OidcConfig {
+                bot_id: "12345".to_owned(),
+                client_secret: Arc::new(Secret::new("test-client-secret".to_owned())),
+                signing_algorithm: OidcSigningAlgorithm::Rs256,
+                redirect_url: "https://console.example/auth/oidc/callback".to_owned(),
+                authorization_endpoint: OIDC_AUTHORIZATION_ENDPOINT.to_owned(),
+                token_endpoint: "http://127.0.0.1:9/token".to_owned(),
+                issuer: OIDC_ISSUER.to_owned(),
+                jwks_endpoint: "http://127.0.0.1:9/jwks".to_owned(),
+            },
+        );
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/auth/oidc/start")
+                    .body(Body::empty())
+                    .expect("构造 OIDC 起始请求失败"),
+            )
+            .await
+            .expect("执行 OIDC 起始请求失败");
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("OIDC 起始响应缺少 Location");
+        assert!(location.starts_with("https://oauth.telegram.org/auth?"));
+        assert!(location.contains("response_type=code"));
+        assert!(location.contains("client_id=12345"));
+        assert!(location.contains("code_challenge="));
+        assert!(location.contains("code_challenge_method=S256"));
+        assert!(location.contains("nonce="));
+        assert!(location.contains("state="));
+        let state_value = location
+            .split("state=")
+            .nth(1)
+            .and_then(|value| value.split('&').next())
+            .expect("OIDC 起始 URL 缺少 state 值");
+        let state_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("OIDC 起始响应缺少 state cookie");
+        assert!(state_cookie.contains(&format!("{OIDC_STATE_COOKIE}={state_value}")));
+        assert!(state_cookie.contains("Path=/auth/oidc/callback"));
+        assert!(state_cookie.contains("Max-Age=600"));
+        assert!(state_cookie.contains("HttpOnly"));
+        assert!(state_cookie.contains("Secure"));
+        assert!(state_cookie.contains("SameSite=Lax"));
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_binds_state_to_browser_and_consumes_it_once() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("启动 OIDC 拒绝测试服务失败");
+        let address = listener.local_addr().expect("读取 OIDC 拒绝测试地址失败");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("接受 OIDC 拒绝测试请求失败");
+            let _ = read_http_request(&mut socket).await;
+            let response =
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("写入 OIDC 拒绝测试响应失败");
+        });
+        let pool = PgPoolOptions::new()
+            .connect_lazy(&test_database_url())
+            .expect("构造惰性测试连接池失败");
+        let state = ControlPlaneState::with_auth_pool_and_oidc(
+            pool.clone(),
+            pool,
+            OidcConfig {
+                bot_id: "12345".to_owned(),
+                client_secret: Arc::new(Secret::new("test-client-secret".to_owned())),
+                signing_algorithm: OidcSigningAlgorithm::Rs256,
+                redirect_url: "https://console.example/auth/oidc/callback".to_owned(),
+                authorization_endpoint: OIDC_AUTHORIZATION_ENDPOINT.to_owned(),
+                token_endpoint: format!("http://{address}/token"),
+                issuer: OIDC_ISSUER.to_owned(),
+                jwks_endpoint: format!("http://{address}/jwks"),
+            },
+        );
+        let app = router(state);
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/auth/oidc/start")
+                    .body(Body::empty())
+                    .expect("构造 OIDC 起始请求失败"),
+            )
+            .await
+            .expect("执行 OIDC 起始请求失败");
+        let location = start
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("OIDC 起始响应缺少 Location")
+            .to_owned();
+        let state_value = location
+            .split("state=")
+            .nth(1)
+            .and_then(|value| value.split('&').next())
+            .expect("OIDC 起始 URL 缺少 state 值")
+            .to_owned();
+        let state_cookie = start
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("OIDC 起始响应缺少 state cookie")
+            .split(';')
+            .next()
+            .expect("OIDC state cookie 为空")
+            .to_owned();
+
+        let mismatch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/auth/oidc/callback?code=code-1&state=attacker-state")
+                    .header(header::COOKIE, &state_cookie)
+                    .body(Body::empty())
+                    .expect("构造错误 state 回调请求失败"),
+            )
+            .await
+            .expect("执行错误 state 回调请求失败");
+        assert_eq!(mismatch.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            mismatch
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/auth/oidc/callback?code=code-1&state={state_value}"
+                    ))
+                    .header(header::COOKIE, &state_cookie)
+                    .body(Body::empty())
+                    .expect("构造正确 state 回调请求失败"),
+            )
+            .await
+            .expect("执行正确 state 回调请求失败");
+        assert_eq!(accepted.status(), StatusCode::BAD_REQUEST);
+        server.await.expect("OIDC 拒绝测试服务任务失败");
+        assert_eq!(
+            accepted
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let cleared_cookie = accepted
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("回调响应缺少清理 state cookie");
+        assert!(cleared_cookie.contains("Max-Age=0"));
+
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/auth/oidc/callback?code=code-1&state={state_value}"
+                    ))
+                    .header(header::COOKIE, &state_cookie)
+                    .body(Body::empty())
+                    .expect("构造重放回调请求失败"),
+            )
+            .await
+            .expect("执行重放回调请求失败");
+        assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_missing_code_clears_cookie_after_consuming_state() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy(&test_database_url())
+            .expect("构造惰性测试连接池失败");
+        let state = ControlPlaneState::with_auth_pool_and_oidc(
+            pool.clone(),
+            pool,
+            OidcConfig {
+                bot_id: "12345".to_owned(),
+                client_secret: Arc::new(Secret::new("test-client-secret".to_owned())),
+                signing_algorithm: OidcSigningAlgorithm::Rs256,
+                redirect_url: "https://console.example/auth/oidc/callback".to_owned(),
+                authorization_endpoint: OIDC_AUTHORIZATION_ENDPOINT.to_owned(),
+                token_endpoint: OIDC_TOKEN_ENDPOINT.to_owned(),
+                issuer: OIDC_ISSUER.to_owned(),
+                jwks_endpoint: OIDC_JWKS_ENDPOINT.to_owned(),
+            },
+        );
+        let app = router(state);
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/auth/oidc/start")
+                    .body(Body::empty())
+                    .expect("构造 OIDC 起始请求失败"),
+            )
+            .await
+            .expect("执行 OIDC 起始请求失败");
+        let location = start
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("OIDC 起始响应缺少 Location")
+            .to_owned();
+        let state_value = location
+            .split("state=")
+            .nth(1)
+            .and_then(|value| value.split('&').next())
+            .expect("OIDC 起始 URL 缺少 state 值")
+            .to_owned();
+        let state_cookie = start
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("OIDC 起始响应缺少 state cookie")
+            .split(';')
+            .next()
+            .expect("OIDC state cookie 为空")
+            .to_owned();
+
+        let missing_code = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/auth/oidc/callback?state={state_value}"))
+                    .header(header::COOKIE, &state_cookie)
+                    .body(Body::empty())
+                    .expect("构造缺少 code 的回调请求失败"),
+            )
+            .await
+            .expect("执行缺少 code 的回调请求失败");
+        assert_eq!(missing_code.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            missing_code
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let cleared_cookie = missing_code
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("缺少 code 的回调响应缺少清理 state cookie");
+        assert!(cleared_cookie.contains("Max-Age=0"));
+
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/auth/oidc/callback?code=code-1&state={state_value}"
+                    ))
+                    .header(header::COOKIE, &state_cookie)
+                    .body(Body::empty())
+                    .expect("构造重放回调请求失败"),
+            )
+            .await
+            .expect("执行重放回调请求失败");
+        assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    }
+}

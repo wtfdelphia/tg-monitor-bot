@@ -1,0 +1,264 @@
+# eng/04 §四 那份卡口清单的可执行形式。**清单是定义处，本文件是它的落地**，
+# 两边必须同步 —— 少一条就是那条卡口不存在，而流水线照样全绿。
+#
+# 分两个 job 的理由不是提速：不连库的五条与连库的两条失败方向不同。
+# 前者红是代码问题，后者红可能是库没起来 —— 混在一个 job 里，
+# 一次 compose 启动失败会长得像审计断言报红。
+name: CI
+
+on:
+  push:
+    branches: [main, dev, 'codex/pre014-main-*']
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # 工具链由 rust-toolchain.toml 钉死在 1.98.1，这里不再指定版本 ——
+  # 写两遍就会有对不上的那天，而 clippy 的 lint 集合随版本变动（见该文件注释）。
+  RUSTFLAGS: -D warnings
+
+# GitHub-hosted runner 固定到 Ubuntu 24.04，避免 ubuntu-latest 在迁移期间
+# 分配不同镜像。升级 runner 前须验证 PostgreSQL client、Docker 与发布构建。
+# JavaScript Actions 使用 Node.js 24 runtime；cargo-deny 版本与配置由卡口固定。
+jobs:
+  # ── 不连库的五条（eng/04 §四 前五条）────────────────────────────────
+  static:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: 装工具链（components 来自 rust-toolchain.toml）
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # --offline 是这一步的全部意义：.sqlx/ 已提交（eng/00 §6.1），
+      # 所以编译期 SQL 校验在没有数据库的 job 里也能跑。
+      # 不加它，sqlx 会去连 DATABASE_URL 而这个 job 没有库。
+      - name: 编译期 SQL 校验（离线，用已提交的 .sqlx/）
+        run: cargo build --workspace --all-targets
+        env:
+          SQLX_OFFLINE: "true"
+
+      - name: cargo deny
+        run: |
+          cargo install cargo-deny --locked --version 0.20.2
+          cargo deny check
+
+      # 负向卡口：这条 grep 保证 newtype 约束的静态检查自己没被绕过。
+      # 它内含三条自检探针（坏副本必须被抓到），所以不需要在这里另加反证。
+      - name: 池 newtype 的负向约束
+        run: scripts/check-newtype.sh
+
+      - name: OpenAPI 契约一致
+        run: cargo run --quiet --bin tgm -- openapi --check
+        env:
+          SQLX_OFFLINE: "true"
+
+      - name: 驱动回归
+        run: python3 scripts/ai-driver/check-regressions.py
+
+      - name: 稳定源码归档器回归
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_stable_source_archive scripts.tests.test_stable_tree scripts.tests.test_stable_source_rebuild scripts.tests.test_stable_release_assets -v
+
+      - name: 原生发布包安装回归
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/check-native-services.py
+
+      - name: 稳定源码树清单核对
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          args=(--repository "$GITHUB_WORKSPACE" --commit "$GITHUB_SHA" --manifest-path scripts/stable-tree.manifest)
+          if [ "$GITHUB_REF" = refs/heads/main ] || [ "$BASE_BRANCH" = main ]; then args+=(--strict); fi
+          python3 scripts/check-stable-tree.py "${args[@]}"
+
+      - name: 精简源码快照树正向检查
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          output="$(python3 scripts/stable-tree-snapshot.py \
+            --repository "$GITHUB_WORKSPACE" \
+            --commit "$SOURCE_COMMIT" \
+            --manifest-path scripts/stable-tree.manifest)"
+          tree="$(printf '%s\n' "$output" | tail -1)"
+          [[ "$tree" =~ ^[0-9a-f]{40}$ ]] || {
+            printf '快照生成器没有返回 Git tree：%s\n' "$output" >&2
+            exit 1
+          }
+          validation_commit="$(printf '%s\n' 'PRE-014 ephemeral tree validation' \
+            | git -c user.name='PRE-014 CI Validator' \
+                -c user.email='pre014-ci-validator@example.invalid' \
+                commit-tree "$tree" -p "$SOURCE_COMMIT")"
+          python3 scripts/check-stable-tree.py \
+            --repository "$GITHUB_WORKSPACE" \
+            --commit "$validation_commit" \
+            --manifest-path scripts/stable-tree.manifest \
+            --strict
+
+      - name: 稳定源码归档 manifest 核对
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tgm-source-archive-check
+          epoch="$(git show -s --format=%ct HEAD)"
+          python3 scripts/stable-source-archive.py \
+            --repository "$GITHUB_WORKSPACE" \
+            --commit "$GITHUB_SHA" \
+            --manifest-path scripts/stable-source-archive.manifest \
+            --source-date-epoch "$epoch" \
+            --output /tmp/tgm-source-archive-check/source.tar.gz
+          python3 - /tmp/tgm-source-archive-check/source.tar.gz "$GITHUB_SHA" <<'PY'
+          import sys
+          import tarfile
+
+          archive, commit = sys.argv[1:]
+          expected_prefix = f"tg-monitor-bot-source-{commit}/"
+          with tarfile.open(archive, "r:gz") as source:
+              members = source.getnames()
+              if not members or any(not name.startswith(expected_prefix) for name in members):
+                  raise SystemExit("source archive contains an unexpected path")
+              if any("/docs/plan/" in name or "/docs/pre-do/" in name for name in members):
+                  raise SystemExit("source archive contains excluded development planning material")
+              metadata = source.extractfile(expected_prefix + "SOURCE-MANIFEST.sha256")
+              if metadata is None:
+                  raise SystemExit("source archive is missing manifest audit metadata")
+              print(metadata.read().decode(), end="")
+          print(f"archive_member_count={len(members)}")
+          PY
+  # ── 连库的两条 + 全部测试 ────────────────────────────────────────
+  database:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: 装工具链
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      # R7（crates/db/tests/backup.rs）要起 pg_dump，而**版本必须 ≥ 服务端**：
+      # pg_dump 对更高版本的服务端直接拒绝（"server version: 17.x;
+      # pg_dump version: 16.x"）。runner 自带的客户端版本不受我们控制，
+      # 所以显式装 17 而不是指望默认值。
+      #
+      # 不装会怎样：R7 的反证（owner 必须 dump 成功）先红 —— 那是刻意的。
+      # 若只有 R7 正向那条，版本不匹配会让它**因为错误的原因变绿**。
+      #
+      # 装完必须把 17 的 bin 显式前置到 PATH。**首跑实测（run 35821544704）：
+      # 装完 17.11 之后 `pg_dump --version` 仍然是 16.15**，R7 反证报
+      # "server version: 17.11; pg_dump version: 16.15" 而红。
+      # 本段原先的注释写着「/usr/bin/pg_dump 是 pg_wrapper，它选已装的最高版本，
+      # 所以装完不需要改 PATH」—— 那句话在 runner 上不成立：
+      # 镜像自带的 postgresql-client-16 把 /usr/bin/pg_dump 占住了，
+      # 装 client-17 只往 /usr/lib/postgresql/17/bin/ 放文件，不动 /usr/bin。
+      #
+      # 所以这里写死 17 的路径而不是再赌一次解析顺序，并且把版本从「打印」
+      # 改成「断言」：只 `pg_dump --version` 的话，版本不对也照样绿到下一步，
+      # 真正的失败推迟到测试里，报错指向 backup.rs 而不是这一步。
+      - name: 装 postgresql-client 17（R7 需要，且须与服务端同版本）
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          export PATH="/usr/lib/postgresql/17/bin:$PATH"
+          pg_dump --version
+          pg_dump --version | grep -q "PostgreSQL) 17\." || {
+            echo "::error::pg_dump 不是 17.x，R7 会因为版本不匹配而红"; exit 1; }
+
+      # 复用 compose.yaml —— 与本地开发同一份编排（eng/02 §一）。
+      # 不在这里手写 services: postgres，因为那会变成第二份真相：
+      # 四角色种子在 scripts/init/01-roles.sql 里，PgBouncer 的
+      # SERVER_RESET_QUERY_ALWAYS 是安全配置而非调优（R3/R4 依赖它）。
+      - name: 起 compose（postgres + pgbouncer + redis + minio）
+        run: docker compose up -d --wait
+
+      # 用 `tgm migrate` 而不是 `sqlx migrate run`，尽管下一步的脚本仍要 sqlx-cli。
+      # 理由：生产路径是 `tgm migrate`（ops/00 §2.1 第 1 步），它嵌入的是
+      # 编译期的那份 migrations/。如果这里只跑 CLI，「嵌入的那份能不能跑」
+      # 在 CI 里永远没验过 —— 而两者不一致的方式是存在的（改了文件没重新编译，
+      # 或 include 路径写错却恰好编过）。先跑 tgm migrate 就把这条路径覆盖了。
+      - name: 跑迁移（走生产路径 tgm migrate）
+        run: cargo run --bin tgm -- migrate
+        env:
+          # tgm_owner 是 NOLOGIN（实测 rolcanlogin=f），所以这里用 postgres 连。
+          # 每个 DDL 文件自己 SET ROLE tgm_owner —— 表的 owner 由文件保证，
+          # 不靠连接身份碰巧对（见 migrations/0002 开头的注释）。
+          TGM_DB_URL_OWNER: postgres://postgres:pw@127.0.0.1:55432/tgm
+
+      # sqlx-cli 供下面两步用：migrate-idempotent.sh 内部要 `sqlx migrate run`
+      # 来强制重跑（它先 DELETE 掉版本记录），以及 `cargo sqlx prepare --check`。
+      # 装在这里而不是「跑迁移」那步里，是为了让「那步验的是 tgm migrate」
+      # 这件事在 yml 里看得出来。
+      - name: 装 sqlx-cli
+        run: cargo install sqlx-cli --locked --version 0.9.0 --no-default-features -F postgres
+
+      # 为 cargo sqlx prepare 单独准备 schema 库；它不使用生产库，也不让任务代码
+      # 拿到 owner 连接。迁移仍走生产路径，但目标是测试 schema 库。
+      - name: 初始化测试 schema 库
+        run: cargo run --bin tgm -- migrate
+        env:
+          TGM_DB_URL_OWNER: postgres://postgres:pw@127.0.0.1:55432/tgm_test_schema
+
+      # eng/04 §四 清单里那条 `cargo sqlx prepare --check --workspace`。
+      # **必须在这个 job 而不是 static job**：无库时它报 error 但 rc=0（实测），
+      # 放进没有库的 job 会让它永远绿 —— 正是 §五 说的那个形状。
+      # 与上面 static job 的 `SQLX_OFFLINE=true cargo build` 不重复：
+      # 那条验「.sqlx/ 够用现有 SQL」，这条给出可操作的报错
+      # （`.sqlx is missing one or more queries`）而不是一句编译错误。
+      # 它对**多余**条目只 warning 且 rc=0（实测：往 .sqlx/ 塞一个改了 query
+      # 字段的条目，输出 "potentially unused queries found in .sqlx"，rc 仍是 0）。
+      # 所以这里把那句 warning 转成失败 —— 陈旧条目不是洁癖问题：
+      # .sqlx/ 是 static job 里 SQLX_OFFLINE 编译的唯一事实来源，
+      # 留着一条指向已删除列的缓存，下一个改这块的人会拿到一份
+      # 编译期通过、运行时报 column does not exist 的代码。
+      #
+      # 用 tee + grep 而不是 `--check` 的 rc：rc 在这条路径上不携带信息。
+      # set -o pipefail 让 prepare 自己的失败不被 tee 吃掉。
+      - name: .sqlx/ 与 SQL 一致（清单第 4 条）
+        run: |
+          set -o pipefail
+          cargo sqlx prepare --workspace --check 2>&1 | tee /tmp/prepare.log
+          if grep -q "unused queries found" /tmp/prepare.log; then
+            echo "::error::.sqlx/ 有陈旧条目 —— 跑 cargo sqlx prepare --workspace 重新生成"
+            exit 1
+          fi
+        env:
+          DATABASE_URL: postgres://app_user:apw@127.0.0.1:55432/tgm_test_schema
+
+      # 迁移可重入（WP-1 出口判据第一条）。第二遍必须是 no-op：
+      # sqlx 按文件记版本，但每个 DDL 文件内部也得幂等 ——
+      # 部分成功的状态是真实存在的（ADR-0021）。
+      - name: 迁移可重入（第二遍必须无新增版本）
+        run: scripts/migrate-idempotent.sh
+        env:
+          DATABASE_URL: postgres://postgres:pw@127.0.0.1:55432/tgm
+
+      # L1+L2+L3。DATABASE_URL 使用 tgm_test 控制库；它不是超级用户，
+      # 仅负责 SQLx 创建/删除临时测试库。隔离查询仍由 support/mod.rs 换成
+      # app_user / auth_lookup 受限连接。
+      - name: 测试
+        run: cargo test --workspace
+        env:
+          DATABASE_URL: postgres://tgm_test:tpw@127.0.0.1:55432/tgm_test_control
+          SQLX_OFFLINE: "true"
+
+      - name: RLS 静态审计
+        run: cargo run --bin tgm -- audit-rls
+        env:
+          TGM_DB_URL_OWNER: postgres://postgres:pw@127.0.0.1:55432/tgm
+
+      # ADR-0022：不是「再跑一遍」。判据是逐条破坏后恰好那一条红，
+      # 且撤销后库状态快照逐字节相同。只会全绿的断言等于没有断言。
+      - name: 审计断言双遍自检
+        run: scripts/audit-double-pass.sh
+        env:
+          TGM_DB_URL_OWNER: postgres://postgres:pw@127.0.0.1:55432/tgm

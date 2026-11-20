@@ -1,0 +1,1 @@
+../migrations/0021_identity_secret_bot_session.sql
