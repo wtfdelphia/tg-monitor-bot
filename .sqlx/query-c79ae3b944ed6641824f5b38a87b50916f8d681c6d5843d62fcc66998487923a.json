@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id\n          FROM canonical_events\n         WHERE receiver_identity_id = $1\n           AND tg_chat_id = $2\n           AND tg_message_id = $3\n           AND event_type = $4\n           AND edit_version = $5\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "canonical_events",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c79ae3b944ed6641824f5b38a87b50916f8d681c6d5843d62fcc66998487923a"
+}

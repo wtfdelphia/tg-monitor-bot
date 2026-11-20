@@ -1,0 +1,10 @@
+[Unit]
+Description=TGM tenant retention delivery-tasks
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=tgm-tenant-cleanup@delivery-tasks.service
+
+[Install]
+WantedBy=timers.target

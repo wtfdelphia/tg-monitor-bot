@@ -1,0 +1,10 @@
+[Unit]
+Description=TGM tenant retention notify-dedup
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=tgm-tenant-cleanup@notify-dedup.service
+
+[Install]
+WantedBy=timers.target

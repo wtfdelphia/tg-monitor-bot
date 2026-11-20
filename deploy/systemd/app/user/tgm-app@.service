@@ -1,0 +1,23 @@
+[Unit]
+Description=TGM user application role (%i; same UID, no role credential isolation)
+StartLimitInterval=120s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/
+ExecStartPre=/usr/bin/env -i "%h/.local/bin/tgm" serve --role %i --env-file "%h/.config/tgm/app/%i.env" --check-config
+ExecStart=/usr/bin/env -i "%h/.local/bin/tgm" serve --role %i --env-file "%h/.config/tgm/app/%i.env"
+Restart=on-failure
+RestartSec=10s
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=30s
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tgm-app-%i
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

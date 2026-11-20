@@ -1,0 +1,10 @@
+[Unit]
+Description=TGM tenant retention tenant-events
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=tgm-tenant-cleanup@tenant-events.service
+
+[Install]
+WantedBy=timers.target

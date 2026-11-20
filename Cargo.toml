@@ -1,0 +1,99 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/db", "crates/tg", "crates/app", "bins/tgm"]
+# vendor/ 下是打了本地补丁的上游 crate，经 [patch.crates-io] 接入，不是本仓成员（vendor/README.md）。
+exclude = ["vendor"]
+
+# 五个 crate 共享的元数据。license 必须写：不写则 cargo deny check licenses 报
+# 五条 error[unlicensed]（实测）—— 它对本仓自己的 crate 与第三方一视同仁。
+# 可以用 [licenses] private.ignore 让它跳过，但仓库本来就是 MIT（见 LICENSE），
+# 补真实值比让卡口对自己睁眼更对。
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# 版本号的唯一落点（eng/00 §6.3）。各 crate 写 `x = { workspace = true }`。
+# 理由是 §2.3 那个 opentelemetry 版本错配：两份不同版本同时链入且编译能过，
+# 这种问题只有在版本声明集中时才能靠读一个文件排除。
+[workspace.dependencies]
+# 核心运行时
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+rstest = "0.27"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+regex = "1.13"
+
+grammers-client = { version = "0.10.0", default-features = false, features = ["html"] }
+grammers-session = { version = "0.10.0", default-features = false }
+glass_pumpkin = "=2.0.0-rc0"
+
+# 错误类型（eng/00 §三：thiserror 给库层，anyhow 只给 bins）
+thiserror = "2.0"
+anyhow = "1.0"
+
+# 存储
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "macros", "migrate", "chrono", "json"] }
+
+# 信封加密（ADR-0011/0012，落地形态见 eng/01 §三）。eng/00 §二 没有钉这四个，
+# 版本是 2026-09-22 从 sparse index 核的当时最新稳定版。
+# aes-gcm 取 0.11（2026-08-21）而非网上示例常见的 0.10：0.11 起 aead 升到 0.6，
+# Nonce 与 Key 的构造路径变了，照 0.10 的示例写编译不过。
+aes-gcm = { version = "0.11", features = ["zeroize"] }
+zeroize = "1.9"
+async-trait = "0.1"          # eng/01 §三 的 trait 签名是 async fn
+base64 = "0.23"              # TGM_LOCAL_KEK 是 base64 的 32 字节
+getrandom = { version = "0.4", features = ["std", "sys_rng"] }
+sha2 = "0.11"
+# QR 登录二维码（WP-2-qr-login-control D3）：只开 svg，不拉 image
+qrcode = { version = "=0.14.1", default-features = false, features = ["svg"] }
+aws-config = { version = "=1.12.0", default-features = false, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio"] }
+aws-sdk-kms = { version = "=1.123.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "=1.152.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-runtime = "=1.10.0"
+aws-smithy-runtime-api = "=1.19.0"
+aws-smithy-types = "=1.8.1"
+aws-types = "=1.6.0"
+
+# 可观测性（eng/00 §5.1 的 subscriber 形态首发就要落地）
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+# CLI。eng/00 §二 没有钉 CLI 解析库，但 eng/04 的卡口要求 tgm 有子命令 ——
+# 见 bins/tgm/Cargo.toml 同处的注释。
+clap = { version = "4.6", features = ["derive"] }
+
+# Web / 控制面
+axum = "0.8"
+utoipa = "5.5"
+tower = { version = "0.5", features = ["util"] }
+flate2 = "1.1.10"
+josekit = { version = "0.10.3", features = ["vendored"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+
+# 本仓 crate
+tgm-core = { path = "crates/core" }
+tgm-db = { path = "crates/db" }
+tgm-tg = { path = "crates/tg" }
+tgm-app = { path = "crates/app" }
+
+# lint 开关集中在这里，各 crate 写 [lints] workspace = true。
+# 放 workspace 而不是各 crate 的 #![deny]：流水线是 `cargo clippy -- -D warnings`，
+# 而 -D warnings 只管命令行那一层，crate 内的 allow 会静默抵消它。
+[workspace.lints.rust]
+unsafe_code = "forbid"          # 本项目没有需要 unsafe 的地方，forbid 不留 allow 后门
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# 这两条对应 eng/00 §三 纪律 3（sqlx::Error 不得透给客户端）与 §五（脱敏）：
+# 隐式的 panic 与 unwrap 会把内部细节抖到日志或响应里。
+unwrap_used = "deny"
+expect_used = "warn"            # 启动期配置校验里 expect 是合理的，故只 warn
+panic = "warn"
+todo = "deny"                   # 骨架阶段容易留下，而它会在运行时炸
+dbg_macro = "deny"              # dbg! 走 Debug，绕过 Secret<T> 之外的脱敏约定
+
+# grammers-session 0.10.0 本地补丁：updateChannelTooLong 不再覆盖已知频道 pts（vendor/README.md）。
+# 上游修复发布后删掉这一节与 vendor/grammers-session，回到 crates.io。
+[patch.crates-io]
+grammers-session = { path = "vendor/grammers-session" }

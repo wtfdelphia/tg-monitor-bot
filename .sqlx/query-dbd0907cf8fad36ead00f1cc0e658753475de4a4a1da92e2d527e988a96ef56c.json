@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE account_leases\n           SET expires_at = clock_timestamp()\n         WHERE identity_id = $1\n           AND worker_id = $2\n           AND fencing_token = $3\n        RETURNING fencing_token\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "fencing_token",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "account_leases",
+            "name": "fencing_token"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "dbd0907cf8fad36ead00f1cc0e658753475de4a4a1da92e2d527e988a96ef56c"
+}

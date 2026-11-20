@@ -1,0 +1,1 @@
+../migrations/0024_tenant_notifications.sql

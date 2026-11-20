@@ -1,0 +1,22 @@
+[Unit]
+Description=TGM authentication retention (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tgm-auth-cleanup
+Group=tgm-auth-cleanup
+EnvironmentFile=/etc/tgm/auth-cleanup.env
+ExecStart=/usr/local/bin/tgm cleanup-auth --category %i
+TimeoutStartSec=15min
+TimeoutStopSec=30s
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=

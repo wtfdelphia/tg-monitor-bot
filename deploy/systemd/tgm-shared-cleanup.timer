@@ -1,0 +1,10 @@
+[Unit]
+Description=TGM shared event retention hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=tgm-shared-cleanup.service
+
+[Install]
+WantedBy=timers.target

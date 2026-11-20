@@ -1,0 +1,1260 @@
+//! 反向测试：跨租户隔离。清单与编号在 docs/design/eng/03-测试策略.md §三。
+//!
+//! 每条测试的名字带 `rN_` 前缀，对应那份清单的编号 —— 清单是唯一归口处，
+//! 这里不重复叙述测试意图，只写「怎么验」。
+//!
+//! 迁移路径写成 `../../migrations`：那份迁移在仓库根，不在本 crate 内
+//! （见 src/lib.rs 的同一条说明）。宏的默认推断是 crate 根下的 `migrations/`，
+//! 不写这个参数则整个 27 表一张都不会建，而测试会以「表不存在」失败 ——
+//! 那种失败看起来像测试写错了，其实是路径没配。
+
+// workspace 的 expect_used / panic 两条针对的是生产路径（eng/00 §三 纪律 3：
+// sqlx::Error 不得透给客户端）。在反向测试里 expect 与 panic 就是断言本身，
+// 换成 `?` 会把失败变成静默的 Err —— 那正好是这些测试要防的形状。
+// 范围限在本文件，不动 [workspace.lints]。
+#![allow(clippy::expect_used, clippy::panic)]
+
+mod support;
+
+use sqlx::PgPool;
+use support::AdminOnlyPool;
+use tgm_core::ids::TenantId;
+
+/// 两个租户加各自一行数据。返回 (租户 A, 租户 B)。
+///
+/// 以超级用户身份灌（eng/03 §2.2：种子不能在 RLS 启用后以受限角色插入）。
+/// 这不是偶然安全 —— fixture 只灌数据、不改 RLS 配置，是那节明确约定的。
+async fn seed_two_tenants(admin: &AdminOnlyPool) -> (i64, i64) {
+    let mut ids = Vec::new();
+    for name in ["tenant-a", "tenant-b"] {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO tenants (name, owner_user_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(name)
+        .bind(if name == "tenant-a" { 1001_i64 } else { 1002 })
+        .fetch_one(admin.raw())
+        .await
+        .expect("建租户失败");
+        sqlx::query("INSERT INTO keywords (tenant_id, word) VALUES ($1, $2)")
+            .bind(id)
+            .bind(format!("kw-{name}"))
+            .execute(admin.raw())
+            .await
+            .expect("灌关键词失败");
+        ids.push(id);
+    }
+    (ids[0], ids[1])
+}
+
+/// R1 不设 `app.tenant_id` 直接查 → 报错，非 0 行。
+///
+/// 这条同时是整套脚手架的自检：断言的后半段特意在**注入的管理池**上跑同一个查询，
+/// 并要求它成功。管理池（`tgm_test`）在测试库上带恒真策略 `tgm_test_admin`，
+/// 所以它查得到；两段合起来才证明受限角色池真的换了角色 ——
+/// 只有前半段的话，一个连都连不上的池也会让它「通过」。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn r1_no_tenant_context_errors(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    support::assert_not_bypassrls(&app).await;
+
+    let err = sqlx::query("SELECT count(*) FROM rules")
+        .fetch_one(&app)
+        .await
+        .expect_err("不设 app.tenant_id 竟然查成功了 —— 隔离是坏的");
+
+    // eng/03 §四 第 2 条：全新连接的报错是 unrecognized configuration parameter，
+    // 与 R3（复用连接、残留空串）的 invalid input syntax 不是同一条文本。
+    // 所以这里不能写成匹配「任意报错」，也不能与 R3 共用断言。
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unrecognized configuration parameter"),
+        "报错是 fail-loud 的，但文本不是预期的那条：{msg}"
+    );
+
+    // 脚手架自检：同一个查询在注入的管理池上必须成功
+    // （它带恒真策略，能看见所有行；换超级用户注入时这里是同样的自检）。
+    // 它失败意味着表没建起来，上面那个 expect_err 是因为别的原因过的。
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM rules")
+        .fetch_one(admin.raw())
+        .await
+        .expect("管理池查 rules 失败 —— 迁移没跑起来，上面那条断言是空的");
+    assert_eq!(n, 0, "干净的测试库里 rules 应该是空的");
+}
+
+/// R2 租户 A 写 B 的 `tenant_id` → `WITH CHECK` 拒绝。
+///
+/// 顺带验 USING：设了 A 的上下文只看得到 A 那一行。
+/// 两段一起才有意义 —— 只验 WITH CHECK 的话，一张空表也会让它通过。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn r2_cross_tenant_write_rejected(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let (a, b) = seed_two_tenants(&admin).await;
+
+    let mut tx = app.begin().await.expect("开事务失败");
+    // set_config 的第三参数是 true（事务级）。false 会让它活到连接归还之后，
+    // 那正是 R3 那条泄漏的成因（eng/03 §四）。
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(a.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设租户上下文失败");
+
+    let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM keywords")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("查本租户关键词失败");
+    assert_eq!(seen, 1, "USING 谓词不对：A 的上下文下应当只见 A 的 1 行");
+
+    let err = sqlx::query("INSERT INTO keywords (tenant_id, word) VALUES ($1, 'stolen')")
+        .bind(b)
+        .execute(&mut *tx)
+        .await
+        .expect_err("A 竟然写进了 B 的 tenant_id —— WITH CHECK 没起作用");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("row-level security policy"),
+        "拒绝了，但不是 RLS 拒的：{msg}"
+    );
+}
+
+/// R8 唯一约束探测 → 成功，不得 `duplicate key`。
+///
+/// 这条测的是侧信道而非读权限：`uq_keyword` 是 (tenant_id, word, match_type)，
+/// 带了 tenant_id，所以 A 插一个 B 已有的 word 应当成功。
+/// 若唯一约束漏了 tenant_id，这里会得到 duplicate key ——
+/// 而那个报错本身就是「B 有这个词」的 oracle，RLS 补不了。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn r8_unique_probe_no_oracle(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let (a, b) = seed_two_tenants(&admin).await;
+
+    // B 的那行用的词。A 拿它来探测。
+    let bs_word: String = sqlx::query_scalar("SELECT word FROM keywords WHERE tenant_id = $1")
+        .bind(b)
+        .fetch_one(admin.raw())
+        .await
+        .expect("取 B 的词失败");
+
+    let mut tx = app.begin().await.expect("开事务失败");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(a.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设租户上下文失败");
+
+    sqlx::query("INSERT INTO keywords (tenant_id, word) VALUES ($1, $2)")
+        .bind(a)
+        .bind(&bs_word)
+        .execute(&mut *tx)
+        .await
+        .expect("插 B 已有的词失败 —— 唯一约束漏了 tenant_id，这是跨租户 oracle");
+}
+
+/// R22 `app_user` 对 `tenant_consents` 的 `UPDATE`/`DELETE` → denied。
+///
+/// 这条验的是 GRANT 层而不是 RLS 层：0011 只给了 SELECT, INSERT。
+/// 所以报错应当是 permission denied，不是 row-level security policy ——
+/// 两者混淆会让「凭证不可篡改」这条保证落在错误的机制上。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn r22_consents_immutable(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let (a, _) = seed_two_tenants(&admin).await;
+    sqlx::query("INSERT INTO tenant_members (tenant_id, user_id) VALUES ($1, 1001)")
+        .bind(a)
+        .execute(admin.raw())
+        .await
+        .expect("建成员关系失败");
+    sqlx::query(
+        "INSERT INTO tenant_consents (tenant_id, consent_type, text_version, user_id)
+         VALUES ($1, 'tos', 'v1', 1001)",
+    )
+    .bind(a)
+    .execute(admin.raw())
+    .await
+    .expect("灌同意记录失败");
+
+    for sql in [
+        "UPDATE tenant_consents SET text_version = 'v2'",
+        "DELETE FROM tenant_consents",
+    ] {
+        let mut tx = app.begin().await.expect("开事务失败");
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(a.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("设租户上下文失败");
+        let err = sqlx::query(sql)
+            .execute(&mut *tx)
+            .await
+            .expect_err(&format!("`{sql}` 竟然成功了 —— 同意凭证可被篡改"));
+        assert!(
+            err.to_string().contains("permission denied"),
+            "被拒了，但不是 GRANT 层拒的：{err}"
+        );
+    }
+}
+
+/// R5 **关掉 RLS 跑跨租户查询 → 应仍不泄漏**。§三 说它是清单里最有价值的一条。
+///
+/// 它测的不是 RLS，是 `repo::count_keywords` 里那句显式 `WHERE tenant_id = $1`
+/// —— 也就是 eng/00 §四 那条纪律是否真被执行了。其余测试在 RLS 开着时都会绿，
+/// 唯有这条能证明第一道防线存在。
+///
+/// 注意 `TenantId` 只能从库里解码（eng/00 §4.1 没有 `From<i64>`），
+/// 所以下面那句 `query_scalar` 是必需的绕路，不是啰嗦。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn r5_no_leak_with_rls_disabled(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let (a, _b) = seed_two_tenants(&admin).await;
+
+    let ta: TenantId = sqlx::query_scalar("SELECT id FROM tenants WHERE id = $1")
+        .bind(a)
+        .fetch_one(admin.raw())
+        .await
+        .expect("解码 TenantId 失败");
+
+    // 第一遍：RLS 开着。两道防线都在。
+    let with_rls = tgm_db::repo::count_keywords(&app, ta)
+        .await
+        .expect("RLS 开着时查询失败");
+    assert_eq!(with_rls, 1, "本租户应当只有 1 行");
+
+    // 第二遍：关掉 RLS，只剩应用层那句 WHERE。
+    let mut admin_tx = admin.raw().begin().await.expect("开 admin 事务失败");
+    for sql in [
+        "SET ROLE tgm_owner",
+        "ALTER TABLE keywords DISABLE ROW LEVEL SECURITY",
+        "RESET ROLE",
+    ] {
+        sqlx::query(sql)
+            .execute(&mut *admin_tx)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` 失败：{e}"));
+    }
+    admin_tx.commit().await.expect("提交 RLS 变更失败");
+
+    // 先确认 RLS 真的关掉了 —— 否则这一遍与第一遍没有区别，
+    // 「第二遍也绿」这句话就是空的（与 audit-double-pass.sh 的判据同形）。
+    let leaked: i64 = sqlx::query_scalar("SELECT count(*) FROM keywords")
+        .fetch_one(&app)
+        .await
+        .expect("RLS 关掉后裸查应当成功");
+    assert_eq!(
+        leaked, 2,
+        "RLS 没真关掉，这一遍与第一遍无异 —— 本条测试没测到任何东西"
+    );
+
+    let without_rls = tgm_db::repo::count_keywords(&app, ta)
+        .await
+        .expect("RLS 关掉后查询失败");
+    assert_eq!(
+        without_rls, 1,
+        "关掉 RLS 后泄漏了 —— Repo 里漏了显式 WHERE tenant_id，第一道防线不存在"
+    );
+}
+
+/// R6 owner 的 `SECURITY DEFINER` 函数 / 普通视图。
+///
+/// §五 的实测结论改变了这条的断言形状：主断言是**静态**的
+/// 「带 `tenant_id` 的表上不存在普通视图与 `SECURITY DEFINER` 函数」，
+/// 那就是审计断言 A8。这里保留的是动态部分，防止有人补一条 owner 策略把 A8 绕开
+/// —— 补了之后 A8 仍绿（它只查对象存不存在），而泄漏是真的。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn r6_owner_paths_return_empty(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let (a, _b) = seed_two_tenants(&admin).await;
+
+    // 视图必须以 tgm_owner 身份建。**这一步不是样板**：
+    // 用超级用户建出来的视图 owner 是 postgres，而超级用户旁路 RLS ——
+    // 实测那样建出来的视图返回全部 2 行，本条断言会以「FORCE 没生效」失败，
+    // 而真正的原因只是视图 owner 错了。与「表的 owner 决定 FORCE 是真的还是装饰」
+    // 同形，只是对象换成了视图。
+    //
+    // SET ROLE 是会话级动作，所以三句必须在同一条连接上，不能分别走池。
+    let mut ddl_tx = admin.raw().begin().await.expect("开 DDL 事务失败");
+    for ddl in [
+        "SET ROLE tgm_owner",
+        "CREATE VIEW v_kw AS SELECT * FROM keywords",
+        "GRANT SELECT ON v_kw TO app_user",
+        "RESET ROLE",
+    ] {
+        sqlx::query(ddl)
+            .execute(&mut *ddl_tx)
+            .await
+            .unwrap_or_else(|e| panic!("`{ddl}` 失败：{e}"));
+    }
+    ddl_tx.commit().await.expect("提交 DDL 失败");
+
+    let mut tx = app.begin().await.expect("开事务失败");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(a.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设租户上下文失败");
+
+    // §五：不是「安全且可用」，而是「安全但功能坏掉」—— 静默 0 行。
+    // 这类 bug 在功能测试里表现为「查不到数据」，容易被误诊成数据没写进去。
+    let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM v_kw")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("查 owner 视图失败");
+    assert_eq!(
+        seen, 0,
+        "owner 的普通视图返回了 {seen} 行 —— FORCE 没在 owner 身上生效"
+    );
+}
+
+/// R19 **租户指定 `tenant_id IS NULL` 的演示身份建源 → 403**。§三 标它是承重墙。
+///
+/// 数据库层面这条**不成立而且必须不成立**：`shared_identity_read` 策略让
+/// `app_user` 看得见演示身份，而 `source_subscriptions.receiver_identity_id`
+/// 是普通单列外键 —— 于是 INSERT 会成功。
+/// 所以这条断言在这里的形态是「记录下 DB 不拦」，403 必须由应用层出。
+///
+/// 这不是把测试写松：把它写成「DB 会拦」才是假绿，因为 DB 确实不拦（本测试即证据），
+/// 而那样写出来的绿会让应用层那道检查看起来可以省。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn r19_db_does_not_block_demo_identity(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let (a, _b) = seed_two_tenants(&admin).await;
+
+    let demo: i64 = sqlx::query_scalar(
+        "INSERT INTO identities (kind, tenant_id, display_name)
+         VALUES ('bot', NULL, 'demo') RETURNING id",
+    )
+    .fetch_one(admin.raw())
+    .await
+    .expect("建演示身份失败");
+
+    let mut tx = app.begin().await.expect("开事务失败");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(a.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设租户上下文失败");
+
+    // 前提：演示身份对租户是可见的（shared_identity_read 策略）。
+    // 这一句同时防止下面那个 INSERT 因为「看不见所以不知道 id」而失去意义。
+    let visible: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM identities WHERE tenant_id IS NULL")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("查演示身份失败");
+    assert_eq!(
+        visible, 1,
+        "演示身份对租户不可见 —— shared_identity_read 没生效"
+    );
+
+    let r = sqlx::query(
+        "INSERT INTO source_subscriptions (tenant_id, tg_chat_id, receiver_identity_id)
+         VALUES ($1, -100123, $2)",
+    )
+    .bind(a)
+    .bind(demo)
+    .execute(&mut *tx)
+    .await;
+
+    assert!(
+        r.is_ok(),
+        "DB 竟然拦住了演示身份建源 —— 那说明 shared_identity_read 或外键形态变了，\
+         本测试所记录的前提（403 必须由应用层出）需要重新核对：{r:?}"
+    );
+}
+
+/// R13 `bot_console_sessions` 业务角色 `SELECT`/`INSERT` 均 denied。
+///
+/// 与 R22 同形（都验 GRANT 层封死），成本近零，故按 §三 的分批一起写。
+/// 0011 对这张表是 `REVOKE ALL ... FROM app_user`。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn r13_console_sessions_denied(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let (a, _) = seed_two_tenants(&admin).await;
+
+    for sql in [
+        "SELECT count(*) FROM bot_console_sessions",
+        "INSERT INTO bot_console_sessions (tg_user_id, tenant_id) VALUES (1, 1)",
+    ] {
+        let mut tx = app.begin().await.expect("开事务失败");
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(a.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("设租户上下文失败");
+        let err = sqlx::query(sql)
+            .execute(&mut *tx)
+            .await
+            .expect_err(&format!("`{sql}` 竟然成功了 —— 会话表对业务角色没封死"));
+        assert!(
+            err.to_string().contains("permission denied"),
+            "被拒了，但不是 GRANT 层拒的：{err}"
+        );
+    }
+}
+
+/// `web_sessions` 的写入只允许鉴权域代表当前绑定的 Telegram 用户写入。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn auth_lookup_web_session_insert_is_bound_to_auth_user(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let auth = support::auth_pool(&admin).await;
+    support::assert_role(&app, "app_user").await;
+    support::assert_role(&auth, "auth_lookup").await;
+    let tenant = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO tenants (name, owner_user_id) VALUES ('session-rls', 7301) RETURNING id",
+    )
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建会话 RLS 测试租户失败");
+    sqlx::query("INSERT INTO tenant_members (tenant_id, user_id) VALUES ($1, 7301), ($1, 7302)")
+        .bind(tenant)
+        .execute(admin.raw())
+        .await
+        .expect("创建会话 RLS 测试成员失败");
+
+    let mut tx = auth.begin().await.expect("开启 auth_lookup 事务失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', '7301', true)")
+        .execute(&mut *tx)
+        .await
+        .expect("绑定 auth_user_id 失败");
+    let own = sqlx::query(
+        "INSERT INTO web_sessions (tenant_id, id, user_id, csrf_token, expires_at)
+         VALUES ($1, $2, 7301, $3, now() + interval '30 days')",
+    )
+    .bind(tenant)
+    .bind([1_u8; 32].as_slice())
+    .bind([2_u8; 32].as_slice())
+    .execute(&mut *tx)
+    .await;
+    assert!(own.is_ok(), "auth_lookup 不能写入自己的会话：{own:?}");
+    tx.commit().await.expect("提交自己的会话失败");
+
+    let mut tx = auth.begin().await.expect("开启越权事务失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', '7301', true)")
+        .execute(&mut *tx)
+        .await
+        .expect("绑定越权测试 auth_user_id 失败");
+    let err = sqlx::query(
+        "INSERT INTO web_sessions (tenant_id, id, user_id, csrf_token, expires_at)
+         VALUES ($1, $2, 7302, $3, now() + interval '30 days')",
+    )
+    .bind(tenant)
+    .bind([3_u8; 32].as_slice())
+    .bind([4_u8; 32].as_slice())
+    .execute(&mut *tx)
+    .await
+    .expect_err("auth_lookup 竟能代表别的 Telegram 用户写会话");
+    assert!(
+        err.to_string().contains("row-level security policy"),
+        "越权写入被拒了，但不是 RLS 拒绝：{err}"
+    );
+
+    let mut tx = app.begin().await.expect("开启 app_user 事务失败");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("绑定租户上下文失败");
+    let err = sqlx::query(
+        "INSERT INTO web_sessions (tenant_id, id, user_id, csrf_token, expires_at)
+         VALUES ($1, $2, 7301, $3, now() + interval '30 days')",
+    )
+    .bind(tenant)
+    .bind([5_u8; 32].as_slice())
+    .bind([6_u8; 32].as_slice())
+    .execute(&mut *tx)
+    .await
+    .expect_err("app_user 竟能写入 web_sessions");
+    assert!(
+        err.to_string().contains("permission denied"),
+        "app_user 被拒了，但不是 GRANT 层拒绝：{err}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn auth_lookup_web_session_delete_is_bound_to_session(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let auth = support::auth_pool(&admin).await;
+    support::assert_role(&app, "app_user").await;
+    support::assert_role(&auth, "auth_lookup").await;
+    let tenant: i64 = sqlx::query_scalar(
+        "INSERT INTO tenants (name, owner_user_id)
+         VALUES ('web-session-delete', 7301)
+         RETURNING id",
+    )
+    .fetch_one(admin.raw())
+    .await
+    .expect("创建会话删除隔离租户失败");
+    sqlx::query(
+        "INSERT INTO tenant_members (tenant_id, user_id, role)
+         VALUES ($1, 7301, 'TENANT_ADMIN'), ($1, 7302, 'TENANT_ADMIN')",
+    )
+    .bind(tenant)
+    .execute(admin.raw())
+    .await
+    .expect("创建会话删除隔离成员失败");
+    let own = [7_u8; 32];
+    let other = [8_u8; 32];
+
+    sqlx::query(
+        "INSERT INTO web_sessions (tenant_id, id, user_id, csrf_token, expires_at)
+         VALUES ($1, $2, 7301, $3, now() + interval '30 days'),
+                ($1, $4, 7302, $5, now() + interval '30 days')",
+    )
+    .bind(tenant)
+    .bind(own.as_slice())
+    .bind([9_u8; 32].as_slice())
+    .bind(other.as_slice())
+    .bind([10_u8; 32].as_slice())
+    .execute(admin.raw())
+    .await
+    .expect("创建会话删除隔离数据失败");
+
+    let mut tx = auth.begin().await.expect("开启无上下文删除事务失败");
+    let deleted = sqlx::query("DELETE FROM web_sessions WHERE id = $1")
+        .bind(own.as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect("无上下文删除应闭锁为零行");
+    assert_eq!(deleted.rows_affected(), 0, "未设置上下文竟能删除会话");
+    drop(tx);
+
+    let mut tx = auth.begin().await.expect("开启会话删除隔离事务失败");
+    sqlx::query("SELECT set_config('app.session_id', '\\x' || encode($1, 'hex'), true)")
+        .bind(own.as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect("绑定当前 session_id 失败");
+    let deleted = sqlx::query("DELETE FROM web_sessions WHERE id IN ($1, $2)")
+        .bind(own.as_slice())
+        .bind(other.as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect("删除当前会话失败");
+    assert_eq!(deleted.rows_affected(), 1);
+    tx.commit().await.expect("提交会话删除隔离事务失败");
+
+    let mut tx = app.begin().await.expect("开启业务角色删除事务失败");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("绑定业务角色租户上下文失败");
+    let err = sqlx::query("DELETE FROM web_sessions WHERE id = $1")
+        .bind(other.as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect_err("app_user 竟能删除 web_sessions");
+    assert!(
+        err.to_string().contains("permission denied"),
+        "app_user 被拒了，但不是 GRANT 层拒绝：{err}"
+    );
+
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM web_sessions WHERE id = $1")
+        .bind(other.as_slice())
+        .fetch_one(admin.raw())
+        .await
+        .expect("查询未授权会话失败");
+    assert_eq!(remaining, 1);
+}
+
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn auth_lookup_web_session_management_is_bound_to_user(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let auth = support::auth_pool(&admin).await;
+    support::assert_role(&app, "app_user").await;
+    support::assert_role(&auth, "auth_lookup").await;
+    support::assert_not_bypassrls(&auth).await;
+    let (tenant_a, tenant_b) = seed_two_tenants(&admin).await;
+    const USER_ID: i64 = 7311;
+    const OTHER_USER_ID: i64 = 7312;
+    for tenant in [tenant_a, tenant_b] {
+        sqlx::query("INSERT INTO tenant_members (tenant_id, user_id) VALUES ($1, $2), ($1, $3)")
+            .bind(tenant)
+            .bind(USER_ID)
+            .bind(OTHER_USER_ID)
+            .execute(admin.raw())
+            .await
+            .expect("创建跨租户会话成员失败");
+    }
+    let own_a = [31_u8; 32];
+    let own_b = [32_u8; 32];
+    let other_a = [33_u8; 32];
+    let other_b = [34_u8; 32];
+    for (tenant, user_id, session_id) in [
+        (tenant_a, USER_ID, own_a),
+        (tenant_b, USER_ID, own_b),
+        (tenant_a, OTHER_USER_ID, other_a),
+        (tenant_b, OTHER_USER_ID, other_b),
+    ] {
+        sqlx::query(
+            "INSERT INTO web_sessions (tenant_id, id, user_id, csrf_token, expires_at)
+             VALUES ($1, $2, $3, $2, now() + interval '30 days')",
+        )
+        .bind(tenant)
+        .bind(session_id.as_slice())
+        .bind(user_id)
+        .execute(admin.raw())
+        .await
+        .expect("创建跨租户会话失败");
+    }
+
+    let mut tx = auth.begin().await.expect("开启无上下文会话事务失败");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM web_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("无上下文列表应闭锁为零行");
+    assert_eq!(count, 0);
+    let deleted = sqlx::query("DELETE FROM web_sessions")
+        .execute(&mut *tx)
+        .await
+        .expect("无上下文撤销应闭锁为零行");
+    assert_eq!(deleted.rows_affected(), 0);
+    tx.commit().await.expect("提交无上下文事务失败");
+
+    let mut connection = auth.acquire().await.expect("获取会话隔离连接失败");
+    let mut tx = sqlx::Connection::begin(&mut *connection)
+        .await
+        .expect("开启用户会话事务失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', $1, true)")
+        .bind(USER_ID.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("绑定用户会话上下文失败");
+    let tenants: Vec<i64> =
+        sqlx::query_scalar("SELECT tenant_id FROM web_sessions ORDER BY tenant_id")
+            .fetch_all(&mut *tx)
+            .await
+            .expect("读取本人跨租户会话失败");
+    assert_eq!(tenants, vec![tenant_a, tenant_b]);
+    let denied = sqlx::query("DELETE FROM web_sessions WHERE id IN ($1, $2)")
+        .bind(other_a.as_slice())
+        .bind(other_b.as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect("他人会话撤销应闭锁为零行");
+    assert_eq!(denied.rows_affected(), 0);
+    let deleted = sqlx::query("DELETE FROM web_sessions WHERE id = $1")
+        .bind(own_b.as_slice())
+        .execute(&mut *tx)
+        .await
+        .expect("撤销本人另一租户会话失败");
+    assert_eq!(deleted.rows_affected(), 1);
+    tx.commit().await.expect("提交用户撤销事务失败");
+
+    let mut tx = sqlx::Connection::begin(&mut *connection)
+        .await
+        .expect("开启上下文残留检查事务失败");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM web_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("用户事务结束后的会话列表应闭锁");
+    assert_eq!(count, 0);
+    let deleted = sqlx::query("DELETE FROM web_sessions")
+        .execute(&mut *tx)
+        .await
+        .expect("用户事务结束后的会话撤销应闭锁");
+    assert_eq!(deleted.rows_affected(), 0);
+    tx.commit().await.expect("提交上下文残留检查失败");
+
+    for query in ["SELECT id FROM web_sessions", "DELETE FROM web_sessions"] {
+        let mut tx = app.begin().await.expect("开启业务角色会话事务失败");
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(tenant_a.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("绑定业务角色租户失败");
+        let err = sqlx::query(query)
+            .execute(&mut *tx)
+            .await
+            .expect_err("业务角色竟能管理会话");
+        assert!(
+            err.to_string().contains("permission denied"),
+            "业务角色不是在 GRANT 层被拒：{err}"
+        );
+    }
+    let mut tx = auth.begin().await.expect("开启裸删除隔离事务失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', $1, true)")
+        .bind(USER_ID.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("绑定裸删除用户上下文失败");
+    let deleted = sqlx::query("DELETE FROM web_sessions")
+        .execute(&mut *tx)
+        .await
+        .expect("本人裸删除会话失败");
+    assert_eq!(
+        deleted.rows_affected(),
+        1,
+        "DELETE 策略泄露了他人行或没有删除本人行"
+    );
+    tx.commit().await.expect("提交裸删除会话失败");
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM web_sessions WHERE user_id = $1")
+        .bind(OTHER_USER_ID)
+        .fetch_one(admin.raw())
+        .await
+        .expect("确认他人会话保留失败");
+    assert_eq!(remaining, 2);
+}
+
+/// R24 `ensure_rls` 不得把 FORCE RLS 打到临时表上。
+///
+/// 这条的来历与清单里其余各条不同：它不是照设计推出来的，是被一条无关探针
+/// 撞出来的（想用 `CREATE TEMP TABLE` 存两个 id，结果写入被 RLS 拒了）。
+///
+/// **它为什么能潜伏过全套验证：超级用户 bypass RLS，而迁移、`tgm audit-rls`、
+/// 双遍脚本全都以 `postgres` 跑。** 以超级用户建临时表能正常写入，
+/// 换成 `tgm_owner` 或 `app_user` 才被拒 —— 对现有每条验证路径都是隐形的。
+/// 所以这条测试必须用**非超级用户**的池，用 `admin` 跑会永远绿。
+///
+/// 反向那半条（普通表仍须被开 FORCE）也在这里：只验临时表能写的话，
+/// 把 0013 的判断放宽成「全都跳过」同样会绿 —— 那正是 0012 想防的形状。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn r24_event_trigger_skips_temp_tables(admin: PgPool) {
+    let (app, _admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+
+    let mut tx = app.begin().await.expect("开事务失败");
+    sqlx::query("CREATE TEMP TABLE r24_probe (a int)")
+        .execute(&mut *tx)
+        .await
+        .expect("建临时表失败");
+    sqlx::query("INSERT INTO r24_probe VALUES (1)")
+        .execute(&mut *tx)
+        .await
+        .expect(
+            "临时表写入被拒 —— ensure_rls 又把 FORCE RLS 打到临时表上了（迁移 0013）。\
+             注意本条不会在以超级用户跑的任何检查里报红",
+        );
+    let forced: bool =
+        sqlx::query_scalar("SELECT relforcerowsecurity FROM pg_class WHERE relname = 'r24_probe'")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("查临时表的 relforcerowsecurity 失败");
+    assert!(!forced, "临时表被打上了 FORCE RLS");
+
+    // 反向：普通表仍须被 ensure_rls 开上 ENABLE + FORCE。
+    // 用 admin 建 —— app_user 没有 public schema 的 CREATE 权限（0001）。
+    let mut atx = _admin.raw().begin().await.expect("开 admin 事务失败");
+    sqlx::query("CREATE TABLE r24_perm_probe (a int)")
+        .execute(&mut *atx)
+        .await
+        .expect("建普通表失败");
+    let (enabled, forced): (bool, bool) = sqlx::query_as(
+        "SELECT relrowsecurity, relforcerowsecurity FROM pg_class
+         WHERE relname = 'r24_perm_probe'",
+    )
+    .fetch_one(&mut *atx)
+    .await
+    .expect("查普通表的 RLS 标志失败");
+    assert!(
+        enabled && forced,
+        "普通表没被 ensure_rls 开上 RLS（enabled={enabled} forced={forced}）—— \
+         0013 的临时表判断放得太宽，把持久表也跳过了"
+    );
+}
+
+/// R11 同 `update_id` 重投三次 → 一次副作用。
+///
+/// 定义处 `../spec/02-总体架构.md` §6.7。幂等键是 `bot_console_updates` 的主键
+/// `(tenant_id, bot_id, update_id)`，这条测它真的挡得住重投。
+///
+/// **副作用落在 `audit_logs` 而不是 `rules`。** 后者有 `uq_rule_conflict`
+/// （`tenant_id, keyword_id, COALESCE(source_ref,0), COALESCE(media_type,'ANY'), target_ref`
+/// WHERE enabled），而那个约束存在的目的正是给 API 判 409 —— 也就是说
+/// 应用层本来就会吞掉它的冲突。实测同一条 `/addrule` 跑三遍：
+/// 裸 INSERT 报 `duplicate key ... uq_rule_conflict`，
+/// 走 409 语义（`ON CONFLICT DO NOTHING`）则 `INSERT 0 0` 两次、最终 1 行。
+/// 于是幂等键**完全删掉**这条测试仍然绿。`audit_logs` 没有任何业务唯一约束
+/// （主键是 `GENERATED ALWAYS` 的 `id`，每次插入都是新行），
+/// 是这库里能真的数出「三次副作用」的落点。
+///
+/// 三次重投的形态按 §6.7 那段 SQL 注释分开写：裸 INSERT 拿 `duplicate key`
+/// 是「发现重投」的机制，`ON CONFLICT DO NOTHING` 的 `INSERT 0 0` 是
+/// 「据此判定已处理，直接返回」的机制。两者都要验 —— 只验后者的话，
+/// 主键退化成 `(tenant_id, update_id)` 仍然会绿。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn r11_replayed_update_id_has_one_effect(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    support::assert_role(&app, "app_user").await;
+    let (a, _b) = seed_two_tenants(&admin).await;
+
+    // 两个 Bot 身份。第二个用来验 bot_id 真在键里（§6.7：update_id 按 Bot 独立计数）。
+    let mut bots = Vec::new();
+    for name in ["bot-ctl", "bot-data"] {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO identities (kind, tenant_id, display_name)
+             VALUES ('bot', $1, $2) RETURNING id",
+        )
+        .bind(a)
+        .bind(name)
+        .fetch_one(admin.raw())
+        .await
+        .expect("建 Bot 身份失败");
+        bots.push(id);
+    }
+    let (ctl, data) = (bots[0], bots[1]);
+    const UPD: i64 = 9001;
+
+    // 一次「处理一个 update」：先占幂等键，占到了才写副作用。
+    // 返回是否真的处理了（false = 已处理过，直接返回）。
+    async fn handle(pool: &PgPool, tenant: i64, bot: i64, upd: i64) -> bool {
+        let mut tx = pool.begin().await.expect("开事务失败");
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(tenant.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("设租户上下文失败");
+        let claimed = sqlx::query(
+            "INSERT INTO bot_console_updates (tenant_id, bot_id, update_id)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(tenant)
+        .bind(bot)
+        .bind(upd)
+        .execute(&mut *tx)
+        .await
+        .expect("占幂等键失败")
+        .rows_affected();
+        if claimed == 1 {
+            sqlx::query(
+                "INSERT INTO audit_logs (tenant_id, action, resource, source)
+                 VALUES ($1, 'rule.create', 'rules', 'bot')",
+            )
+            .bind(tenant)
+            .execute(&mut *tx)
+            .await
+            .expect("写副作用失败");
+        }
+        tx.commit().await.expect("提交失败");
+        claimed == 1
+    }
+
+    // 同一个 update 投三次。
+    assert!(handle(&app, a, ctl, UPD).await, "第一次投递没被处理");
+    assert!(
+        !handle(&app, a, ctl, UPD).await,
+        "第二次重投被当成新 update"
+    );
+    assert!(
+        !handle(&app, a, ctl, UPD).await,
+        "第三次重投被当成新 update"
+    );
+
+    let effects: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE tenant_id = $1")
+        .bind(a)
+        .fetch_one(admin.raw())
+        .await
+        .expect("数副作用失败");
+    assert_eq!(
+        effects, 1,
+        "同一个 update_id 投三次产生了 {effects} 条副作用 —— \
+         bot_console_updates 的主键没挡住重投"
+    );
+
+    // 裸 INSERT 的那半条：`ON CONFLICT DO NOTHING` 只报 0 行，
+    // 而 §6.7 记的是「重投同一 update_id → duplicate key」。两种形态都要在。
+    let mut tx = app.begin().await.expect("开事务失败");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(a.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设租户上下文失败");
+    let err = sqlx::query(
+        "INSERT INTO bot_console_updates (tenant_id, bot_id, update_id) VALUES ($1, $2, $3)",
+    )
+    .bind(a)
+    .bind(ctl)
+    .bind(UPD)
+    .execute(&mut *tx)
+    .await
+    .expect_err("裸 INSERT 重投竟然成功 —— 主键不在那三列上");
+    assert!(
+        err.to_string().contains("duplicate key"),
+        "重投被拒了，但不是唯一约束拒的：{err}"
+    );
+    drop(tx);
+
+    // 另一个 Bot 的同号 update_id 必须能插进去。
+    // 这半条是 bot_id 在键里的唯一证据：主键退化成 (tenant_id, update_id) 时，
+    // 上面每一条断言都仍然会绿，只有这一条会红。
+    assert!(
+        handle(&app, a, data, UPD).await,
+        "另一个 Bot 的同号 update_id 被当成重投 —— bot_id 不在幂等键里，\
+         控制 Bot 的命令会被误判成数据 Bot 的重投（spec/02 §6.7）"
+    );
+}
+
+/// R18 两个应答并发打到 `pending` → 只一个推进。
+///
+/// 定义处 `../spec/07-接口契约.md` §五 附：`UPDATE ... WHERE state = 'pending'`
+/// 看影响行数。这是 spec 里写明「另需一条并发测试」的那条。
+///
+/// **走 `auth_lookup` 而不是 `app_user`**：`console_login_challenges` 对
+/// `app_user` 是零权限（0011），用 `app_user` 写这条只会拿到 permission denied
+/// —— 那是 R13 的形状，不是这条要验的。
+///
+/// 两个事务必须**真的同时在场**才测到并发。先各自开事务、第一个 UPDATE 成功
+/// 但**不提交**，此时第二个 UPDATE 会阻塞在行锁上 —— 这个阻塞是被测机制的
+/// 一部分，所以测试里显式断言它发生（`pg_stat_activity` 查等锁），
+/// 再提交第一个、放第二个过去。顺序执行两次 UPDATE 也会得到 1/0，
+/// 但那证明不了并发下成立。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn r18_concurrent_answers_only_one_advances(admin: PgPool) {
+    let (_app, admin) = support::pools(admin).await;
+    let auth = support::auth_pool(&admin).await;
+    support::assert_role(&auth, "auth_lookup").await;
+    support::assert_not_bypassrls(&auth).await;
+
+    let nonce = vec![7_u8; 32];
+    sqlx::query(
+        "INSERT INTO console_login_challenges (nonce, confirm_code, origin_ip, expires_at)
+         VALUES ($1, '1234', '10.0.0.1', now() + interval '2 minutes')",
+    )
+    .bind(&nonce)
+    .execute(admin.raw())
+    .await
+    .expect("建挑战失败");
+
+    // 两个应答者。state='pending' 是初始态，两人都看得见那一行。
+    const SQL: &str = "UPDATE console_login_challenges
+                       SET state = 'awaiting_confirm', tg_user_id = $2
+                       WHERE nonce = $1 AND state = 'pending'";
+
+    let mut t1 = auth.begin().await.expect("开事务 1 失败");
+    let first = sqlx::query(SQL)
+        .bind(&nonce)
+        .bind(5001_i64)
+        .execute(&mut *t1)
+        .await
+        .expect("应答 1 失败")
+        .rows_affected();
+    assert_eq!(first, 1, "第一个应答没推进状态");
+
+    // 事务 1 未提交，行锁还在。事务 2 的同一句应当阻塞。
+    let auth2 = auth.clone();
+    let nonce2 = nonce.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let second = tokio::spawn(async move {
+        let mut t2 = auth2.begin().await.expect("开事务 2 失败");
+        started_tx.send(()).expect("通知事务 2 启动失败");
+        let n = sqlx::query(SQL)
+            .bind(&nonce2)
+            .bind(5002_i64)
+            .execute(&mut *t2)
+            .await
+            .expect("应答 2 失败")
+            .rows_affected();
+        t2.commit().await.expect("提交事务 2 失败");
+        n
+    });
+
+    // 先确认事务 2 已经拿到连接，再确认它在事务 1 未提交时不会完成。
+    // 不查 pg_stat_activity：tgm_test 不能查看 auth_lookup 会话的等待详情。
+    started_rx.await.expect("事务 2 未启动");
+    let mut second = Box::pin(second);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut second)
+            .await
+            .is_err(),
+        "第二个应答在第一个提交前就完成 —— 没有测到并发下的行锁等待"
+    );
+
+    t1.commit().await.expect("提交事务 1 失败");
+
+    // 事务 1 提交后，事务 2 的 UPDATE 在 READ COMMITTED 下重新检查 WHERE ——
+    // state 已不是 'pending'，于是影响 0 行。这就是「只一个推进」的机制。
+    let n = second.await.expect("事务 2 的 task 崩了");
+    assert_eq!(
+        n, 0,
+        "两个应答都推进了状态（影响行数 1 和 {n}）—— \
+         条件更新没挡住并发应答，后到的那个会覆盖先到的 tg_user_id"
+    );
+
+    // 最终态：应答者必须是先到的那个，不是后到的。
+    let winner: i64 =
+        sqlx::query_scalar("SELECT tg_user_id FROM console_login_challenges WHERE nonce = $1")
+            .bind(&nonce)
+            .fetch_one(admin.raw())
+            .await
+            .expect("查最终应答者失败");
+    assert_eq!(
+        winner, 5001,
+        "落库的应答者是后到的那个 —— 说明第二个 UPDATE 实际写进去了"
+    );
+}
+
+/// R16 成员被移出后会话**立即**失效。
+///
+/// 定义处 `../spec/07-接口契约.md` §五-3，理由在 §1.5：不用 JWT 就是为了这个。
+///
+/// **这条在 DB 层只覆盖一半，另一半必须由应用层出。** 库里的机制是
+/// `web_sessions` 与 `bot_console_sessions` 上那道
+/// `FOREIGN KEY (tenant_id, user_id) REFERENCES tenant_members ON DELETE CASCADE`
+/// —— `DELETE FROM tenant_members` 会把两张表的会话行一并清掉。
+/// 这里验的是**会话行确实消失**。
+///
+/// 而 §1.5 要的是「每次请求查库」：行消失了，但如果鉴权中间件把会话缓存在
+/// 进程内或 Redis 里且不校验成员关系，会话照样能用。那半条归应用层，
+/// 本测试拦不住 —— 与 R19 同形（§3.2），把它写成「DB 全包」才是假绿。
+///
+/// **两张表的会话行只能用 admin 灌。** `auth_lookup` 在它们上面虽有全量 GRANT，
+/// 但 0010 只给了 `FOR SELECT` 策略，INSERT 找不到可匹配的策略会被 RLS 拒
+/// （那个迁移的注释已预先记下这个后果，并把写入路径的形态留给实现期）。
+/// 所以这里灌用 admin、查用 `auth_lookup` —— 查那一步同时验了
+/// `session_self_lookup` / `console_self_lookup` 两条策略真的让鉴权域读得到。
+/// 用 admin 查会绕过 RLS，那样连「会话对鉴权域可见」都没验到。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn r16_member_removal_kills_sessions(admin: PgPool) {
+    let (_app, admin) = support::pools(admin).await;
+    let auth = support::auth_pool(&admin).await;
+    support::assert_role(&auth, "auth_lookup").await;
+    let (a, _b) = seed_two_tenants(&admin).await;
+
+    const UID: i64 = 8001;
+    const SID: &[u8] = b"r16-session-id-32-bytes-padding!";
+    sqlx::query("INSERT INTO tenant_members (tenant_id, user_id) VALUES ($1, $2)")
+        .bind(a)
+        .bind(UID)
+        .execute(admin.raw())
+        .await
+        .expect("建成员关系失败");
+
+    // 两条入口各一个会话。用 admin 灌 —— 理由见上面的文档注释。
+    sqlx::query(
+        "INSERT INTO web_sessions (tenant_id, id, user_id, csrf_token, expires_at)
+         VALUES ($1, $2, $3, '\\xbb', now() + interval '30 days')",
+    )
+    .bind(a)
+    .bind(SID)
+    .bind(UID)
+    .execute(admin.raw())
+    .await
+    .expect("建 web 会话失败");
+    sqlx::query("INSERT INTO bot_console_sessions (tg_user_id, tenant_id) VALUES ($1, $2)")
+        .bind(UID)
+        .bind(a)
+        .execute(admin.raw())
+        .await
+        .expect("建 bot 会话失败");
+
+    // 前置：两个会话都在。少了这一句，下面的「清零」可能只是从来没建成功。
+    let before = session_counts(&auth, UID, SID).await;
+    assert_eq!(before, (1, 1), "会话没建起来，后面的断言会空转：{before:?}");
+
+    // 有效期是 30 天，所以下面的清零只可能来自 CASCADE，不是过期。
+    sqlx::query("DELETE FROM tenant_members WHERE tenant_id = $1 AND user_id = $2")
+        .bind(a)
+        .bind(UID)
+        .execute(admin.raw())
+        .await
+        .expect("移出成员失败");
+
+    let after = session_counts(&auth, UID, SID).await;
+    assert_eq!(
+        after,
+        (0, 0),
+        "成员被移出后会话还在（web={}, bot={}）—— 那道复合外键的 ON DELETE CASCADE \
+         没生效，会话要等 30 天过期才失效，spec/07 §1.5 不用 JWT 的理由就落空了",
+        after.0,
+        after.1
+    );
+}
+
+/// 以鉴权域的身份数会话行，返回 (web_sessions, bot_console_sessions)。
+///
+/// 两条策略的谓词各不相同 —— `session_self_lookup` 用 `app.session_id`（会话 id），
+/// R12 `auth_lookup` 只见自己成员关系；不设即报错；`INSERT` 被拒。
+///
+/// 定义处 `../spec/05-安全与租户隔离.md` §3.7 的五项实测表。
+///
+/// **清单标题里的三条断言由不同机制拦住，测的时候不能混**：
+/// 「只见自己」是 `member_self_lookup` 策略（RLS 层），
+/// 「不设即报错」是 `current_setting` 的 fail-loud（PG 行为，不是我们写的），
+/// 「`INSERT` 被拒」是 GRANT 层 —— 0011 只给了这张表 `SELECT`。
+/// 实测那三种拒绝的报错文本各不相同（`permission denied for table` /
+/// `unrecognized configuration parameter`），所以断言逐条对文本，
+/// 不写成「反正会 Err」—— 后者在权限被误放宽成全量 DML 时照样绿。
+///
+/// **多出来的那条断言（`app_user` 不受自查策略影响）是这条测试的承重部分。**
+/// §3.7 列的三条错误解法里，第一条就是「加自查策略但不限定角色」，
+/// 而它的危害正是 `app_user` 借道那条策略读到跨租户行。实测把
+/// `member_self_lookup` 的 `TO auth_lookup` 改成 `TO app_user, auth_lookup`：
+/// `app_user` 在单一租户上下文里从 2 行变成 3 行（横跨两个租户），
+/// 而 `tgm audit-rls` 的 16 条**一条都不报红** —— A6 的判据是
+/// 「PUBLIC 策略或 qual 恒真」，这条策略两者都不是。
+/// 也就是说清单里那三条断言全绿时，这个洞仍然开着，只有这一条能抓到它。
+#[sqlx::test(migrations = "../../migrations-test")]
+async fn r12_auth_lookup_sees_only_own_membership(admin: PgPool) {
+    let (app, admin) = support::pools(admin).await;
+    let auth = support::auth_pool(&admin).await;
+    support::assert_role(&auth, "auth_lookup").await;
+    support::assert_not_bypassrls(&auth).await;
+    let (a, b) = seed_two_tenants(&admin).await;
+
+    // 777 同时属于两个租户 —— 鉴权反查的真实形态就是「一个 tg 用户多个租户」。
+    // 888 只属于 A，用来验谓词真的按 user_id 过滤而不是「全放行」。
+    const SELF: i64 = 777;
+    const OTHER: i64 = 888;
+
+    // 「不设变量 → fail-loud」必须**第一个**跑，在灌数据之前，而这个位置是承重的。
+    // 两个实测理由：
+    //
+    // 一、`set_config(..., true)` 的事务级设置在提交或回滚之后参数并不消失，
+    //    而是在该连接上变成**空串** —— 再读拿到的报错换成
+    //    `invalid input syntax for type bigint: ""`，不再是
+    //    `unrecognized configuration parameter`（R3 测的就是这个残留；
+    //    实测 `RESET` 也救不回来，参数一旦存在就回不到「不存在」）。
+    //    池里的连接会被复用，所以这条断言排在别的步骤之后会红在错误的理由上。
+    //
+    // 二、这条断言**不依赖表里有行**，因为报错发生在**规划期**：
+    //    `current_setting` 要被折叠成常量才能和 `user_id` 比较，
+    //    实测连 `EXPLAIN` 都过不去。反过来说，若有人把谓词改成
+    //    `current_setting(...)::bigint IS NOT NULL` 那种不引用列的形状，
+    //    它就只留在 Filter 里、空表上一行都不求值 —— fail-loud 静默消失。
+    //    所以这条断言也顺带守着「谓词必须真的和列比较」。
+    let err = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tenant_members")
+        .fetch_one(&auth)
+        .await
+        .expect_err("没设 app.auth_user_id 也能查成员表 —— fail-loud 没了");
+    assert!(
+        err.to_string()
+            .contains("unrecognized configuration parameter"),
+        "拒是拒了，但不是 current_setting 的 fail-loud：{err}"
+    );
+
+    for (tenant, uid) in [(a, SELF), (b, SELF), (a, OTHER)] {
+        sqlx::query("INSERT INTO tenant_members (tenant_id, user_id) VALUES ($1, $2)")
+            .bind(tenant)
+            .bind(uid)
+            .execute(admin.raw())
+            .await
+            .expect("建成员关系失败");
+    }
+
+    // 1) 设自己的 id 全表查 → 只见自己那两行，且两个租户都在。
+    let mut tx = auth.begin().await.expect("开鉴权事务失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', $1, true)")
+        .bind(SELF.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设 app.auth_user_id 失败");
+    let mine: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT tenant_id, user_id FROM tenant_members ORDER BY tenant_id")
+            .fetch_all(&mut *tx)
+            .await
+            .expect("反查成员关系失败");
+    assert_eq!(
+        mine,
+        vec![(a, SELF), (b, SELF)],
+        "反查看到的不是「自己在哪些租户」：{mine:?} —— \
+         member_self_lookup 的谓词没按 user_id 过滤，或把别人的行也放了进来"
+    );
+
+    // 2) 同一个连接里查别人 → 0 行。不是报错，是查得到表但看不见行。
+    let others: i64 = sqlx::query_scalar("SELECT count(*) FROM tenant_members WHERE user_id = $1")
+        .bind(OTHER)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("查他人成员关系失败");
+    assert_eq!(
+        others, 0,
+        "鉴权域能看到别人的成员关系（{others} 行）—— 反查凭一个 tg_user_id \
+         就能枚举出全平台的租户成员表"
+    );
+    drop(tx);
+
+    // 3) 写操作被 GRANT 层拦住，三种都拦。
+    //    0011 只给这张表 SELECT，所以报的是 permission denied 而不是
+    //    42501 那种「找不到匹配策略」—— 与三张会话表的形状不同（见 R16 的注释）。
+    //
+    //    **三条必须各开一个事务。** 第一条被拒之后事务进入 aborted 状态，
+    //    同一事务里后两条拿到的是 `current transaction is aborted`，
+    //    那既不是 permission denied 也不是 RLS 拒 —— 首跑就红在这里。
+    //    共用事务的话，真正的形态一条都没量到，而失败信息会指向错误的方向。
+    for (what, sql) in [
+        (
+            "INSERT",
+            "INSERT INTO tenant_members (tenant_id, user_id) VALUES (1, 999)",
+        ),
+        ("UPDATE", "UPDATE tenant_members SET role = 'TENANT_OWNER'"),
+        ("DELETE", "DELETE FROM tenant_members"),
+    ] {
+        let mut tx = auth.begin().await.expect("开鉴权事务失败");
+        sqlx::query("SELECT set_config('app.auth_user_id', $1, true)")
+            .bind(SELF.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("设 app.auth_user_id 失败");
+        let err = sqlx::query(sql)
+            .execute(&mut *tx)
+            .await
+            .expect_err(&format!("鉴权域的 {what} 竟然成功了 —— 它只该有 SELECT"));
+        assert!(
+            err.to_string().contains("permission denied"),
+            "{what} 被拒了，但不是 GRANT 层拒的：{err} —— \
+             若是 RLS 拒的，说明写权限已被授出，只剩策略在挡"
+        );
+    }
+
+    // 4) 业务角色不得借道自查策略。理由见上面的文档注释：
+    //    这一条是 §3.7 三条错误解法里第一条的反向断言，而 audit-rls 抓不到它。
+    let mut tx = app.begin().await.expect("开业务事务失败");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(a.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设租户上下文失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', $1, true)")
+        .bind(SELF.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设 app.auth_user_id 失败");
+    let seen: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT tenant_id, user_id FROM tenant_members ORDER BY user_id")
+            .fetch_all(&mut *tx)
+            .await
+            .expect("业务角色查成员表失败");
+    assert_eq!(
+        seen,
+        vec![(a, SELF), (a, OTHER)],
+        "业务角色看到的行不止自己租户的：{seen:?} —— \
+         member_self_lookup 少了 TO auth_lookup 限定，它与租户策略构成 OR（spec/05 §3.7）。\
+         注意 audit-rls 全绿也不代表这条成立"
+    );
+}
+
+/// `console_self_lookup` 用 `app.auth_user_id`（tg_user_id）—— 所以两个变量都要设。
+/// 这正是鉴权路径的真实形态：按 cookie 查会话时还不知道租户（spec/07 §1.4）。
+async fn session_counts(auth: &PgPool, uid: i64, sid: &[u8]) -> (i64, i64) {
+    let mut tx = auth.begin().await.expect("开鉴权事务失败");
+    sqlx::query("SELECT set_config('app.session_id', $1, true)")
+        .bind(format!("\\x{}", hex(sid)))
+        .execute(&mut *tx)
+        .await
+        .expect("设 app.session_id 失败");
+    sqlx::query("SELECT set_config('app.auth_user_id', $1, true)")
+        .bind(uid.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("设 app.auth_user_id 失败");
+    let web: i64 = sqlx::query_scalar("SELECT count(*) FROM web_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("数 web 会话失败");
+    let bot: i64 = sqlx::query_scalar("SELECT count(*) FROM bot_console_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("数 bot 会话失败");
+    (web, bot)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
