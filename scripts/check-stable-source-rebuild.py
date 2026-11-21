@@ -122,6 +122,9 @@ def main() -> int:
                 "--source-commit", args.source_commit,
                 "--rust-toolchain", args.rust_toolchain,
                 "--builder-image", args.builder_image,
+                "--source-manifest-sha256", hashlib.sha256(
+                    (extracted / "scripts/stable-source-archive.manifest").read_bytes()
+                ).hexdigest(),
                 "--source-date-epoch", str(args.source_date_epoch),
                 "--output", str(output.resolve()),
             ])

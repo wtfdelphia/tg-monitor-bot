@@ -1,6 +1,7 @@
 # Stable main tree paths; reviewed exact allowlist.
 .dockerignore
 .github/workflows/binary-candidate.yml
+.github/workflows/binary-release.yml
 .github/workflows/ci.yml
 .gitignore
 .sqlx/query-1552bcdcfcb91b5ed63a9e9bedbef9ac7e667fff7ade481434f07bcd19b9675a.json
@@ -409,6 +410,7 @@ scripts/tgm-native-target-acceptance.sh
 scripts/tgm-native-user-unit-check.sh
 scripts/verify-external-closure-evidence.py
 scripts/verify-native-candidate.py
+scripts/verify-native-stable.py
 scripts/wp8-docker-acceptance.sh
 scripts/wp8-docker-release-package.sh
 scripts/wp8-docker-release-preflight.sh

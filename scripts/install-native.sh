@@ -15,9 +15,10 @@ PROVENANCE=""
 PROVENANCE_BUNDLE=""
 RELEASE_BUILDINFO=""
 RELEASE_SBOM=""
+SOURCE_ARCHIVE=""
+SOURCE_MANIFEST=""
 APP_ROLES=(control-plane bot-gateway mtproto-worker fanout rule delivery)
-IDENTITY_REGEXP="${COSIGN_CERTIFICATE_IDENTITY_REGEXP:-https://github\\.com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-release\\.yml@refs/(tags/v[0-9]+\\.[0-9]+\\.[0-9]+|heads/main)}"
-OIDC_ISSUER="${COSIGN_CERTIFICATE_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
+OIDC_ISSUER='https://token.actions.githubusercontent.com'
 
 usage() {
   cat <<'EOF'
@@ -25,6 +26,7 @@ usage() {
   scripts/install-native.sh --root [--app-services] --archive <包.tar.gz> --checksums <SHA256SUMS> --bundle <SHA256SUMS.sigstore.json>
   scripts/install-native.sh --user [--app-services --accept-same-uid] --archive <包.tar.gz> --checksums <SHA256SUMS> --bundle <SHA256SUMS.sigstore.json>
   scripts/install-native.sh --user --candidate --accept-candidate --archive <包.tar.gz> --checksums <SHA256SUMS> --bundle <签名 bundle> --provenance <provenance.json> --provenance-bundle <provenance 签名 bundle> --buildinfo <BUILDINFO.json> --sbom <sbom.cdx.json>
+  scripts/install-native.sh --root|--user --archive <包.tar.gz> --checksums <SHA256SUMS> --bundle <签名 bundle> --provenance <provenance.json> --provenance-bundle <provenance 签名 bundle> --buildinfo <BUILDINFO.json> --sbom <sbom.cdx.json> --source-archive <精简源码.tar.gz> --source-manifest <SOURCE-ARCHIVE-MANIFEST.txt>
   scripts/install-native.sh --root --rollback <版本>
   scripts/install-native.sh --user --rollback <版本>
 
@@ -171,6 +173,7 @@ verify_outer_checksum() {
 verify_signature() {
   local checksums="$1"
   local bundle="$2"
+  local identity
   if [ "$CANDIDATE" = 1 ]; then
     cosign verify-blob \
       --offline \
@@ -180,10 +183,16 @@ verify_signature() {
       "$checksums" >/dev/null || fail "候选 SHA256SUMS 的 cosign 身份验证失败"
     return
   fi
+  local stable_version
+  stable_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' "$RELEASE_BUILDINFO")" || \
+    fail '稳定 BUILDINFO 无法读取 version'
+  printf '%s\n' "$stable_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || \
+    fail '稳定 BUILDINFO version 格式无效'
+  identity="https://github[.]com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-release[.]yml@refs/tags/v${stable_version//./[.]}"
   cosign verify-blob \
     --offline \
     --bundle "$bundle" \
-    --certificate-identity-regexp "$IDENTITY_REGEXP" \
+    --certificate-identity-regexp "$identity" \
     --certificate-oidc-issuer "$OIDC_ISSUER" \
     "$checksums" >/dev/null || fail "SHA256SUMS 的 cosign keyless 签名验证失败"
 }
@@ -492,6 +501,8 @@ while [ "$#" -gt 0 ]; do
     --provenance-bundle) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; PROVENANCE_BUNDLE="$2"; shift 2 ;;
     --buildinfo) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; RELEASE_BUILDINFO="$2"; shift 2 ;;
     --sbom) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; RELEASE_SBOM="$2"; shift 2 ;;
+    --source-archive) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; SOURCE_ARCHIVE="$2"; shift 2 ;;
+    --source-manifest) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; SOURCE_MANIFEST="$2"; shift 2 ;;
     --rollback) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; ROLLBACK="$2"; shift 2 ;;
     --candidate) CANDIDATE=1; shift ;;
     --accept-candidate) ACCEPT_CANDIDATE=1; shift ;;
@@ -514,9 +525,11 @@ if [ -n "$ROLLBACK" ]; then
   [ "$APP_SERVICES" = 0 ] || fail '回滚只切换已安装的二进制，不安装应用 unit'
   [ -z "$ARCHIVE" ] && [ -z "$CHECKSUMS" ] && [ -z "$BUNDLE" ] && \
     [ -z "$PROVENANCE" ] && [ -z "$PROVENANCE_BUNDLE" ] && \
-    [ -z "$RELEASE_BUILDINFO" ] && [ -z "$RELEASE_SBOM" ] || fail '回滚不能与发布包参数同时使用'
+      [ -z "$RELEASE_BUILDINFO" ] && [ -z "$RELEASE_SBOM" ] && \
+      [ -z "$SOURCE_ARCHIVE" ] && [ -z "$SOURCE_MANIFEST" ] || fail '回滚不能与发布包参数同时使用'
   [ "$CANDIDATE" = 0 ] && [ -z "$PROVENANCE" ] && [ -z "$PROVENANCE_BUNDLE" ] && \
-    [ -z "$RELEASE_BUILDINFO" ] && [ -z "$RELEASE_SBOM" ] || fail '回滚不能使用候选验证参数'
+    [ -z "$RELEASE_BUILDINFO" ] && [ -z "$RELEASE_SBOM" ] && \
+    [ -z "$SOURCE_ARCHIVE" ] && [ -z "$SOURCE_MANIFEST" ] || fail '回滚不能使用发布验证参数'
   rollback "$ROLLBACK"
   exit 0
 fi
@@ -529,14 +542,16 @@ if [ "$CANDIDATE" = 1 ]; then
   [ "$MODE" = user ] || fail '候选包只允许安装到非 root 用户目录'
   [ "$APP_SERVICES" = 0 ] || fail '候选包不安装 systemd unit'
 else
-  [ -z "$PROVENANCE" ] && [ -z "$PROVENANCE_BUNDLE" ] && \
-    [ -z "$RELEASE_BUILDINFO" ] && [ -z "$RELEASE_SBOM" ] || \
-    fail '稳定包不能携带候选来源参数'
+  [ -n "$PROVENANCE" ] && [ -n "$PROVENANCE_BUNDLE" ] && \
+    [ -n "$RELEASE_BUILDINFO" ] && [ -n "$RELEASE_SBOM" ] && \
+    [ -n "$SOURCE_ARCHIVE" ] && [ -n "$SOURCE_MANIFEST" ] || \
+    fail '稳定包必须提供 provenance、BUILDINFO、SBOM 和精简源码材料'
 fi
 require_command tar
 require_command sha256sum
 require_command cosign
 [ "$CANDIDATE" = 0 ] || require_command python3
+require_command python3
 [ -f "$ARCHIVE" ] || fail "发布包不存在：$ARCHIVE"
 [ -f "$CHECKSUMS" ] || fail "SHA256SUMS 不存在：$CHECKSUMS"
 [ -f "$BUNDLE" ] || fail "签名 bundle 不存在：$BUNDLE"
@@ -544,6 +559,12 @@ require_command cosign
 [ "$CANDIDATE" = 0 ] || [ -f "$PROVENANCE_BUNDLE" ] || fail "provenance 签名 bundle 不存在：$PROVENANCE_BUNDLE"
 [ "$CANDIDATE" = 0 ] || [ -f "$RELEASE_BUILDINFO" ] || fail "候选 BUILDINFO 不存在：$RELEASE_BUILDINFO"
 [ "$CANDIDATE" = 0 ] || [ -f "$RELEASE_SBOM" ] || fail "候选 SBOM 不存在：$RELEASE_SBOM"
+[ "$CANDIDATE" = 1 ] || [ -f "$PROVENANCE" ] || fail "稳定 provenance 不存在：$PROVENANCE"
+[ "$CANDIDATE" = 1 ] || [ -f "$PROVENANCE_BUNDLE" ] || fail "稳定 provenance 签名 bundle 不存在：$PROVENANCE_BUNDLE"
+[ "$CANDIDATE" = 1 ] || [ -f "$RELEASE_BUILDINFO" ] || fail "稳定 BUILDINFO 不存在：$RELEASE_BUILDINFO"
+[ "$CANDIDATE" = 1 ] || [ -f "$RELEASE_SBOM" ] || fail "稳定 SBOM 不存在：$RELEASE_SBOM"
+[ "$CANDIDATE" = 1 ] || [ -f "$SOURCE_ARCHIVE" ] || fail "精简源码包不存在：$SOURCE_ARCHIVE"
+[ "$CANDIDATE" = 1 ] || [ -f "$SOURCE_MANIFEST" ] || fail "精简源码清单不存在：$SOURCE_MANIFEST"
 verify_outer_checksum "$ARCHIVE" "$CHECKSUMS"
 verify_signature "$CHECKSUMS" "$BUNDLE"
 verify_archive_members "$ARCHIVE"
@@ -569,6 +590,13 @@ if [ "$CANDIDATE" = 1 ]; then
     --package-sbom "$package_root/sbom.cdx.json" --version "$version"
 else
   [ -f "$package_root/BUILDINFO.json" ] || fail '发布包缺少 BUILDINFO.json'
+  python3 "$package_root/scripts/verify-native-stable.py" \
+    --archive "$ARCHIVE" --checksums "$CHECKSUMS" --checksum-bundle "$BUNDLE" \
+    --provenance "$PROVENANCE" --provenance-bundle "$PROVENANCE_BUNDLE" \
+    --buildinfo "$RELEASE_BUILDINFO" --sbom "$RELEASE_SBOM" \
+    --source-archive "$SOURCE_ARCHIVE" --source-manifest "$SOURCE_MANIFEST" \
+    --source-commit "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$RELEASE_BUILDINFO")" \
+    --version "$version"
 fi
 if [ "$CANDIDATE" = 1 ]; then
   validate_binary "$package_root/bin/tgm" "$package_root"

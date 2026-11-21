@@ -193,6 +193,7 @@ scripts/tests/test_stable_source_archive.py
 scripts/tests/test_stable_source_rebuild.py
 scripts/tests/test_stable_tree.py
 scripts/verify-native-candidate.py
+scripts/verify-native-stable.py
 vendor/README.md
 vendor/grammers-session/Cargo.toml
 vendor/grammers-session/DEPS.md

@@ -103,6 +103,34 @@ class StableTreeTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("binary-candidate.yml", result.stderr)
 
+    def test_stable_release_workflow_must_be_explicitly_allowlisted(self) -> None:
+        (self.root / ".github/workflows").mkdir(parents=True)
+        (self.root / ".github/workflows/binary-release.yml").write_text("name: release\n", encoding="utf-8")
+        self.commit()
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_check_with("--strict")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("binary-release.yml", result.stderr)
+        (self.root / "stable-tree.manifest").write_text(
+            ".github/workflows/binary-release.yml\nsrc/main.rs\nstable-tree.manifest\n", encoding="utf-8"
+        )
+        self.commit()
+        self.assertEqual(self.run_check_with("--strict").returncode, 0)
+
+    def test_stable_release_trigger_and_permissions_are_scoped(self) -> None:
+        workflow = (ROOT / ".github/workflows/binary-release.yml").read_text(encoding="utf-8")
+        self.assertIn("v*.*.*", workflow)
+        self.assertNotIn("workflow_dispatch:", workflow)
+        self.assertIn("contents: read", workflow)
+        self.assertIn("checks: read", workflow)
+        self.assertIn("contents: write", workflow)
+        self.assertIn("actions: read", workflow)
+        self.assertIn("id-token: write", workflow)
+        self.assertNotIn("--clobber", workflow)
+        self.assertIn("stable release requires a newly created tag", workflow)
+        self.assertIn("refusing to overwrite", workflow)
+
     def test_source_snapshot_ci_push_scope_is_read_only_and_task_limited(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("branches: [main, dev, 'codex/pre014-main-*']", workflow)

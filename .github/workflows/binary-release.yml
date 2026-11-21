@@ -1,0 +1,282 @@
+name: Native binary release
+
+concurrency:
+  group: native-binary-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    name: Build and verify stable release assets
+    runs-on: ubuntu-24.04
+    outputs:
+      source_commit: ${{ steps.validate.outputs.source_commit }}
+    permissions:
+      contents: read
+      checks: read
+    env:
+      CARGO_TERM_COLOR: always
+      SQLX_OFFLINE: 'true'
+      BUILDER_IMAGE: tgm-native-builder:${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Validate exact stable tag and successful main CI
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$BEFORE_SHA" =~ ^0+$ ]] || {
+            echo "stable release requires a newly created tag; tag updates are rejected" >&2
+            exit 1
+          }
+          git fetch origin main --no-tags
+          source_commit="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          main_commit="$(git rev-parse origin/main^{commit})"
+          git merge-base --is-ancestor "$source_commit" "$main_commit"
+          test -z "$(git status --porcelain)"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+          checks="$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$source_commit/check-runs?per_page=100" \
+            --jq '.check_runs[] | select(.name == "static" or .name == "database") | [.name,.status,.conclusion] | @tsv')"
+          for required in static database; do
+            matches="$(printf '%s\n' "$checks" | awk -F '\t' -v name="$required" '$1 == name { count++ } END { print count + 0 }')"
+            result="$(printf '%s\n' "$checks" | awk -F '\t' -v name="$required" '$1 == name { print $2 "\t" $3 }')"
+            if [ "$matches" != 1 ] || [ "$result" != $'completed\tsuccess' ]; then
+              echo "tag commit check $required must be unique and successful" >&2
+              printf '%s\n' "$checks" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install Rust toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install
+          echo "version=$(rustup show active-toolchain | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve workspace version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tgm") | .version')"
+          test "v$version" = "$RELEASE_TAG"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+
+      - name: Create exact source archive and builder
+        env:
+          SOURCE_COMMIT: ${{ steps.validate.outputs.source_commit }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          epoch="$(git show -s --format=%ct "$SOURCE_COMMIT")"
+          source_context="$RUNNER_TEMP/tgm-release-source-$GITHUB_RUN_ID"
+          mkdir -p dist/assets "$source_context"
+          python3 scripts/stable-source-archive.py \
+            --repository "$GITHUB_WORKSPACE" --commit "$SOURCE_COMMIT" \
+            --manifest-path scripts/stable-source-archive.manifest \
+            --source-date-epoch "$epoch" \
+            --output "dist/assets/tgm-${VERSION}-source.tar.gz"
+          tar -xzf "dist/assets/tgm-${VERSION}-source.tar.gz" -C "$source_context" --strip-components=1
+          echo "TGM_SOURCE_CONTEXT=$source_context" >> "$GITHUB_ENV"
+          docker build --pull=false --file "$source_context/deploy/native/centos7-builder.Dockerfile" \
+            --tag "$BUILDER_IMAGE" "$source_context"
+
+      - name: Build and inspect native binary
+        id: build
+        run: |
+          set -euo pipefail
+          container="$(docker create "$BUILDER_IMAGE")"
+          trap 'docker rm "$container" >/dev/null' EXIT
+          mkdir -p dist
+          docker cp "$container:/src/target/release/tgm" dist/tgm
+          docker image inspect --format '{{.Id}}' "$BUILDER_IMAGE" > dist/builder-image.id
+          echo "builder_image_id=$(cat dist/builder-image.id)" >> "$GITHUB_OUTPUT"
+          chmod 0755 dist/tgm
+          python3 - <<'PY'
+          import re
+          import subprocess
+          output = subprocess.check_output(['readelf', '--version-info', 'dist/tgm'], text=True)
+          versions = [tuple(map(int, value.split('.'))) for value in re.findall(r'GLIBC_([0-9]+(?:\.[0-9]+)*)', output)]
+          if max(versions, default=(0,)) > (2, 17):
+              raise SystemExit('binary requires glibc newer than 2.17')
+          PY
+          ldd dist/tgm
+          ./dist/tgm --help >/dev/null
+          ./dist/tgm purge-deleted-tenants --help >/dev/null
+          "$TGM_SOURCE_CONTEXT/scripts/native-release-preflight.sh" --binary dist/tgm --unit-dir "$TGM_SOURCE_CONTEXT/deploy/systemd"
+          "$TGM_SOURCE_CONTEXT/scripts/native-release-preflight.sh" --binary dist/tgm --unit-dir "$TGM_SOURCE_CONTEXT/deploy/systemd" --app-services
+
+      - name: Generate source SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ env.TGM_SOURCE_CONTEXT }}
+          format: cyclonedx-json
+          output-file: dist/sbom.cdx.json
+          upload-artifact: false
+
+      - name: Package deterministic binary archive
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.validate.outputs.source_commit }}
+          BUILDER_IMAGE_ID: ${{ steps.build.outputs.builder_image_id }}
+        run: |
+          set -euo pipefail
+          epoch="$(git show -s --format=%ct "$SOURCE_COMMIT")"
+          python3 "$TGM_SOURCE_CONTEXT/scripts/native-release-package.py" \
+            --source-root "$TGM_SOURCE_CONTEXT" --binary "$GITHUB_WORKSPACE/dist/tgm" \
+            --sbom "$GITHUB_WORKSPACE/dist/sbom.cdx.json" --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" --rust-toolchain "$(rustup show active-toolchain | awk '{print $1}')" \
+            --builder-image "$BUILDER_IMAGE_ID" --source-date-epoch "$epoch" \
+            --source-manifest-sha256 "$(sha256sum "$TGM_SOURCE_CONTEXT/scripts/stable-source-archive.manifest" | awk '{print $1}')" \
+            --output "$GITHUB_WORKSPACE/dist/package"
+          cp "dist/package/tgm-${VERSION}-linux-x86_64-gnu.tar.gz" dist/assets/
+          cp dist/package/BUILDINFO.json dist/package/sbom.cdx.json dist/assets/
+          cp "$TGM_SOURCE_CONTEXT/scripts/stable-source-archive.manifest" dist/assets/SOURCE-ARCHIVE-MANIFEST.txt
+          manifest_sha="$(sha256sum dist/assets/SOURCE-ARCHIVE-MANIFEST.txt | awk '{print $1}')"
+          python3 scripts/stable-release-assets.py prepare \
+            --assets dist/assets --version "$VERSION" --source-commit "$SOURCE_COMMIT" \
+            --builder-image "$BUILDER_IMAGE_ID" --rust-toolchain "$(rustup show active-toolchain | awk '{print $1}')" \
+            --run-id "$GITHUB_RUN_ID" --source-manifest-sha256 "$manifest_sha"
+
+      - name: Rebuild package only from the source archive
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.validate.outputs.source_commit }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.version }}
+          BUILDER_IMAGE_ID: ${{ steps.build.outputs.builder_image_id }}
+        run: |
+          set -euo pipefail
+          epoch="$(git show -s --format=%ct "$SOURCE_COMMIT")"
+          python3 scripts/check-stable-source-rebuild.py \
+            --source-archive "dist/assets/tgm-${VERSION}-source.tar.gz" --sbom dist/assets/sbom.cdx.json \
+            --version "$VERSION" --source-commit "$SOURCE_COMMIT" --rust-toolchain "$TOOLCHAIN" \
+            --builder-image "$BUILDER_IMAGE_ID" --source-date-epoch "$epoch" \
+            --expected-binary dist/tgm --expected-package "dist/assets/tgm-${VERSION}-linux-x86_64-gnu.tar.gz"
+
+      - name: Verify unsigned asset structure
+        run: |
+          set -euo pipefail
+          python3 scripts/stable-release-assets.py verify \
+            --assets dist/assets --version '${{ steps.version.outputs.version }}' \
+            --source-commit '${{ steps.validate.outputs.source_commit }}'
+
+      - name: Upload verified assets for the isolated signer
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-release-assets
+          path: dist/assets/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Cleanup builder resources
+        if: always()
+        run: |
+          docker rm -f $(docker ps -aq --filter "ancestor=$BUILDER_IMAGE") 2>/dev/null || true
+          docker image rm "$BUILDER_IMAGE" 2>/dev/null || true
+
+  publish:
+    name: Sign and publish immutable stable Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Download verified assets
+        uses: actions/download-artifact@v4
+        with:
+          name: stable-release-assets
+          path: dist/assets
+
+      - name: Verify publish checkout matches the build commit
+        env:
+          EXPECTED_SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          actual_commit="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          test "$actual_commit" = "$EXPECTED_SOURCE_COMMIT"
+          git fetch origin main --no-tags
+          git merge-base --is-ancestor "$actual_commit" "origin/main^{commit}"
+          test -z "$(git status --porcelain)"
+
+      - name: Reject existing Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          response="$RUNNER_TEMP/release-lookup-$GITHUB_RUN_ID.txt"
+          if gh api --include "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" >"$response" 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to overwrite." >&2
+            rm -f "$response"
+            exit 1
+          fi
+          if ! grep -Eq '^HTTP/[0-9.]+ 404([[:space:]]|$)' "$response"; then
+            cat "$response" >&2
+            rm -f "$response"
+            echo "Release lookup failed for a reason other than not-found; refusing to publish." >&2
+            exit 1
+          fi
+          rm -f "$response"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Sign and verify release payload
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          EXPECTED_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --bundle dist/assets/SHA256SUMS.sigstore.json dist/assets/SHA256SUMS
+          cosign sign-blob --yes --bundle dist/assets/provenance.sigstore.json dist/assets/provenance.json
+          python3 scripts/stable-release-assets.py verify \
+            --assets dist/assets --version "${RELEASE_TAG#v}" \
+            --source-commit "$(git rev-parse HEAD)" \
+            --expected-run-id "$EXPECTED_RUN_ID" --verify-signatures
+
+      - name: Create Release without overwrite
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          EXPECTED_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          read -r remote_tag_sha remote_peeled_sha < <(
+            git ls-remote origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}" \
+              | awk -v tag="refs/tags/$RELEASE_TAG" -v peeled="refs/tags/$RELEASE_TAG^{}" \
+                  '$2 == tag { direct=$1 } $2 == peeled { annotated=$1 } END { print direct, annotated }'
+          )
+          remote_tag_commit="${remote_peeled_sha:-$remote_tag_sha}"
+          test -n "$remote_tag_commit" && test "$remote_tag_commit" = "$(git rev-parse HEAD)" || {
+            echo "release tag changed after build verification; refusing to publish" >&2
+            exit 1
+          }
+          assets=(dist/assets/*)
+          python3 scripts/stable-release-assets.py verify \
+            --assets dist/assets --version "${RELEASE_TAG#v}" \
+            --source-commit "$(git rev-parse HEAD)" \
+            --expected-run-id "$EXPECTED_RUN_ID"
+          gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" \
+            --generate-notes "${assets[@]}"

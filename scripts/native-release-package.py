@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target", default="x86_64-unknown-linux-gnu")
     parser.add_argument("--rust-toolchain", required=True)
     parser.add_argument("--builder-image", required=True)
+    parser.add_argument("--source-manifest-sha256")
     parser.add_argument("--source-date-epoch", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -87,6 +88,16 @@ def main() -> int:
             raise SystemExit("候选包来源必须是完整 Git commit SHA")
     elif any((args.candidate_run_id, args.candidate_attempt, args.candidate_ci_run_id, args.candidate_run_url)):
         raise SystemExit("稳定包不能携带候选 run 标识")
+    if args.channel == "stable" and not re.fullmatch(r"[0-9a-f]{64}", args.source_manifest_sha256 or ""):
+        raise SystemExit("稳定包必须提供稳定源码 manifest SHA-256")
+    if args.channel == "stable":
+        if not re.fullmatch(r"[0-9a-f]{40}", args.source_commit):
+            raise SystemExit("稳定包来源必须是完整 Git commit SHA")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", args.builder_image):
+            raise SystemExit("稳定包 builder 必须包含 sha256 digest")
+        manifest_path = repository / "scripts/stable-source-archive.manifest"
+        if not manifest_path.is_file() or sha256(manifest_path) != args.source_manifest_sha256:
+            raise SystemExit("稳定包来源 manifest 摘要与源码快照不匹配")
     if args.output.exists() and any(args.output.iterdir()):
         raise SystemExit(f"输出目录非空：{args.output}")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -115,6 +126,9 @@ def main() -> int:
         if args.channel == "candidate":
             shutil.copy2(repository / "scripts" / "verify-native-candidate.py", staging / "scripts")
             (staging / "scripts" / "verify-native-candidate.py").chmod(0o755)
+        else:
+            shutil.copy2(repository / "scripts" / "verify-native-stable.py", staging / "scripts")
+            (staging / "scripts" / "verify-native-stable.py").chmod(0o755)
         shutil.copy2(repository / "deploy" / "native" / "README.md", staging / "README.md")
         shutil.copy2(repository / "deploy" / "native" / "platform-support.md", staging / "platform-support.md")
         readme = (staging / "README.md").read_text(encoding="utf-8")
@@ -167,6 +181,7 @@ def main() -> int:
                 "@CANDIDATE_INSTALL@",
                 candidate_install,
             )
+            readme = readme.replace("@STABLE_DISTRIBUTION@", "")
         else:
             readme = readme.replace(
                 "\n\n发布通道：`@CHANNEL@`\n\n@STABILITY_NOTICE@\n\n",
@@ -174,6 +189,26 @@ def main() -> int:
             )
             readme = readme.replace("@CANDIDATE_DISTRIBUTION@", "")
             readme = readme.replace("@CANDIDATE_INSTALL@", "")
+            stable_distribution = (
+                "稳定 Release 包含签名清单、provenance、BUILDINFO、SBOM、精简源码归档和对应 manifest。"
+                "安装前先下载这些文件并从二进制归档提取安装器。\n\n"
+                "```bash\n"
+                "tar -xOzf tgm-@VERSION@-linux-x86_64-gnu.tar.gz ./scripts/install-native.sh > install-native.sh\n"
+                "bash install-native.sh --root \\\n"
+                "  --archive tgm-@VERSION@-linux-x86_64-gnu.tar.gz \\\n"
+                "  --checksums SHA256SUMS \\\n"
+                "  --bundle SHA256SUMS.sigstore.json \\\n"
+                "  --provenance provenance.json \\\n"
+                "  --provenance-bundle provenance.sigstore.json \\\n"
+                "  --buildinfo BUILDINFO.json \\\n"
+                "  --sbom sbom.cdx.json \\\n"
+                "  --source-archive tgm-@VERSION@-source.tar.gz \\\n"
+                "  --source-manifest SOURCE-ARCHIVE-MANIFEST.txt\n"
+                "```\n\n"
+                "使用非 root user 模式时，将 `--root` 替换为 `--user`。稳定安装器会先核验签名身份、"
+                "发布来源、二进制包和精简源码 manifest，然后才安装文件。"
+            )
+            readme = readme.replace("@STABLE_DISTRIBUTION@", stable_distribution)
         (staging / "README.md").write_text(readme, encoding="utf-8")
         shutil.copytree(repository / "deploy" / "systemd", staging / "deploy" / "systemd", dirs_exist_ok=True)
 
@@ -184,10 +219,15 @@ def main() -> int:
             "target": args.target,
             "rust_toolchain": args.rust_toolchain,
             "builder_image": args.builder_image,
+            **({"source_manifest_sha256": args.source_manifest_sha256} if args.channel == "stable" else {}),
             "source_date_epoch": args.source_date_epoch,
             "cargo_lock_sha256": sha256(repository / "Cargo.lock"),
             "openssl": "vendored via josekit feature",
         }
+        if args.channel == "stable":
+            buildinfo.update({"channel": "stable", "stable": True, "release_tag": release_tag})
+            if args.source_manifest_sha256 is not None:
+                buildinfo["source_manifest_sha256"] = args.source_manifest_sha256
         if args.channel == "candidate":
             buildinfo.update({
                 "channel": "candidate",

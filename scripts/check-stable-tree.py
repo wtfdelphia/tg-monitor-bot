@@ -74,9 +74,9 @@ def check(root: Path, commit: str, manifest_path: str, strict: bool = False) -> 
         "docs/Telegram 多租户内容监控与分发平台.md",
         ".github/workflows/docker-build-validation.yml",
         ".github/workflows/docker-publish.yml",
-        ".github/workflows/binary-release.yml",
         "compose.acceptance.override.yaml",
     }
+    optional_development_exact = {".github/workflows/binary-release.yml"}
     unexpected = sorted(unlisted) if strict else sorted(
         path for path in unlisted
         if not path.startswith(ignored_prefixes)
@@ -84,6 +84,7 @@ def check(root: Path, commit: str, manifest_path: str, strict: bool = False) -> 
             "scripts/ai-driver/ai-run.sh", "scripts/ai-driver/ai-gates.sh",
             "scripts/ai-driver/check-regressions.py",
         })
+        and path not in optional_development_exact
         and path not in ignored_exact
     )
     forbidden = sorted(

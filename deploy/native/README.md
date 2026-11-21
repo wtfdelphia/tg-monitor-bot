@@ -23,22 +23,30 @@
 
 ## 安装前验证
 
-从 GitHub Release 同时取得以下三个文件：
+稳定版安装需要从 GitHub Release 取得以下文件；候选版所需材料见候选专用段落：
 
 ```text
 tgm-@VERSION@-linux-x86_64-gnu.tar.gz
 SHA256SUMS
 SHA256SUMS.sigstore.json
+provenance.json
+provenance.sigstore.json
+BUILDINFO.json
+sbom.cdx.json
+tgm-@VERSION@-source.tar.gz
+SOURCE-ARCHIVE-MANIFEST.txt
 ```
 
 @CANDIDATE_DISTRIBUTION@
+
+@STABLE_DISTRIBUTION@
 
 目标机必须是 Linux x86-64，glibc 不低于 2.17。安装器要求本机已有 `cosign`、`tar`、
 `sha256sum`、`ldd`、`openssl` 和 `systemd-analyze`；它不会联网下载工具、依赖或脚本。签名验证失败、
 压缩包校验失败、包内校验失败、动态依赖不满足、unit/timer 预检失败或帮助命令失败时，
 安装器拒绝切换当前版本。
 
-候选来源验证需要 Python 3.6 或更高版本；安装验证器不要求替换系统 Python，构建和 CI
+稳定版与候选来源验证需要 Python 3.6 或更高版本；安装验证器不要求替换系统 Python，构建和 CI
 仍使用各自既有工具链。glibc 兼容只证明二进制 ABI 的最低要求，不证明宿主 systemd 的
 指令与安全能力满足部署要求。
 
@@ -133,7 +141,13 @@ root 模式安装到 `/opt/tgm/releases/@VERSION@`，并原子更新 `/usr/local
 bash scripts/install-native.sh --root \
   --archive tgm-@VERSION@-linux-x86_64-gnu.tar.gz \
   --checksums SHA256SUMS \
-  --bundle SHA256SUMS.sigstore.json
+  --bundle SHA256SUMS.sigstore.json \
+  --provenance provenance.json \
+  --provenance-bundle provenance.sigstore.json \
+  --buildinfo BUILDINFO.json \
+  --sbom sbom.cdx.json \
+  --source-archive tgm-@VERSION@-source.tar.gz \
+  --source-manifest SOURCE-ARCHIVE-MANIFEST.txt
 ```
 
 安装完成后，人工执行 `systemctl daemon-reload`、备份恢复库迁移、`tgm audit-rls` 和
@@ -151,7 +165,13 @@ user 模式只安装到 `$HOME/.local/opt/tgm/releases/@VERSION@`，并原子更
 bash scripts/install-native.sh --user \
   --archive tgm-@VERSION@-linux-x86_64-gnu.tar.gz \
   --checksums SHA256SUMS \
-  --bundle SHA256SUMS.sigstore.json
+  --bundle SHA256SUMS.sigstore.json \
+  --provenance provenance.json \
+  --provenance-bundle provenance.sigstore.json \
+  --buildinfo BUILDINFO.json \
+  --sbom sbom.cdx.json \
+  --source-archive tgm-@VERSION@-source.tar.gz \
+  --source-manifest SOURCE-ARCHIVE-MANIFEST.txt
 ```
 
 ## 回滚

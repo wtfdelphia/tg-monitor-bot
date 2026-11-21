@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -57,6 +58,7 @@ class NativeServices(unittest.TestCase):
         shutil.copyfile(ROOT / "scripts/verify-native-candidate.py", self.fixture / "scripts/verify-native-candidate.py")
         (self.fixture / "VERSION").write_text("0.1.0\n", encoding="utf-8")
         self.stub("cosign", 'printf "cosign %s\\n" "$*" >> "$CALLS"\nexit "${SIGNATURE_STATUS:-0}"')
+        self.stub("python3", f'exec "{sys.executable}" -B "$@"')
         self.stub("systemctl", 'printf "systemctl %s\\n" "$*" >> "$CALLS"\n[ "$*" = "--user show-environment" ] || exit 99\nexit "${MANAGER_STATUS:-0}"')
         account_index = '''case "${2:-}" in
 tgm-control-plane) account_index=0;; tgm-bot-gateway) account_index=1;; tgm-mtproto-worker) account_index=2;;
@@ -120,6 +122,35 @@ exec {real_ln} "$@"''')
             }
         else:
             (self.fixture / "scripts/verify-native-candidate.py").unlink(missing_ok=True)
+            shutil.copyfile(ROOT / "scripts/verify-native-stable.py", self.fixture / "scripts/verify-native-stable.py")
+            source_commit = "a" * 40
+            manifest = b"scripts/stable-source-archive.manifest\n"
+            manifest_digest = hashlib.sha256(manifest).hexdigest()
+            buildinfo.update({
+                "source_commit": source_commit,
+                "target": "x86_64-unknown-linux-gnu",
+                "rust_toolchain": "1.98.1-x86_64-unknown-linux-gnu",
+                "builder_image": "sha256:" + "b" * 64,
+                "release_tag": f"v{version}",
+                "source_manifest_sha256": manifest_digest,
+                "artifact": f"tgm-{version}-linux-x86_64-gnu.tar.gz",
+            })
+            source_archive = self.base / f"tgm-{version}-source.tar.gz"
+            with tarfile.open(source_archive, "w:gz") as stream:
+                for name, content in (
+                    ("scripts/stable-source-archive.manifest", manifest),
+                    ("SOURCE-MANIFEST.sha256", (
+                        f"manifest_sha256={manifest_digest}\nmanifest_path=scripts/stable-source-archive.manifest\n"
+                        f"source_commit={source_commit}\n"
+                    ).encode()),
+                ):
+                    info = tarfile.TarInfo(f"tg-monitor-bot-source-{source_commit}/{name}")
+                    info.size = len(content)
+                    info.mode = 0o644
+                    stream.addfile(info, io.BytesIO(content))
+            self.source_archive = source_archive
+            self.source_manifest = self.base / "SOURCE-ARCHIVE-MANIFEST.txt"
+            self.source_manifest.write_bytes(manifest)
         (self.fixture / "BUILDINFO.json").write_text(json.dumps(buildinfo), encoding="utf-8")
         (self.fixture / "sbom.cdx.json").write_text(json.dumps({"bomFormat": "CycloneDX", "version": 1}), encoding="utf-8")
         files = sorted(path for path in self.fixture.rglob("*") if path.is_file() and path.name != "SHA256SUMS")
@@ -136,12 +167,19 @@ exec {real_ln} "$@"''')
                 (self.fixture / "BUILDINFO.json", "candidate-BUILDINFO.json"),
                 (self.fixture / "sbom.cdx.json", "candidate-sbom.cdx.json"),
             ))
+        elif version.count(".") == 2:
+            outer_files.extend((
+                (self.source_archive, self.source_archive.name),
+                (self.source_manifest, "SOURCE-ARCHIVE-MANIFEST.txt"),
+                (self.fixture / "BUILDINFO.json", "BUILDINFO.json"),
+                (self.fixture / "sbom.cdx.json", "sbom.cdx.json"),
+            ))
         outer.write_text("".join(
             f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {name}\n"
             for path, name in outer_files
         ), encoding="utf-8")
-        release_buildinfo = self.base / "candidate-BUILDINFO.json"
-        release_sbom = self.base / "candidate-sbom.cdx.json"
+        release_buildinfo = self.base / ("candidate-BUILDINFO.json" if candidate else "BUILDINFO.json")
+        release_sbom = self.base / ("candidate-sbom.cdx.json" if candidate else "sbom.cdx.json")
         shutil.copyfile(self.fixture / "BUILDINFO.json", release_buildinfo)
         shutil.copyfile(self.fixture / "sbom.cdx.json", release_sbom)
         bundle = self.base / "bundle.json"
@@ -179,6 +217,56 @@ exec {real_ln} "$@"''')
             self.provenance_bundle = self.base / "provenance.sigstore.json"
             self.provenance_bundle.write_text("{}\n", encoding="utf-8")
             self.buildinfo_path = self.fixture / "BUILDINFO.json"
+        elif version.count(".") == 2:
+            self.provenance = self.base / "provenance.json"
+            subjects = [
+                {"name": name, "digest": {"sha256": hashlib.sha256(path.read_bytes()).hexdigest()}}
+                for path, name in sorted(outer_files, key=lambda item: item[1])
+            ]
+            provenance = {
+                "_type": "https://in-toto.io/Statement/v1", "subject": subjects,
+                "predicateType": "https://slsa.dev/provenance/v1",
+                "predicate": {"buildDefinition": {
+                    "buildType": "https://github.com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-release.yml",
+                    "externalParameters": {
+                        "release_tag": f"v{version}",
+                        "source_manifest": "scripts/stable-source-archive.manifest",
+                        "source_manifest_sha256": manifest_digest,
+                        "builder_image": buildinfo["builder_image"],
+                        "rust_toolchain": buildinfo["rust_toolchain"],
+                    },
+                    "resolvedDependencies": [{
+                        "uri": f"git+https://github.com/wtfdelphia/tg-monitor-bot@refs/tags/v{version}",
+                        "digest": {"gitCommit": source_commit},
+                    }],
+                }, "runDetails": {
+                    "builder": {"id": "https://github.com/wtfdelphia/tg-monitor-bot/actions/runs/456"},
+                    "metadata": {"invocationId": "456"},
+                }},
+            }
+            package_checksums = sorted(
+                path for path in self.fixture.rglob("*") if path.is_file() and path.name != "SHA256SUMS"
+            )
+            (self.fixture / "SHA256SUMS").write_text("".join(
+                f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(self.fixture).as_posix()}\n"
+                for path in package_checksums
+            ), encoding="ascii")
+            with tarfile.open(archive, "w:gz") as stream:
+                for path in sorted(self.fixture.rglob("*")):
+                    stream.add(path, arcname="./" + path.relative_to(self.fixture).as_posix(), recursive=False)
+            outer.write_text("".join(
+                f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {name}\n"
+                for path, name in outer_files
+            ), encoding="utf-8")
+            provenance["subject"] = [
+                {"name": name, "digest": {"sha256": hashlib.sha256(path.read_bytes()).hexdigest()}}
+                for path, name in sorted(outer_files, key=lambda item: item[1])
+            ]
+            self.provenance.write_text(json.dumps(provenance), encoding="utf-8")
+            self.provenance_bundle = self.base / "provenance.sigstore.json"
+            self.provenance_bundle.write_text("{}\n", encoding="utf-8")
+            self.source_buildinfo = release_buildinfo
+            self.source_sbom = release_sbom
         else:
             self.provenance = None
             self.provenance_bundle = None
@@ -192,8 +280,16 @@ exec {real_ln} "$@"''')
         arguments = [f"--{mode}", "--app-services"]
         if mode == "user" and accept:
             arguments.append("--accept-same-uid")
-        return self.invoke(*arguments, "--archive", str(self.archive), "--checksums", str(self.checksums),
-                           "--bundle", str(self.bundle), **environment)
+        stable_arguments = [
+            "--archive", str(self.archive), "--checksums", str(self.checksums),
+            "--bundle", str(self.bundle), "--provenance", str(self.provenance),
+            "--provenance-bundle", str(self.provenance_bundle),
+            "--buildinfo", str(self.base / "BUILDINFO.json"),
+            "--sbom", str(self.base / "sbom.cdx.json"),
+            "--source-archive", str(self.source_archive),
+            "--source-manifest", str(self.source_manifest),
+        ]
+        return self.invoke(*arguments, *stable_arguments, **environment)
 
     def install_candidate(self, **environment: str) -> subprocess.CompletedProcess[str]:
         return self.invoke(
@@ -203,6 +299,17 @@ exec {real_ln} "$@"''')
             "--buildinfo", str(self.base / "candidate-BUILDINFO.json"),
             "--sbom", str(self.base / "candidate-sbom.cdx.json"),
             **environment,
+        )
+
+    def install_stable(self, **environment: str) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "--user", "--archive", str(self.archive), "--checksums", str(self.checksums),
+            "--bundle", str(self.bundle), "--provenance", str(self.provenance),
+            "--provenance-bundle", str(self.provenance_bundle),
+            "--buildinfo", str(self.base / "BUILDINFO.json"),
+            "--sbom", str(self.base / "sbom.cdx.json"),
+            "--source-archive", str(self.source_archive),
+            "--source-manifest", str(self.source_manifest), **environment,
         )
 
     def assert_success(self, result: subprocess.CompletedProcess[str]) -> None:
@@ -232,6 +339,41 @@ exec {real_ln} "$@"''')
         for line in calls.splitlines():
             if line.startswith("systemctl "):
                 self.assertEqual(line, "systemctl --user show-environment")
+
+    def test_stable_install_verifies_tag_identity_and_all_release_material(self) -> None:
+        self.assert_success(self.install_stable())
+        self.assertTrue((self.home / ".local/bin/tgm").is_symlink())
+        calls = self.calls.read_text(encoding="utf-8")
+        verification = next(line for line in calls.splitlines() if "provenance.json" in line)
+        pattern = verification.split("--certificate-identity-regexp ", 1)[1].split(" --certificate-oidc-issuer", 1)[0]
+        identity = "https://github.com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-release.yml@refs/tags/v0.1.0"
+        self.assertIsNotNone(re.fullmatch(pattern, identity))
+        self.assertIsNone(re.fullmatch(pattern, identity.replace("refs/tags/v0.1.0", "refs/heads/main")))
+        self.assertIsNone(re.fullmatch(pattern, identity.replace("v0.1.0", "v0.2.0")))
+        checksum_call = next(line for line in calls.splitlines() if "checksums-0.1.0" in line)
+        checksum_pattern = checksum_call.split("--certificate-identity-regexp ", 1)[1].split(" --certificate-oidc-issuer", 1)[0]
+        self.assertIsNotNone(re.fullmatch(checksum_pattern, identity))
+        self.assertIsNone(re.fullmatch(checksum_pattern, identity.replace("v0.1.0", "v0.2.0")))
+        self.assertNotIn("heads/main", calls)
+        self.assertFalse(any(line.startswith("systemctl ") for line in calls.splitlines()))
+
+    def test_stable_install_rejects_candidate_workflow_identity(self) -> None:
+        provenance = json.loads(self.provenance.read_text(encoding="utf-8"))
+        provenance["predicate"]["buildDefinition"]["buildType"] = (
+            "https://github.com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-candidate.yml"
+        )
+        self.provenance.write_text(json.dumps(provenance), encoding="utf-8")
+        self.assert_rejected(self.install_stable())
+        self.assertFalse((self.home / ".local/opt/tgm/releases").exists())
+
+    def test_stable_install_rejects_tampered_release_assets(self) -> None:
+        provenance = json.loads(self.provenance.read_text(encoding="utf-8"))
+        provenance["subject"][0]["digest"]["sha256"] = "0" * 64
+        self.provenance.write_text(json.dumps(provenance), encoding="utf-8")
+        self.assert_rejected(self.install_stable())
+        self.source_manifest.write_bytes(b"tampered manifest\\n")
+        self.assert_rejected(self.install_stable())
+        self.assertFalse((self.home / ".local/opt/tgm/releases").exists())
 
     def test_user_requires_same_uid_acceptance_and_manager(self) -> None:
         self.assert_rejected(self.install(accept=False))
@@ -465,7 +607,8 @@ exec {real_ln} "$@"''')
             result = subprocess.run([
                 "python3", str(ROOT / "scripts/native-release-package.py"), "--binary", str(binary),
                 "--source-root", str(ROOT), "--sbom", str(sbom), "--version", "0.1.0", "--source-commit", "0" * 40,
-                "--rust-toolchain", "test", "--builder-image", "test", "--source-date-epoch", "1700000000",
+                "--rust-toolchain", "test", "--builder-image", "sha256:" + "b" * 64, "--source-date-epoch", "1700000000",
+                "--source-manifest-sha256", hashlib.sha256((ROOT / "scripts/stable-source-archive.manifest").read_bytes()).hexdigest(),
                 "--output", str(output),
             ], env=self.environment, text=True, capture_output=True, timeout=20)
             self.assert_success(result)
@@ -524,7 +667,8 @@ exec {real_ln} "$@"''')
         result = subprocess.run([
             "python3", str(ROOT / "scripts/native-release-package.py"), "--binary", str(binary),
             "--source-root", str(ROOT), "--sbom", str(sbom), "--version", "0.1.0", "--source-commit", "0" * 40,
-            "--rust-toolchain", "test", "--builder-image", "test", "--source-date-epoch", "1700000000",
+            "--rust-toolchain", "test", "--builder-image", "sha256:" + "b" * 64, "--source-date-epoch", "1700000000",
+            "--source-manifest-sha256", hashlib.sha256((ROOT / "scripts/stable-source-archive.manifest").read_bytes()).hexdigest(),
             "--output", str(output),
         ], env=self.environment, text=True, capture_output=True, timeout=20)
         self.assert_success(result)
@@ -536,8 +680,11 @@ exec {real_ln} "$@"''')
         self.assertNotIn("candidate-SHA256SUMS", readme)
         self.assertNotIn("@CANDIDATE_", readme)
         self.assertNotIn("发布通道：", readme)
-        self.assertNotIn("channel", buildinfo)
-        self.assertNotIn("stable", buildinfo)
+        self.assertNotIn("@STABLE_", readme)
+        self.assertEqual(buildinfo.get("channel"), "stable")
+        self.assertIs(buildinfo.get("stable"), True)
+        self.assertEqual(buildinfo.get("release_tag"), "v0.1.0")
+        self.assertIn("SOURCE-ARCHIVE-MANIFEST.txt", readme)
 
     def prepare_preflight(self) -> None:
         self.stub("ldd", 'if [ "$1" = --version ]; then echo "ldd (GNU libc) 2.17"; else echo "libc.so.6 => /lib64/libc.so.6"; fi')
