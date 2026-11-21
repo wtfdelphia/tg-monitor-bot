@@ -393,6 +393,7 @@ scripts/native-release-package.py
 scripts/native-release-preflight.sh
 scripts/pgbouncer/userlist.txt
 scripts/prestage-local.py
+scripts/stable-release-approval.py
 scripts/stable-release-assets.py
 scripts/stable-source-archive.manifest
 scripts/stable-source-archive.py
@@ -402,6 +403,7 @@ scripts/tenant-purge-preflight.py
 scripts/tests/test_external_closure_evidence.py
 scripts/tests/test_g1_prestage.py
 scripts/tests/test_g4_journal_redaction.py
+scripts/tests/test_stable_release_approval.py
 scripts/tests/test_stable_release_assets.py
 scripts/tests/test_stable_source_archive.py
 scripts/tests/test_stable_source_rebuild.py

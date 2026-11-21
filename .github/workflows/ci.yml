@@ -63,7 +63,7 @@ jobs:
         run: python3 scripts/ai-driver/check-regressions.py
 
       - name: 稳定源码归档器回归
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_stable_source_archive scripts.tests.test_stable_tree scripts.tests.test_stable_source_rebuild scripts.tests.test_stable_release_assets -v
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_stable_source_archive scripts.tests.test_stable_tree scripts.tests.test_stable_source_rebuild scripts.tests.test_stable_release_assets scripts.tests.test_stable_release_approval -v
 
       - name: 原生发布包安装回归
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/check-native-services.py

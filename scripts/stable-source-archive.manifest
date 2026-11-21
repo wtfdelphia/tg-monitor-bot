@@ -183,11 +183,13 @@ scripts/init/01-roles.sql
 scripts/install-native.sh
 scripts/native-release-package.py
 scripts/native-release-preflight.sh
+scripts/stable-release-approval.py
 scripts/stable-release-assets.py
 scripts/stable-source-archive.manifest
 scripts/stable-source-archive.py
 scripts/stable-tree-snapshot.py
 scripts/stable-tree.manifest
+scripts/tests/test_stable_release_approval.py
 scripts/tests/test_stable_release_assets.py
 scripts/tests/test_stable_source_archive.py
 scripts/tests/test_stable_source_rebuild.py

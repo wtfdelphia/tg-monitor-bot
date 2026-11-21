@@ -190,8 +190,17 @@ def main() -> int:
             readme = readme.replace("@CANDIDATE_DISTRIBUTION@", "")
             readme = readme.replace("@CANDIDATE_INSTALL@", "")
             stable_distribution = (
-                "稳定 Release 包含签名清单、provenance、BUILDINFO、SBOM、精简源码归档和对应 manifest。"
-                "安装前先下载这些文件并从二进制归档提取安装器。\n\n"
+                "首次发布先在 main 的 Actions 运行 `Native binary release`，选择 `mode=prepare`，"
+                "填写当前 workspace 版本和完整 main commit。该阶段只构建并上传未签名验收资产及 `APPROVAL.json`，"
+                "不创建 tag、不签名、不发布。人工核对资产清单中的版本、source commit、五项 payload SHA-256、"
+                "provenance 与 manifest 摘要后，记录 `APPROVAL.json` 的 SHA-256。\n\n"
+                "确认批准后，创建并推送精确 `vMAJOR.MINOR.PATCH` tag；随后从该 tag ref 手动运行同一 workflow，"
+                "由 `WTFGEDelphia` 从该 tag ref 手动运行同一 workflow，选择 `mode=publish`，填入同一个 version、"
+                "source commit、prepare run ID 和已批准的 approval record SHA-256。"
+                "发布阶段重新验证 required checks、prepare run、全部资产摘要与 tag/source 绑定，签名后才创建 Release。\n\n"
+                "稳定 Release 包含二进制、provenance、BUILDINFO、SBOM、精简源码归档、manifest、SHA256SUMS、"
+                "审批记录及其摘要文件，以及绑定审批人、运行编号和审批记录 SHA-256 的独立签名声明。\n\n"
+                "安装前下载这些文件并从二进制归档提取安装器：\n\n"
                 "```bash\n"
                 "tar -xOzf tgm-@VERSION@-linux-x86_64-gnu.tar.gz ./scripts/install-native.sh > install-native.sh\n"
                 "bash install-native.sh --root \\\n"
