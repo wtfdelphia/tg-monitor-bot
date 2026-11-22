@@ -136,6 +136,9 @@ class StableTreeTests(unittest.TestCase):
         self.assertIn("retention-days: 90", workflow)
         self.assertIn("dist/prepared/assets", workflow)
         self.assertIn("dist/prepared/approval", workflow)
+        self.assertIn("--pattern approval.sigstore.json", workflow)
+        self.assertIn('"$approved/approval.sigstore.json"', workflow)
+        self.assertNotIn("approval-statement.sigstore.json", workflow)
 
     def test_source_snapshot_ci_push_scope_is_read_only_and_task_limited(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")

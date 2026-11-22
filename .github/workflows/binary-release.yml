@@ -368,13 +368,13 @@ jobs:
           mkdir -p "$approved"
           gh release download "$RELEASE_TAG" \
             --pattern APPROVAL.json --pattern APPROVAL.json.sha256 \
-            --pattern approval-statement.json --pattern approval-statement.sigstore.json \
+            --pattern approval-statement.json --pattern approval.sigstore.json \
             --dir "$approved"
           cmp -- dist/approval/APPROVAL.json "$approved/APPROVAL.json"
           cmp -- dist/approval/APPROVAL.json.sha256 "$approved/APPROVAL.json.sha256"
           (cd "$approved" && sha256sum -c APPROVAL.json.sha256)
           cmp -- "$RUNNER_TEMP/approval-statement.json" "$approved/approval-statement.json"
-          cosign verify-blob --bundle "$approved/approval-statement.sigstore.json" \
+          cosign verify-blob --bundle "$approved/approval.sigstore.json" \
             --certificate-identity-regexp "$approval_identity" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "$approved/approval-statement.json"
