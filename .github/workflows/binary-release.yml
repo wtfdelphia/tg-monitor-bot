@@ -1,20 +1,44 @@
 name: Native binary release
 
 concurrency:
-  group: native-binary-release-${{ github.ref_name }}
+  group: native-binary-release-${{ github.ref }}
   cancel-in-progress: false
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'prepare generates unsigned approval materials; publish requires a reviewed prepare run and exact approval SHA-256'
+        required: true
+        type: choice
+        options:
+          - prepare
+          - publish
+      version:
+        description: 'MAJOR.MINOR.PATCH; must match Cargo workspace and v tag'
+        required: true
+        type: string
+      source_commit:
+        description: 'Full main commit SHA approved for this release'
+        required: true
+        type: string
+      prepare_run_id:
+        description: 'Required only in publish mode; completed prepare run ID'
+        required: false
+        type: string
+      approval_record_sha256:
+        description: 'Required only in publish mode; SHA-256 reviewed and approved by the maintainer'
+        required: false
+        type: string
 
 jobs:
   build:
-    name: Build and verify stable release assets
+    if: inputs.mode == 'prepare' && github.ref == 'refs/heads/main'
+    name: Build unsigned stable assets for review
     runs-on: ubuntu-24.04
     outputs:
       source_commit: ${{ steps.validate.outputs.source_commit }}
+      version: ${{ steps.version.outputs.version }}
     permissions:
       contents: read
       checks: read
@@ -25,35 +49,29 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Validate exact stable tag and successful main CI
+      - name: Validate exact main source and successful required checks
         id: validate
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
-          BEFORE_SHA: ${{ github.event.before }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          [[ "$BEFORE_SHA" =~ ^0+$ ]] || {
-            echo "stable release requires a newly created tag; tag updates are rejected" >&2
-            exit 1
-          }
-          git fetch origin main --no-tags
-          source_commit="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           main_commit="$(git rev-parse origin/main^{commit})"
-          git merge-base --is-ancestor "$source_commit" "$main_commit"
+          test "$SOURCE_COMMIT" = "$GITHUB_SHA"
+          test "$SOURCE_COMMIT" = "$main_commit"
           test -z "$(git status --porcelain)"
-          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
-          checks="$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$source_commit/check-runs?per_page=100" \
+          echo "source_commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+          checks="$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$SOURCE_COMMIT/check-runs?per_page=100" \
             --jq '.check_runs[] | select(.name == "static" or .name == "database") | [.name,.status,.conclusion] | @tsv')"
           for required in static database; do
             matches="$(printf '%s\n' "$checks" | awk -F '\t' -v name="$required" '$1 == name { count++ } END { print count + 0 }')"
             result="$(printf '%s\n' "$checks" | awk -F '\t' -v name="$required" '$1 == name { print $2 "\t" $3 }')"
             if [ "$matches" != 1 ] || [ "$result" != $'completed\tsuccess' ]; then
-              echo "tag commit check $required must be unique and successful" >&2
+              echo "main commit check $required must be unique and successful" >&2
               printf '%s\n' "$checks" >&2
               exit 1
             fi
@@ -66,15 +84,16 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           echo "version=$(rustup show active-toolchain | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve workspace version
+      - name: Resolve and validate stable version
         id: version
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tgm") | .version')"
-          test "v$version" = "$RELEASE_TAG"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          workspace_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tgm") | .version')"
+          test "$workspace_version" = "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Create exact source archive and builder
         env:
@@ -167,20 +186,32 @@ jobs:
             --builder-image "$BUILDER_IMAGE_ID" --source-date-epoch "$epoch" \
             --expected-binary dist/tgm --expected-package "dist/assets/tgm-${VERSION}-linux-x86_64-gnu.tar.gz"
 
-      - name: Verify unsigned asset structure
+      - name: Prepare unsigned release approval record
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.validate.outputs.source_commit }}
         run: |
           set -euo pipefail
           python3 scripts/stable-release-assets.py verify \
-            --assets dist/assets --version '${{ steps.version.outputs.version }}' \
-            --source-commit '${{ steps.validate.outputs.source_commit }}'
+            --assets dist/assets --version "$VERSION" --source-commit "$SOURCE_COMMIT" \
+            --expected-run-id "$GITHUB_RUN_ID"
+          python3 scripts/stable-release-approval.py prepare \
+            --assets dist/assets --version "$VERSION" --source-commit "$SOURCE_COMMIT" \
+            --prepare-run-id "$GITHUB_RUN_ID" \
+            --output dist/approval/APPROVAL.json
+          (cd dist/approval && sha256sum APPROVAL.json > APPROVAL.json.sha256)
+          cat dist/approval/APPROVAL.json
+          cat dist/approval/APPROVAL.json.sha256
 
-      - name: Upload verified assets for the isolated signer
+      - name: Upload unsigned approval materials
         uses: actions/upload-artifact@v4
         with:
-          name: stable-release-assets
-          path: dist/assets/
+          name: stable-release-approval-v${{ steps.version.outputs.version }}-run-${{ github.run_id }}
+          path: |
+            dist/assets/
+            dist/approval/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 90
 
       - name: Cleanup builder resources
         if: always()
@@ -189,9 +220,10 @@ jobs:
           docker image rm "$BUILDER_IMAGE" 2>/dev/null || true
 
   publish:
-    name: Sign and publish immutable stable Release
-    needs: build
+    if: ${{ always() && inputs.mode == 'publish' && github.actor == 'WTFGEDelphia' && startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'skipped' }}
+    name: Sign and publish maintainer-approved stable Release
     runs-on: ubuntu-24.04
+    needs: build
     permissions:
       contents: write
       actions: read
@@ -202,23 +234,64 @@ jobs:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
 
-      - name: Download verified assets
+      - name: Download approved prepare artifact
         uses: actions/download-artifact@v4
         with:
-          name: stable-release-assets
-          path: dist/assets
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.prepare_run_id }}
+          name: stable-release-approval-v${{ inputs.version }}-run-${{ inputs.prepare_run_id }}
+          path: dist/prepared
 
-      - name: Verify publish checkout matches the build commit
-        env:
-          EXPECTED_SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
-          RELEASE_TAG: ${{ github.ref_name }}
+      - name: Separate approved record from release payload
         run: |
           set -euo pipefail
-          actual_commit="$(git rev-parse "$RELEASE_TAG^{commit}")"
-          test "$actual_commit" = "$EXPECTED_SOURCE_COMMIT"
+          test -d dist/prepared/assets
+          test -d dist/prepared/approval
+          mkdir -p dist/assets dist/approval
+          cp -a dist/prepared/assets/. dist/assets/
+          cp -a dist/prepared/approval/. dist/approval/
+
+      - name: Verify prepare run provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREPARE_RUN_ID: ${{ inputs.prepare_run_id }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREPARE_RUN_ID")"
+          jq -e --arg sha "$SOURCE_COMMIT" \
+            '.name == "Native binary release" and .path == ".github/workflows/binary-release.yml" and .event == "workflow_dispatch" and .status == "completed" and .conclusion == "success" and .head_branch == "main" and .head_sha == $sha' \
+            <<< "$run" >/dev/null
+
+      - name: Recheck explicit approval material
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          PREPARE_RUN_ID: ${{ inputs.prepare_run_id }}
+          APPROVAL_RECORD_SHA256: ${{ inputs.approval_record_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PREPARE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$APPROVAL_RECORD_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "${GITHUB_REF_NAME#v}" = "$VERSION"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
           git fetch origin main --no-tags
-          git merge-base --is-ancestor "$actual_commit" "origin/main^{commit}"
-          test -z "$(git status --porcelain)"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+          checks="$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$SOURCE_COMMIT/check-runs?per_page=100" \
+            --jq '.check_runs[] | select(.name == "static" or .name == "database") | [.name,.status,.conclusion] | @tsv')"
+          for required in static database; do
+            count="$(printf '%s\n' "$checks" | awk -F '\t' -v name="$required" '$1 == name { n++ } END { print n + 0 }')"
+            result="$(printf '%s\n' "$checks" | awk -F '\t' -v name="$required" '$1 == name { print $2 "\t" $3 }')"
+            test "$count" = 1 && test "$result" = $'completed\tsuccess'
+          done
+          python3 scripts/stable-release-approval.py verify \
+            --assets dist/assets --record dist/approval/APPROVAL.json \
+            --record-sha256 "$APPROVAL_RECORD_SHA256" --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" --prepare-run-id "$PREPARE_RUN_ID"
 
       - name: Reject existing Release
         env:
@@ -229,54 +302,79 @@ jobs:
           response="$RUNNER_TEMP/release-lookup-$GITHUB_RUN_ID.txt"
           if gh api --include "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" >"$response" 2>&1; then
             echo "Release $RELEASE_TAG already exists; refusing to overwrite." >&2
-            rm -f "$response"
             exit 1
           fi
-          if ! grep -Eq '^HTTP/[0-9.]+ 404([[:space:]]|$)' "$response"; then
+          grep -Eq '^HTTP/[0-9.]+ 404([[:space:]]|$)' "$response" || {
             cat "$response" >&2
-            rm -f "$response"
-            echo "Release lookup failed for a reason other than not-found; refusing to publish." >&2
+            echo "Release lookup failed; refusing to publish." >&2
             exit 1
-          fi
-          rm -f "$response"
+          }
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.7.0
 
-      - name: Sign and verify release payload
+      - name: Sign, verify, and publish approved assets
         env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          APPROVAL_RECORD_SHA256: ${{ inputs.approval_record_sha256 }}
+          PREPARE_RUN_ID: ${{ inputs.prepare_run_id }}
+          APPROVER: ${{ github.actor }}
+          APPROVAL_RUN_ID: ${{ github.run_id }}
           RELEASE_TAG: ${{ github.ref_name }}
-          EXPECTED_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           cosign sign-blob --yes --bundle dist/assets/SHA256SUMS.sigstore.json dist/assets/SHA256SUMS
           cosign sign-blob --yes --bundle dist/assets/provenance.sigstore.json dist/assets/provenance.json
           python3 scripts/stable-release-assets.py verify \
-            --assets dist/assets --version "${RELEASE_TAG#v}" \
-            --source-commit "$(git rev-parse HEAD)" \
-            --expected-run-id "$EXPECTED_RUN_ID" --verify-signatures
+            --assets dist/assets --version "$VERSION" --source-commit "$SOURCE_COMMIT" \
+            --expected-run-id "$PREPARE_RUN_ID" --verify-signatures
+          approval_bundle="$RUNNER_TEMP/approval-statement.json"
+          python3 scripts/stable-release-approval.py approve \
+            --assets dist/assets --record dist/approval/APPROVAL.json \
+            --record-sha256 "$APPROVAL_RECORD_SHA256" --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" --prepare-run-id "$PREPARE_RUN_ID" \
+            --approval-run-id "$APPROVAL_RUN_ID" --approver "$APPROVER" \
+            --output "$approval_bundle"
+          cosign sign-blob --yes --bundle "$RUNNER_TEMP/approval.sigstore.json" "$approval_bundle"
+          approval_identity="https://github[.]com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-release[.]yml@refs/tags/v${VERSION//./[.]}"
+          cosign verify-blob --bundle "$RUNNER_TEMP/approval.sigstore.json" \
+            --certificate-identity-regexp "$approval_identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$approval_bundle"
+          remote_tag="$(git ls-remote origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"
+          remote_commit="$(awk -v direct="refs/tags/$RELEASE_TAG" -v peeled="refs/tags/$RELEASE_TAG^{}" \
+            '$2 == direct { tag=$1 } $2 == peeled { commit=$1 } END { print commit != "" ? commit : tag }' <<< "$remote_tag")"
+          test "$remote_commit" = "$SOURCE_COMMIT" || {
+            echo "release tag no longer resolves to the approved source commit" >&2
+            exit 1
+          }
+          gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" \
+            --generate-notes dist/assets/* \
+            dist/approval/APPROVAL.json dist/approval/APPROVAL.json.sha256 \
+            "$approval_bundle" "$RUNNER_TEMP/approval.sigstore.json"
 
-      - name: Create Release without overwrite
+      - name: Verify published approval record signature
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
-          EXPECTED_RUN_ID: ${{ github.run_id }}
+          APPROVAL_RECORD_SHA256: ${{ inputs.approval_record_sha256 }}
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          read -r remote_tag_sha remote_peeled_sha < <(
-            git ls-remote origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}" \
-              | awk -v tag="refs/tags/$RELEASE_TAG" -v peeled="refs/tags/$RELEASE_TAG^{}" \
-                  '$2 == tag { direct=$1 } $2 == peeled { annotated=$1 } END { print direct, annotated }'
-          )
-          remote_tag_commit="${remote_peeled_sha:-$remote_tag_sha}"
-          test -n "$remote_tag_commit" && test "$remote_tag_commit" = "$(git rev-parse HEAD)" || {
-            echo "release tag changed after build verification; refusing to publish" >&2
-            exit 1
-          }
-          assets=(dist/assets/*)
-          python3 scripts/stable-release-assets.py verify \
-            --assets dist/assets --version "${RELEASE_TAG#v}" \
-            --source-commit "$(git rev-parse HEAD)" \
-            --expected-run-id "$EXPECTED_RUN_ID"
-          gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" \
-            --generate-notes "${assets[@]}"
+          approval_identity="https://github[.]com/wtfdelphia/tg-monitor-bot/.github/workflows/binary-release[.]yml@refs/tags/v${VERSION//./[.]}"
+          approved="$RUNNER_TEMP/approved-release"
+          mkdir -p "$approved"
+          gh release download "$RELEASE_TAG" \
+            --pattern APPROVAL.json --pattern APPROVAL.json.sha256 \
+            --pattern approval-statement.json --pattern approval-statement.sigstore.json \
+            --dir "$approved"
+          cmp -- dist/approval/APPROVAL.json "$approved/APPROVAL.json"
+          cmp -- dist/approval/APPROVAL.json.sha256 "$approved/APPROVAL.json.sha256"
+          (cd "$approved" && sha256sum -c APPROVAL.json.sha256)
+          cmp -- "$RUNNER_TEMP/approval-statement.json" "$approved/approval-statement.json"
+          cosign verify-blob --bundle "$approved/approval-statement.sigstore.json" \
+            --certificate-identity-regexp "$approval_identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$approved/approval-statement.json"

@@ -120,16 +120,22 @@ class StableTreeTests(unittest.TestCase):
 
     def test_stable_release_trigger_and_permissions_are_scoped(self) -> None:
         workflow = (ROOT / ".github/workflows/binary-release.yml").read_text(encoding="utf-8")
-        self.assertIn("v*.*.*", workflow)
-        self.assertNotIn("workflow_dispatch:", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("- prepare", workflow)
+        self.assertIn("- publish", workflow)
+        self.assertIn("github.actor == 'WTFGEDelphia'", workflow)
         self.assertIn("contents: read", workflow)
         self.assertIn("checks: read", workflow)
         self.assertIn("contents: write", workflow)
         self.assertIn("actions: read", workflow)
         self.assertIn("id-token: write", workflow)
         self.assertNotIn("--clobber", workflow)
-        self.assertIn("stable release requires a newly created tag", workflow)
+        self.assertIn("awaiting-explicit-release-approval", (ROOT / "scripts/stable-release-approval.py").read_text(encoding="utf-8"))
         self.assertIn("refusing to overwrite", workflow)
+        self.assertIn("needs.build.result == 'skipped'", workflow)
+        self.assertIn("retention-days: 90", workflow)
+        self.assertIn("dist/prepared/assets", workflow)
+        self.assertIn("dist/prepared/approval", workflow)
 
     def test_source_snapshot_ci_push_scope_is_read_only_and_task_limited(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
