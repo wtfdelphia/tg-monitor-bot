@@ -1,6 +1,6 @@
 # PRE-010：GitHub Actions 流水线运行时告警收口
 
-status: active
+status: done
 wp: WP-8
 escalation: yes
 allow-paths: .github/workflows/ci.yml,.github/workflows/binary-candidate.yml,.github/workflows/binary-release.yml,.github/workflows/docker-publish.yml
