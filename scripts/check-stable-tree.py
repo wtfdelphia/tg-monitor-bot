@@ -73,10 +73,12 @@ def check(root: Path, commit: str, manifest_path: str, strict: bool = False) -> 
         "AGENTS.md", "CLAUDE.md", "spec/devlog.md",
         "docs/Telegram 多租户内容监控与分发平台.md",
         ".github/workflows/docker-build-validation.yml",
-        ".github/workflows/docker-publish.yml",
         "compose.acceptance.override.yaml",
     }
-    optional_development_exact = {".github/workflows/binary-release.yml"}
+    optional_development_exact = {
+        ".github/workflows/binary-release.yml",
+        ".github/workflows/docker-publish.yml",
+    }
     unexpected = sorted(unlisted) if strict else sorted(
         path for path in unlisted
         if not path.startswith(ignored_prefixes)
