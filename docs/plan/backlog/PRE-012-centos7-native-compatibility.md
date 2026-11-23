@@ -1,6 +1,6 @@
 # PRE-012：CentOS 7 原生验收兼容收口
 
-status: active
+status: done
 wp: WP-8
 escalation: yes
 allow-paths: scripts/verify-native-candidate.py,scripts/native-release-preflight.sh,scripts/check-native-services.py,deploy/native/README.md,spec/devlog.md
