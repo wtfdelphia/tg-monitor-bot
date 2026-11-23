@@ -1,6 +1,6 @@
 # PRE-009：dev 候选二进制验收包
 
-status: active
+status: done
 wp: WP-8
 escalation: yes
 allow-paths: .github/workflows/binary-candidate.yml,scripts/native-release-package.py,scripts/install-native.sh,scripts/verify-native-candidate.py,scripts/check-native-services.py,deploy/native/README.md
