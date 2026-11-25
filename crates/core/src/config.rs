@@ -454,6 +454,66 @@ pub fn check_tenant_purge(
     check_cleanup(raw_profile, present, rust_log, "TGM_DB_URL_TENANT_PURGE")
 }
 
+/// G4 指纹重算扫描的环境边界（提案
+/// `docs/plan/proposals/G4-production-fingerprint-readonly-access.md` §三）。
+/// 裁剪需要两条连接（源 = 已批准恢复副本、目标 = 空裁剪副本），
+/// 扫描与销毁只需要目标一条。三种动作都拒绝混入其他已登记凭据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum G4ScanAction {
+    Trim,
+    Scan,
+    Destroy,
+}
+
+pub fn check_g4_fingerprint_scan(
+    raw_profile: Option<&str>,
+    present: &[&str],
+    rust_log: Option<&str>,
+    action: G4ScanAction,
+) -> Vec<ConfigProblem> {
+    let mut problems = Vec::new();
+    let profile = match raw_profile {
+        None => {
+            problems.push(ConfigProblem::ProfileMissing);
+            None
+        }
+        Some(raw) => match Profile::parse(raw) {
+            Ok(profile) => Some(profile),
+            Err(_) => {
+                problems.push(ConfigProblem::ProfileUnknown(raw.to_owned()));
+                None
+            }
+        },
+    };
+    let allowed: &[&'static str] = match action {
+        G4ScanAction::Trim => &["TGM_DB_URL_G4_SCAN_SOURCE", "TGM_DB_URL_G4_SCAN_DEST"],
+        G4ScanAction::Scan | G4ScanAction::Destroy => &["TGM_DB_URL_G4_SCAN_DEST"],
+    };
+    for name in allowed {
+        if !present.contains(name) {
+            problems.push(ConfigProblem::Missing(name));
+        }
+    }
+    for name in known_names() {
+        if present.contains(name)
+            && !allowed.contains(name)
+            && !["TGM_PROFILE", "RUST_LOG"].contains(name)
+        {
+            problems.push(ConfigProblem::Unexpected(name));
+        }
+    }
+    if present.contains(&"DATABASE_URL") {
+        problems.push(ConfigProblem::Unexpected("DATABASE_URL"));
+    }
+    if profile.is_some_and(Profile::is_production)
+        && let Some(filter) = rust_log
+        && !filter.contains("sqlx=warn")
+    {
+        problems.push(ConfigProblem::SqlxLogNotSilenced(filter.to_owned()));
+    }
+    problems
+}
+
 fn check_cleanup(
     raw_profile: Option<&str>,
     present: &[&str],
@@ -573,6 +633,8 @@ fn known_names() -> &'static [&'static str] {
         "TGM_BOT_GATEWAY_LISTEN_ADDR",
         "TGM_PLATFORM_API_ID",
         "TGM_PLATFORM_API_HASH",
+        "TGM_DB_URL_G4_SCAN_SOURCE",
+        "TGM_DB_URL_G4_SCAN_DEST",
     ]
 }
 
@@ -580,6 +642,89 @@ fn known_names() -> &'static [&'static str] {
 // 同 kek.rs：测试里的 expect/unwrap 就是断言本身。
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn g4_scan_configuration_is_an_independent_credential_boundary() {
+        let trim_present = [
+            "TGM_PROFILE",
+            "TGM_DB_URL_G4_SCAN_SOURCE",
+            "TGM_DB_URL_G4_SCAN_DEST",
+        ];
+        assert!(
+            check_g4_fingerprint_scan(Some("production"), &trim_present, None, G4ScanAction::Trim)
+                .is_empty()
+        );
+        let scan_present = ["TGM_PROFILE", "TGM_DB_URL_G4_SCAN_DEST"];
+        assert!(
+            check_g4_fingerprint_scan(Some("production"), &scan_present, None, G4ScanAction::Scan)
+                .is_empty()
+        );
+        // 扫描动作多配源连接也要报：扫描只能看裁剪副本。
+        assert!(
+            check_g4_fingerprint_scan(Some("production"), &trim_present, None, G4ScanAction::Scan)
+                .contains(&ConfigProblem::Unexpected("TGM_DB_URL_G4_SCAN_SOURCE"))
+        );
+        // 混入任何其他已登记凭据都报。
+        for forbidden in known_names().iter().copied().chain(["DATABASE_URL"]) {
+            if ["TGM_PROFILE", "RUST_LOG"].contains(&forbidden) {
+                continue;
+            }
+            let mut mixed = vec!["TGM_PROFILE"];
+            if !forbidden.starts_with("TGM_DB_URL_G4_SCAN") {
+                mixed.push(forbidden);
+                let mut found = false;
+                for action in [
+                    G4ScanAction::Trim,
+                    G4ScanAction::Scan,
+                    G4ScanAction::Destroy,
+                ] {
+                    let mut env = mixed.clone();
+                    env.push("TGM_DB_URL_G4_SCAN_SOURCE");
+                    env.push("TGM_DB_URL_G4_SCAN_DEST");
+                    if check_g4_fingerprint_scan(Some("production"), &env, None, action)
+                        .contains(&ConfigProblem::Unexpected(forbidden))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                assert!(found, "混入 {forbidden} 未被报出");
+            }
+        }
+        assert!(
+            check_g4_fingerprint_scan(None, &[], None, G4ScanAction::Trim)
+                .contains(&ConfigProblem::ProfileMissing)
+        );
+        assert!(
+            check_g4_fingerprint_scan(
+                Some("production"),
+                &["TGM_PROFILE"],
+                None,
+                G4ScanAction::Trim
+            )
+            .contains(&ConfigProblem::Missing("TGM_DB_URL_G4_SCAN_SOURCE"))
+        );
+        assert!(
+            check_g4_fingerprint_scan(
+                Some("production"),
+                &scan_present,
+                Some("debug"),
+                G4ScanAction::Scan
+            )
+            .iter()
+            .any(|problem| matches!(problem, ConfigProblem::SqlxLogNotSilenced(_)))
+        );
+        // 常驻角色环境里出现扫描连接串要报多配。
+        assert!(
+            check(
+                Role::Rule,
+                Some("production"),
+                &["TGM_PROFILE", "TGM_DB_URL_G4_SCAN_DEST"],
+                None
+            )
+            .contains(&ConfigProblem::Unexpected("TGM_DB_URL_G4_SCAN_DEST"))
+        );
+    }
+
     #[test]
     fn tenant_lifecycle_has_no_other_credentials() {
         let present = ["TGM_PROFILE", "TGM_DB_URL_TENANT_LIFECYCLE"];
@@ -615,9 +760,9 @@ mod tests {
         }
     }
     use super::{
-        COMMON, ConfigProblem, Role, check, check_auth_cleanup, check_kek_backend,
-        check_platform_cleanup, check_shared_cleanup, check_tenant_cleanup, check_tenant_purge,
-        extra_required, known_names, validate_oidc_alg,
+        COMMON, ConfigProblem, G4ScanAction, Role, check, check_auth_cleanup,
+        check_g4_fingerprint_scan, check_kek_backend, check_platform_cleanup, check_shared_cleanup,
+        check_tenant_cleanup, check_tenant_purge, extra_required, known_names, validate_oidc_alg,
     };
     use crate::oidc::OidcSigningAlgorithm;
 

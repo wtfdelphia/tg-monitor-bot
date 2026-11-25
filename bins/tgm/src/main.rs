@@ -57,6 +57,13 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         max_tenants: i64,
     },
+    /// G4 生产历史指纹重算：只作用于获批隔离副本（裁剪/扫描/销毁）。
+    /// 提案 docs/plan/proposals/G4-production-fingerprint-readonly-access.md。
+    /// 不连接生产库、不添加生产角色；范围标记表缺失即拒绝运行。
+    G4FingerprintScan {
+        #[command(subcommand)]
+        action: G4ScanCommand,
+    },
     /// 导出 OpenAPI 契约；`--check` 则与仓库内的 openapi.json 比对
     Openapi {
         #[arg(long)]
@@ -78,6 +85,44 @@ enum LifecycleAction {
         #[arg(long)]
         tenant_id: i64,
     },
+}
+
+#[derive(clap::Subcommand)]
+enum G4ScanCommand {
+    /// 从已批准恢复副本裁剪出一次性扫描副本并写入范围标记
+    Trim {
+        #[arg(long)]
+        approval_ref: String,
+        #[arg(long, required = true)]
+        tenant: Vec<i64>,
+        #[arg(long)]
+        window_start: Option<String>,
+        #[arg(long)]
+        window_end: Option<String>,
+        #[arg(long)]
+        as_of: String,
+        #[arg(long, default_value_t = false)]
+        include_expired: bool,
+        #[arg(long, default_value_t = false)]
+        allow_content_read: bool,
+        #[arg(long)]
+        max_rows: i64,
+        #[arg(long)]
+        max_duration_secs: i64,
+        #[arg(long)]
+        scan_role: String,
+    },
+    /// 在裁剪副本上只读重算指纹，只输出聚合计数
+    Scan {
+        #[arg(long)]
+        approval_ref: String,
+        #[arg(long)]
+        max_rows: Option<i64>,
+        #[arg(long)]
+        max_duration_secs: Option<i64>,
+    },
+    /// 销毁裁剪副本里的标记表与四张裁剪表
+    Destroy,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -646,6 +691,163 @@ fn present_env_names() -> Vec<String> {
         .collect()
 }
 
+/// G4 指纹重算扫描的环境检查与执行。三条动作共用一套「独立凭据边界」：
+/// 只允许 profile、本命令的连接串与可选日志配置，混入其他已登记凭据即拒绝 ——
+/// 与清理命令同形（eng/01 §二的每行「拒绝混入」）。扫描身份与目标库
+/// 的一次性由 tgm_db::g4_fingerprint_scan 的前置检查兜底。
+fn g4_fingerprint_scan_command(action: G4ScanCommand) -> anyhow::Result<()> {
+    let present = present_env_names();
+    let names: Vec<&str> = present.iter().map(String::as_str).collect();
+    let profile = std::env::var("TGM_PROFILE").ok();
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let check_action = match &action {
+        G4ScanCommand::Trim { .. } => tgm_core::config::G4ScanAction::Trim,
+        G4ScanCommand::Scan { .. } => tgm_core::config::G4ScanAction::Scan,
+        G4ScanCommand::Destroy => tgm_core::config::G4ScanAction::Destroy,
+    };
+    let problems = tgm_core::config::check_g4_fingerprint_scan(
+        profile.as_deref(),
+        &names,
+        rust_log.as_deref(),
+        check_action,
+    );
+    if !problems.is_empty() {
+        for problem in problems {
+            eprintln!("tgm: 配置错误：{problem}");
+        }
+        anyhow::bail!("G4 指纹扫描配置错误，拒绝执行");
+    }
+    let runtime = tokio::runtime::Runtime::new()?;
+    match action {
+        G4ScanCommand::Trim {
+            approval_ref,
+            tenant,
+            window_start,
+            window_end,
+            as_of,
+            include_expired,
+            allow_content_read,
+            max_rows,
+            max_duration_secs,
+            scan_role,
+        } => runtime.block_on(async move {
+            use tgm_db::g4_fingerprint_scan as scan;
+            let scope = scan::ApprovedScope {
+                approval_ref,
+                tenants: tenant,
+                window_start: window_start
+                    .as_deref()
+                    .map(scan::parse_rfc3339)
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?,
+                window_end: window_end
+                    .as_deref()
+                    .map(scan::parse_rfc3339)
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?,
+                as_of: scan::parse_rfc3339(&as_of).map_err(anyhow::Error::msg)?,
+                include_expired,
+                allow_content_read,
+                max_rows,
+                max_duration_secs,
+            };
+            let source_url = std::env::var("TGM_DB_URL_G4_SCAN_SOURCE")
+                .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_G4_SCAN_SOURCE"))?;
+            let dest_url = std::env::var("TGM_DB_URL_G4_SCAN_DEST")
+                .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_G4_SCAN_DEST"))?;
+            let source = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&source_url)
+                .await
+                .map_err(|_| anyhow::anyhow!("G4 扫描源数据库连接失败"))?;
+            let dest = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&dest_url)
+                .await
+                .map_err(|_| anyhow::anyhow!("G4 扫描目标数据库连接失败"))?;
+            let report = scan::run_trim(&source, &dest, &scope, &scan_role)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            source.close().await;
+            dest.close().await;
+            if report.stopped_by_rows {
+                println!(
+                    "tgm: G4 裁剪命中行数上限，范围标记未写入；目标库必须整体废弃（DROP DATABASE）后重来：dedup={} tasks={} tenant_events={} canonical_events={}",
+                    report.notify_dedup_rows,
+                    report.delivery_task_rows,
+                    report.tenant_event_rows,
+                    report.canonical_event_rows
+                );
+                anyhow::bail!("裁剪不完整，未写入范围标记");
+            }
+            println!(
+                "tgm: G4 裁剪完成：dedup={} tasks={} tenant_events={} canonical_events={} stopped=false",
+                report.notify_dedup_rows,
+                report.delivery_task_rows,
+                report.tenant_event_rows,
+                report.canonical_event_rows
+            );
+            Ok(())
+        }),
+        G4ScanCommand::Scan {
+            approval_ref,
+            max_rows,
+            max_duration_secs,
+        } => runtime.block_on(async move {
+            use tgm_db::g4_fingerprint_scan as scan;
+            let url = std::env::var("TGM_DB_URL_G4_SCAN_DEST")
+                .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_G4_SCAN_DEST"))?;
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .map_err(|_| anyhow::anyhow!("G4 扫描数据库连接失败"))?;
+            let scope = scan::load_marker(&pool, &approval_ref)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let max_duration = std::time::Duration::from_secs(
+                u64::try_from(max_duration_secs.unwrap_or(scope.max_duration_secs))
+                    .map_err(|_| anyhow::anyhow!("时长上限必须为正"))?,
+            );
+            let report = scan::run_scan(&pool, &scope, max_duration, max_rows)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            pool.close().await;
+            // 只输出聚合计数与停止标志（提案 §二 第 5 条的输出纪律）。
+            println!(
+                "tgm: G4 扫描结束：tenants={} scanned={} matched={} mismatched={} not_recomputable_no_task={} not_recomputable_missing_source={} not_recomputable_scrubbed={} stopped_by_rows={} stopped_by_duration={}",
+                report.tenants_scanned,
+                report.scanned,
+                report.matched,
+                report.mismatched,
+                report.not_recomputable_no_task,
+                report.not_recomputable_missing_source,
+                report.not_recomputable_scrubbed,
+                report.stopped_by_rows,
+                report.stopped_by_duration
+            );
+            Ok(())
+        }),
+        G4ScanCommand::Destroy => runtime.block_on(async move {
+            use tgm_db::g4_fingerprint_scan as scan;
+            let url = std::env::var("TGM_DB_URL_G4_SCAN_DEST")
+                .map_err(|_| anyhow::anyhow!("缺少 TGM_DB_URL_G4_SCAN_DEST"))?;
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .map_err(|_| anyhow::anyhow!("G4 扫描数据库连接失败"))?;
+            let dropped = scan::run_destroy(&pool)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            pool.close().await;
+            println!("tgm: G4 销毁完成：{}", dropped.join(","));
+            println!("tgm: 扫描角色与数据库本身的删除由责任方按销毁记录另行执行");
+            Ok(())
+        }),
+    }
+}
+
 fn tenant_purge_pool_options(url: &str) -> anyhow::Result<PgConnectOptions> {
     let parsed = PgConnectOptions::from_str(url)
         .map_err(|_| anyhow::anyhow!("租户物理清理数据库连接配置无效"))?
@@ -899,6 +1101,9 @@ fn main() -> anyhow::Result<()> {
     {
         return tenant_purge_command(tenant_id, max_tenants);
     }
+    if let Command::G4FingerprintScan { action } = cmd {
+        return g4_fingerprint_scan_command(action);
+    }
     if let Command::CleanupAuth { category } = cmd {
         let present = present_env_names();
         let names: Vec<&str> = present.iter().map(String::as_str).collect();
@@ -1132,6 +1337,7 @@ fn main() -> anyhow::Result<()> {
         Command::CleanupPlatform => unreachable!("已在上面处理"),
         Command::TenantLifecycle { .. } => unreachable!("已在上面处理"),
         Command::PurgeDeletedTenants { .. } => unreachable!("已在上面处理"),
+        Command::G4FingerprintScan { .. } => unreachable!("已在上面处理"),
         Command::Openapi { check } => {
             openapi(check)?;
         }
