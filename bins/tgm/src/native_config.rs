@@ -202,6 +202,17 @@ fn validate(role: config::Role, values: &BTreeMap<String, Zeroizing<String>>) ->
             );
         }
     }
+    // metrics 监听（G5）：合法地址之外还必须是回环 —— /metrics 不对公网暴露
+    // （ops/00 §三），过宽配置在配置预检阶段就拒，不等启动期绑定。
+    if let Some(value) = get("TGM_METRICS_LISTEN_ADDR") {
+        let addr = value
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| anyhow::anyhow!("环境文件的 metrics 监听地址不合法"))?;
+        ensure!(
+            addr.ip().is_loopback(),
+            "环境文件的 metrics 监听地址必须是回环地址"
+        );
+    }
     for name in [
         "TGM_CONTROL_BOT_IDENTITY_ID",
         "TGM_DATA_BOT_IDENTITY_ID",

@@ -256,6 +256,35 @@ async fn serve_control_plane(
     }
     let pool = sqlx::PgPool::connect(&app_url).await?;
     let auth_pool = sqlx::PgPool::connect(&auth_url).await?;
+    // G5：/metrics 私有监听。可选变量 —— 不设置就不暴露指标（本片不启用生产抓取）；
+    // 设置则必须回环且在业务监听之前绑定成功，否则拒绝启动（失败方向吵闹）。
+    // 采集与暴露都在独立任务里，任何失败只记日志，不波及业务 HTTP。
+    let mut metrics_task: Option<(watch::Sender<bool>, tokio::task::JoinHandle<()>)> = None;
+    if let Some(raw) = std::env::var("TGM_METRICS_LISTEN_ADDR")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        let addr = tgm_app::metrics::parse_listen_addr(&raw)
+            .map_err(|error| anyhow::anyhow!("metrics 配置无效：{error}"))?;
+        let runtime = tgm_app::metrics::MetricsRuntime::bind(tgm_app::metrics::MetricsConfig {
+            listen_addr: addr,
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("metrics 启动被拒：{error}"))?;
+        tracing::info!(metrics_addr = %addr, "metrics 私有监听已绑定（不对公网暴露）");
+        let metrics_pool = pool.clone();
+        let (metrics_stop, mut metrics_stop_rx) = watch::channel(false);
+        let metrics_shutdown = async move {
+            let _ = metrics_stop_rx.changed().await;
+        };
+        let handle = tokio::spawn(async move {
+            if let Err(error) = runtime.serve(metrics_pool, metrics_shutdown).await {
+                tracing::warn!(error = %error, "metrics 监听异常退出，不影响业务");
+            }
+        });
+        metrics_task = Some((metrics_stop, handle));
+    }
     let mut identity_tx = pool.begin().await?;
     sqlx::query("SELECT set_config('app.tenant_id', '0', true)")
         .execute(&mut *identity_tx)
@@ -321,6 +350,11 @@ async fn serve_control_plane(
     let _ = notify_stop.send(true);
     let _ = notify_task.await;
     served?;
+    if let Some((metrics_stop, metrics_task)) = metrics_task {
+        // 业务服务先退，再确定性地停指标监听 —— 不等第二个信号源。
+        let _ = metrics_stop.send(true);
+        let _ = metrics_task.await;
+    }
     Ok(())
 }
 

@@ -191,6 +191,10 @@ pub fn allowed(role: Role) -> Vec<&'static str> {
     match role {
         Role::ControlPlane => {
             v.push("TGM_LISTEN_ADDR");
+            // G5：/metrics 私有监听。可选 —— 不设置就不暴露指标（本片不启用生产抓取）；
+            // 设置则必须回环，由 bins/tgm 的值校验拦非回环。只给 control-plane：
+            // 形态 A 单实例下它是唯一的平台面进程，指标不随业务角色重复暴露。
+            v.push("TGM_METRICS_LISTEN_ADDR");
             v.push("TGM_DB_URL_EXECUTION");
             v.extend_from_slice(&["TGM_KMS_KEY_ARN", "TGM_LOCAL_KEK"]);
         }
@@ -567,6 +571,7 @@ fn known_names() -> &'static [&'static str] {
         "TGM_CONTROL_BOT_IDENTITY_ID",
         "TGM_CONTROL_BOT_USERNAME",
         "TGM_LISTEN_ADDR",
+        "TGM_METRICS_LISTEN_ADDR",
         "TGM_DATA_BOT_SECRET_TOKEN",
         "TGM_DATA_BOT_IDENTITY_ID",
         "TGM_DATA_BOT_TENANT_ID",
@@ -807,6 +812,35 @@ mod tests {
         ] {
             let p = check(role, Some("development"), &minimal(role), None);
             assert!(p.is_empty(), "{role:?} 的最小环境不该有问题：{p:?}");
+        }
+    }
+
+    /// G5：`TGM_METRICS_LISTEN_ADDR` 是 control-plane 独有的**可选**项 ——
+    /// 不设置不暴露指标；给了其他角色就是多配（§4.1）。
+    #[test]
+    fn metrics_listen_addr_is_optional_and_control_plane_only() {
+        let base = minimal(Role::ControlPlane);
+        assert!(check(Role::ControlPlane, Some("development"), &base, None).is_empty());
+        let mut with_metrics = base.clone();
+        with_metrics.push("TGM_METRICS_LISTEN_ADDR");
+        assert!(
+            check(Role::ControlPlane, Some("development"), &with_metrics, None).is_empty(),
+            "control-plane 允许可选配置 metrics 监听"
+        );
+        for role in [
+            Role::BotGateway,
+            Role::MtprotoWorker,
+            Role::Fanout,
+            Role::Rule,
+            Role::Delivery,
+        ] {
+            let mut names = minimal(role);
+            names.push("TGM_METRICS_LISTEN_ADDR");
+            assert!(
+                check(role, Some("development"), &names, None)
+                    .contains(&ConfigProblem::Unexpected("TGM_METRICS_LISTEN_ADDR")),
+                "{role:?} 不得配置 metrics 监听"
+            );
         }
     }
 
