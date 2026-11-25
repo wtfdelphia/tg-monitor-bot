@@ -1,0 +1,82 @@
+# G5：运行指标与单实例启动保护验收提案
+
+任务 id：`G5-runtime-metrics-and-single-instance-acceptance`。
+
+状态：提案阶段，等待维护人批准。
+
+## 一、当前缺口
+
+`docs/design/ops/01-上线就绪与运维.md` §一要求上线前完成核心指标与告警、容量实测和单实例租约防误双开验证。`docs/design/eng/00-工程约定.md` §2.3 已选择 `metrics`、`metrics-exporter-prometheus` 与 `/metrics`，但当前 `Cargo.lock` 没有这两个依赖，应用源码没有 recorder 注册，Axum 路由没有 `/metrics` handler。
+
+运维规格还规定 `/metrics` 不对公网暴露，并要求从数据库提供采集延迟、按租户投递失败率和队列深度。上述指标会跨越 HTTP 暴露面、租户数据边界和数据库读取权限，必须先固定采集角色、监听地址、label 集合与查询范围。
+
+系统级和 user-level systemd 都提供六个角色模板。systemd 对同一 manager 中的同名 unit 提供单一 unit 生命周期，但仓库没有 Rocky 目标机重复启动行为的记录，也没有独立手工进程与 systemd role 进程并存时的专项验证。该缺口应针对首发单实例形态验收。X1–X5 多实例混沌按既有单实例决策保持 `deferred/not-run`。
+
+当前基线：`cloud/dev@994ab82a2f941ec50bc37146fbfb16d5ff6758c1`，CI `45362852128` 成功。
+
+判据出处：`docs/design/plan/00-里程碑与工期.md` §三 G5；`docs/design/ops/01-上线就绪与运维.md` §一、§三、§四、§六；`docs/design/ops/00-部署与运行时.md` §三、§六；`docs/design/eng/00-工程约定.md` §2.3；`docs/design/eng/04-CI门禁.md`。
+
+## 二、建议范围
+
+### 2.1 运行指标与采集
+
+- 依 `eng/00` 已选定的 `metrics` 和 `metrics-exporter-prometheus` 接入 recorder 与 `/metrics` handler。
+- 先明确由哪些 role 注册 recorder、listener 如何配置，以及 system/user unit 如何避免同机端口冲突。
+- 将 metrics listener 与公网业务 listener 分开，并为默认绑定地址、允许的访问网段及配置缺失定义 fail-closed 行为。
+- 按 `ops/01` §3.1 实现采集延迟、租户投递失败率和队列深度。明确采集周期、窗口、缺失样本、分母为零与重启后的行为。
+- 对数据库读取优先复用已有受限角色与查询路径。若需要新 GRANT、角色、RLS 例外或改 audit SQL，停止本提案实施并另提安全方案。
+- 为所有指标冻结名称、单位、label 白名单及基数约束。禁止消息正文、关键词、凭据、session、源链接或可逆内容进入 label、exposition 或错误日志。
+- 不在本片启用生产抓取、告警渠道或写入生产配置。
+
+### 2.2 单实例启动保护验收
+
+维护人批准后，按以下可区分场景编制专项测试：
+
+1. 在隔离 systemd manager 中连续 start 同一个 role unit 两次，确认只有一个 MainPID，第二次操作的退出与 unit 状态符合 systemd 语义。
+2. 从独立 user manager 或直接命令路径启动相同 role，确认候选 binary 与现有 database lease/fencing 是否阻止同一 identity 的双持有和有效写入。
+3. 强杀持租约进程，等待既有租约期限，通过 successor worker 接管，并用 stale fencing token 验证旧进程写入被拒。
+4. 每个测试记录 manager、启动入口、worker/identity 数量、进程 PID 和 lease 状态。测试只使用隔离数据库与 synthetic identity，不连接 Telegram，不使用生产凭据。
+5. 在 Rocky 9.8 目标机运行精确候选包时，确认 systemd 版本、unit 校验、重复 start 结果与清理情况。目标机网络不可达、SSH 身份认证失败或缺少该子项授权时，该子项保持 `not-run`。
+
+测试报告要说明 systemd 同名 unit 的保证范围和 unit 外进程路径的结果，避免把 manager 内重复 start 的行为扩大为主机上任意进程都不可重复。
+
+## 三、必须先由维护人确认
+
+- `metrics-exporter-prometheus` 是否以已有工程约定版本实施，是否允许增加依赖。
+- 哪个 role 运行 exporter，systemd system/user 部署下的私网 bind address 与端口如何配置。
+- 指标中的 tenant 维度采用受控租户标识、预聚合还是其他既有安全表示，数据读取由哪个已有受限身份承担。
+- 指标采集在数据库不可用、租户数量过大、label 基数超限时的行为和停止条件。
+- 单实例测试覆盖同名 systemd unit、跨 manager 和直接进程三种入口的范围。
+- 是否授权 Rocky 目标机上启动隔离候选服务进行重复启动测试。授权只覆盖列明的 candidate、role、窗口、环境文件和测试数据库，不包括生产数据库或外部告警。
+
+## 四、验收标准
+
+- CI 全部必需门禁通过；新增实现有相应反向测试。
+- `/metrics` 只绑定批准的非公网接口，缺失或过宽配置被拒绝。
+- 指标名称、单位和 label 与批准清单一致，未知 label 和内容数据不会出现。
+- 隔离受限角色查询只读取指标所需字段，不扩大 GRANT/RLS 权限。
+- 指标采集失败不会阻塞业务服务启动或改变投递语义，相关错误会以脱敏形式报告。
+- systemd 同名 unit 重复 start、unit 外第二进程竞争和租约 fencing 分别记录结果，不混为一个判据。
+- Rocky 目标机复验绑定精确候选版本与源码提交。目标机检查未运行时，不把 CI 或本地 systemd 测试记成目标机通过。
+
+本提案完成不代表 G3、G5、WP-8 或生产验收通过。生产指标抓取、外部告警和生产服务启用仍需各自的运维授权。
+
+### 2026-11-25 目标机可达性更新
+
+Rocky 目标 `172.20.44.131:22` 的 TCP 检查通过，ED25519 host key 与既有指纹记录匹配；当前执行环境的 SSH key 未被 `tgmtest` 接受，只读盘点脚本未上传，目标机单实例验收保持 `not-run`。WP-8 分项授权记录中的生产只读检查仍为 `not-authorized`。本更新不改变该授权状态。
+
+## 五、停止条件
+
+- 需要改变 RLS、GRANT、数据库角色、迁移、audit SQL 或 CI 安全门禁。
+- 无法把 metrics listener 限定在获批网络，或 scrape 地址可能通过公网暴露。
+- 指标需要未经批准的跨租户明文访问或高基数/敏感标签。
+- systemd 与 direct-process 场景的通过判据未获维护人确认。
+- 测试要求连接生产数据库、触发生产告警、发 Telegram 消息、启用 timer 或删除真实租户。
+
+```text
+[report]
+task: G5-runtime-metrics-and-single-instance-acceptance
+path: escalated
+gates: not-run
+escalation: docs/plan/proposals/G5-runtime-metrics-and-single-instance-acceptance.md
+```
