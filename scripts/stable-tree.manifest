@@ -4,6 +4,7 @@
 .github/workflows/binary-release.yml
 .github/workflows/ci.yml
 .github/workflows/docker-publish.yml
+.github/workflows/stable-release-verify.yml
 .gitignore
 .sqlx/query-1552bcdcfcb91b5ed63a9e9bedbef9ac7e667fff7ade481434f07bcd19b9675a.json
 .sqlx/query-20e35bf95fa0a294e28bfd0a16bdbd3d0ab904897e1f6130b445acc83467c7af.json

@@ -140,6 +140,30 @@ class StableTreeTests(unittest.TestCase):
         self.assertIn('"$approved/approval.sigstore.json"', workflow)
         self.assertNotIn("approval-statement.sigstore.json", workflow)
 
+    def test_download_verification_workflow_has_no_publish_permissions(self) -> None:
+        workflow = (ROOT / ".github/workflows/stable-release-verify.yml").read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("actions/download-artifact@v7", workflow)
+        self.assertIn("test -d dist/prepared/assets", workflow)
+        self.assertIn("test -d dist/prepared/approval", workflow)
+        self.assertIn("ref: ${{ inputs.source_commit }}", workflow)
+        self.assertIn("Validate inputs and prepare run before artifact handling", workflow)
+        self.assertIn("head_sha == $sha", workflow)
+        self.assertLess(
+            workflow.index("Validate inputs and prepare run before artifact handling"),
+            workflow.index("uses: actions/checkout@v7"),
+        )
+        self.assertIn("contents: read", workflow)
+        self.assertIn("actions: read", workflow)
+        self.assertIn("checks: read", workflow)
+        self.assertNotIn("contents: write", workflow)
+        self.assertNotIn("id-token", workflow)
+        self.assertNotIn("packages:", workflow)
+        self.assertNotIn("gh release create", workflow)
+        self.assertNotIn("cosign sign-blob", workflow)
+        self.assertNotIn("cosign verify-blob", workflow)
+        self.assertNotIn("publish", workflow.replace("prepare run", "").replace("prepared", ""))
+
     def test_source_snapshot_ci_push_scope_is_read_only_and_task_limited(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("branches: [main, dev, 'codex/pre014-main-*']", workflow)
