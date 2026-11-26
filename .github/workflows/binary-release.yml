@@ -204,7 +204,7 @@ jobs:
           cat dist/approval/APPROVAL.json.sha256
 
       - name: Upload unsigned approval materials
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: stable-release-approval-v${{ steps.version.outputs.version }}-run-${{ github.run_id }}
           path: |
@@ -235,7 +235,7 @@ jobs:
           fetch-depth: 0
 
       - name: Download approved prepare artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
