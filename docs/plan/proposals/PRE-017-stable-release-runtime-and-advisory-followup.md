@@ -3,8 +3,9 @@
 任务 id：`PRE-017-stable-release-runtime-and-advisory-followup`。
 
 状态：维护人于 2026-11-26 批准（「批准提案 开始实施」）。§3.1 已随
-PR #141 合入 `main`（commit `8c10c2c`）；§3.2 的维护人风险裁定与后续
-稳定版本动作仍按 §四 审批分界等待独立批准。
+PR #141 合入 `main`（commit `8c10c2c`）。§3.2 的维护人风险裁定已于
+2026-11-26 记录（`docs/plan/evidence/PRE-017-v010-url公告风险裁定-2026-11-26.md`）；
+新稳定版本动作仍按 §四 审批分界等待独立批准。
 
 ## 一、背景
 
@@ -92,7 +93,7 @@ main workflow runner=ubuntu-24.04 (GitHub-hosted)
 
 对 `v0.1.0` 精确源码 `31d1aa4a51a56512f96c10a466cbf394f10ff5cc` 的锁文件运行 `cargo deny check advisories`，命中 `RUSTSEC-2026-0592`，受影响组件为 `url 2.5.8`。该 Release SBOM 也记录 `url 2.5.8`。当前 `main` 与 `dev` 锁定 `url 2.5.9`，同一 cargo-deny 检查通过。已发布 tag、Release 资产、签名和来源证明保持原样。
 
-应用级检索和锁定依赖正常依赖图源码检索的范围与结果见 §6.2.1。现有检索没有证明公告 API 在 `v0.1.0` 二进制中的调用可达性或不可达性。既有版本的风险处置仍需维护人裁定。公告原文与受影响版本范围见 [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592)。
+应用级检索和锁定依赖正常依赖图源码检索的范围与结果见 §6.2.1。现有检索没有证明公告 API 在 `v0.1.0` 二进制中的调用可达性或不可达性。维护人已于 2026-11-26 记录风险处置裁定（接受残余风险，见 `docs/plan/evidence/PRE-017-v010-url公告风险裁定-2026-11-26.md`），该裁定不构成可达性证明。公告原文与受影响版本范围见 [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592)。
 
 后续稳定版本实施前需确认锁文件与 SBOM 使用 `url >= 2.5.9`，`cargo deny check advisories` 通过，并归档对既有 `v0.1.0` 的风险处置结论。不得修改旧 tag、Release 资产、签名或 provenance。后续稳定发布仍受 PRE-013 和 G4 顺序条件约束。PRE-017 不授权创建新 tag、运行 `publish` 或推送稳定镜像。
 
@@ -122,8 +123,10 @@ maintainer_risk_disposition=pending
 ```text
 proposal_approved=approved-2026-11-26
 main_workflow_changes=merged-8c10c2c-PR-141
-prepare_runtime_acceptance=not-run
-published_url_2_5_8_advisory_review=open
+prepare_runtime_acceptance=prepare-pass-run-45770352988
+download_verify=PR-145-ci-pass-open
+published_url_2_5_8_advisory_review=disposition-recorded-2026-11-26
+maintainer_risk_disposition=recorded-2026-11-26-accept-residual-risk
 new_stable_tag=not-authorized
 new_stable_release=not-authorized
 ```
@@ -150,6 +153,40 @@ new_stable_release=not-authorized
 （`maintainer_risk_disposition=pending`）；新稳定 `prepare` / `publish`
 与稳定镜像推送按 §四 需要针对精确 source commit 与工件摘要的独立批准，
 本提案不授权。G4 生产扫描授权仍按 G4 提案单独等待。
+
+## 八、实施记录增量（2026-11-26）：v0.1.0 风险裁定
+
+§四 授权范围内，维护人以责任方身份完成 §3.2 的风险处置裁定并归档
+`docs/plan/evidence/PRE-017-v010-url公告风险裁定-2026-11-26.md`：
+接受 `v0.1.0` 残余风险、修复随下一稳定版本交付、旧资产保持不可变。
+§6.2.1 的历史快照块保持原样（那是 2026-11-25 检索时的状态记录），
+当前状态以 §6.3 状态块为准。
+
+本增量不改 `v0.1.0` 的任何已发布材料，不创建新 tag，不运行 `publish`。
+新稳定版本的 `prepare` 运行时验收（§3.3 的上传/下载比对）在批准后另行记录。
+
+## 九、实施记录增量（2026-11-26）：prepare 运行时验收运行
+
+按 §四 授权运行了不发布 Release 的 `prepare` 验收：`workflow_dispatch`
+`mode=prepare`、`version=0.1.0`、`source_commit=8c10c2c`（当时 `main` 的
+tip），run `45770352988` 成功。观察结果：
+
+- `upload-artifact@v6` 与 `download-artifact@v7` 运行日志没有 Node.js 20
+  deprecation、`ubuntu-latest` migration 或依赖公告告警；
+- 工件 `stable-release-approval-v0.1.0-run-45770352988` 的 `assets/` 有 7 个文件，
+  `approval/` 有 2 个文件，保留期 90 天（`expires_at=2027-02-24`）；
+- `APPROVAL.json` SHA-256 为
+  `40b72e66ea8af14db3987c344c96353b4bce634b286437b1aa4a9d75ca89c909`，
+  状态 `awaiting-explicit-release-approval`，source_commit 记为 `8c10c2c`。
+
+本次运行使用 `0.1.0` 检查 action 行为。`publish` job 会先检查既有
+Release，并要求维护人对精确 source commit 与工件摘要审批。本次运行产物
+状态为未签名、未发布。
+
+§3.3 的下载比对需要独立的 `download-artifact@v7` 运行路径，已在
+`main` 基线上以受签名提交建立工作流 `stable-release-verify.yml`
+（PR #145，base `main`）。该 PR 合入并执行一次按精确 run ID 的验证
+运行后，`prepare_runtime_acceptance` 才能记为完整通过。
 
 ```text
 [report]

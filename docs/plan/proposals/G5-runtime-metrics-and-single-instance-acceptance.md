@@ -2,7 +2,7 @@
 
 任务 id：`G5-runtime-metrics-and-single-instance-acceptance`。
 
-状态：维护人于 2026-11-26 批准实施（「批准提案 开始实施」）。指标与单实例测试的代码实现已完成并全门禁通过；生产抓取、告警渠道与 Rocky 目标机子项不在本片。
+状态：维护人于 2026-11-26 批准实施（「批准提案 开始实施」）。指标与单实例实现已合入，合并后 CI 发现一个固定墙钟时间测试缺陷，修复已完成并待 PR CI 验证；生产抓取、告警渠道与 Rocky 目标机子项不在本片。
 
 ## 一、当前缺口
 
@@ -65,6 +65,14 @@
 
 Rocky 目标 `172.20.44.131:22` 的 TCP 检查通过，ED25519 host key 与既有指纹记录匹配；当前执行环境的 SSH key 未被 `tgmtest` 接受，只读盘点脚本未上传，目标机单实例验收保持 `not-run`。WP-8 分项授权记录中的生产只读检查仍为 `not-authorized`。本更新不改变该授权状态。
 
+### 2026-11-26 目标机可达性更新
+
+对 `172.20.44.131:22` 连续三次 TCP 连接尝试均超时，目标机当前不可达；
+未进行 SSH 认证、未上传任何材料。按 §2.2 第 5 项与 §四 判据，Rocky
+目标机单实例复验保持 `not-run`，不以本地或 CI 的 systemd 测试代替。
+该子项恢复执行的前置条件：目标机网络可达、SSH 认证通过、精确候选包
+与授权范围重新核对。
+
 ## 五、停止条件
 
 - 需要改变 RLS、GRANT、数据库角色、迁移、audit SQL 或 CI 安全门禁。
@@ -87,6 +95,26 @@ Rocky 目标 `172.20.44.131:22` 的 TCP 检查通过，ED25519 host key 与既�
   3. 真实 `mtproto-worker` 进程在有效租约前拿不到身份（LeaseBusy）；租约过期后接管、fencing token 递增；僵尸的陈旧 token 写不进事件。
 - **判据与反证**：`crates/app/tests/metrics.rs` 覆盖受限角色、水位线不回溯、窗口与分母为零口径、租户消失不出序列、截断上限、exposition 白名单（含 `le`/`quantile` 格式标签的口径说明）与非回环绑定被拒。
 - **未覆盖项**（按提案保留）：Rocky 目标机同名 unit 复验需单独授权（`not-run`）；X1–X5 多实例混沌按单实例决策保持 `deferred/not-run`；生产抓取与告警渠道需各自运维授权。
+
+## 七、合并后指标测试回归（2026-11-26）
+
+`cloud/dev` 合并提交 `9ce4f666de99378f401c9455376275e8617e8761` 的 CI
+run `45766445471` 中，`database` job 的
+`sample_reads_only_through_restricted_role_and_window_semantics` 失败。
+测试把窗口内 `completed_at` 写成固定的 `2026-11-26T04:00:00Z`，而采集查询
+按数据库当前时间减 `failure_window=3600` 秒计算窗口。该测试因此会随运行时间
+越过窗口边界后失败。
+
+修复将 `seed_task` 改为通过 `clock_timestamp() - make_interval(...)` 相对
+数据库时钟生成时间，窗口内样本使用 60 秒年龄，窗口外样本使用 7,200 秒年龄。
+当前 `cloud/dev` 仍是未含此修复的 `9ce4f666`。修复提交与新的 PR CI 完成前，
+该合并后失败不应视作已由云端分支消除。
+
+本地验证：`cargo check -p tgm-app --tests` 通过；定向 SQLx 用例通过；
+`cargo test -p tgm-app --test metrics -- --nocapture` 的 5 项均通过；
+`scripts/ai-driver/ai-gates.sh --static-only` 通过。完整门禁运行到
+`offline-build` 时停止，根分区可用空间降至约 6.9 GB；修复分支 PR CI
+负责完整门禁裁决。
 
 ```text
 [report]

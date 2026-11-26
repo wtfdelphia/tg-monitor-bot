@@ -17,7 +17,6 @@ use axum::body::Body;
 use axum::http::Request;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use sqlx::PgPool;
-use sqlx::types::chrono::Utc;
 use tgm_app::metrics::{
     COLLECT_SUCCESS_METRIC, DELIVERY_DEAD_RATIO_METRIC, DELIVERY_QUEUE_DEPTH_METRIC,
     INGEST_LATENCY_METRIC, MetricsConfig, collect_sample, parse_listen_addr, record_sample, router,
@@ -29,21 +28,17 @@ async fn seed_task(
     tenant: tgm_core::ids::TenantId,
     sender: tgm_core::ids::IdentityId,
     status: &str,
-    completed_at: &str,
+    age_seconds: i64,
 ) {
     sqlx::query(
         "INSERT INTO delivery_tasks
              (tenant_id, target_tg_chat_id, sender_identity_id, action, status, completed_at)
-         VALUES ($1, -2001, $2, 'COPY', $3, $4)",
+         VALUES ($1, -2001, $2, 'COPY', $3, clock_timestamp() - make_interval(secs => $4))",
     )
     .bind(tenant)
     .bind(sender)
     .bind(status)
-    .bind(
-        sqlx::types::chrono::DateTime::parse_from_rfc3339(completed_at)
-            .expect("测试时间必须合法")
-            .with_timezone(&Utc),
-    )
+    .bind(age_seconds)
     .execute(admin.raw())
     .await
     .expect("写入投递任务失败");
@@ -112,23 +107,13 @@ async fn sample_reads_only_through_restricted_role_and_window_semantics(
     let tenant = support::seed_tenant(&admin, "metrics-tenant", 9201).await;
     let identity = support::seed_identity(&admin, tenant).await;
 
-    // 窗口内：2 DEAD + 1 DONE → ratio 2/3；窗口外 1 DEAD 不计；CANCELLED 两边不计；
-    // 2 PENDING 进队列深度。
-    let now = "2026-11-26T04:00:00+00:00";
-    seed_task(&admin, tenant, identity, "DEAD", now).await;
-    seed_task(&admin, tenant, identity, "DEAD", now).await;
-    seed_task(&admin, tenant, identity, "DONE", now).await;
-    seed_task(
-        &admin,
-        tenant,
-        identity,
-        "DEAD",
-        "2026-11-25T00:00:00+00:00",
-    )
-    .await;
-    seed_task(&admin, tenant, identity, "CANCELLED", now).await;
-    seed_task(&admin, tenant, identity, "PENDING", now).await;
-    seed_task(&admin, tenant, identity, "PENDING", now).await;
+    seed_task(&admin, tenant, identity, "DEAD", 60).await;
+    seed_task(&admin, tenant, identity, "DEAD", 60).await;
+    seed_task(&admin, tenant, identity, "DONE", 60).await;
+    seed_task(&admin, tenant, identity, "DEAD", 7200).await;
+    seed_task(&admin, tenant, identity, "CANCELLED", 60).await;
+    seed_task(&admin, tenant, identity, "PENDING", 60).await;
+    seed_task(&admin, tenant, identity, "PENDING", 60).await;
 
     let mut watermark = None;
     let first = collect_sample(&app, &mut watermark, &config()).await?;
@@ -172,14 +157,7 @@ async fn empty_denominator_yields_zero_and_truncation_caps_tenant_series(
     let first_tenant = support::seed_tenant(&admin, "metrics-empty", 9202).await;
     let identity = support::seed_identity(&admin, first_tenant).await;
     // 只有 PENDING：分母为零，ratio 记 0 而不是除零。
-    seed_task(
-        &admin,
-        first_tenant,
-        identity,
-        "PENDING",
-        "2026-11-26T04:00:00+00:00",
-    )
-    .await;
+    seed_task(&admin, first_tenant, identity, "PENDING", 60).await;
 
     let mut watermark = None;
     let mut bounded = config();
@@ -206,14 +184,7 @@ async fn exposition_contains_only_frozen_names_and_tenant_label(
     let (app, admin) = support::pools(admin).await;
     let tenant = support::seed_tenant(&admin, "metrics-render", 9204).await;
     let identity = support::seed_identity(&admin, tenant).await;
-    seed_task(
-        &admin,
-        tenant,
-        identity,
-        "DEAD",
-        "2026-11-26T04:00:00+00:00",
-    )
-    .await;
+    seed_task(&admin, tenant, identity, "DEAD", 60).await;
 
     // 水位线语义：先推一次水位，再播种延迟样本，下一周期才采得到 ——
     // 与生产里的时序一致（水位只追新落的行）。
