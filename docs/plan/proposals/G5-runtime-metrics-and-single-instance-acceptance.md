@@ -2,7 +2,7 @@
 
 任务 id：`G5-runtime-metrics-and-single-instance-acceptance`。
 
-状态：提案阶段，等待维护人批准。
+状态：维护人于 2026-11-26 批准实施（「批准提案 开始实施」）。指标与单实例测试的代码实现已完成并全门禁通过；生产抓取、告警渠道与 Rocky 目标机子项不在本片。
 
 ## 一、当前缺口
 
@@ -73,10 +73,25 @@ Rocky 目标 `172.20.44.131:22` 的 TCP 检查通过，ED25519 host key 与既�
 - systemd 与 direct-process 场景的通过判据未获维护人确认。
 - 测试要求连接生产数据库、触发生产告警、发 Telegram 消息、启用 timer 或删除真实租户。
 
+## 六、实施记录（2026-11-26）
+
+批准后按 §二 范围实施，未触发 §五 任何停止条件：
+
+- **依赖**：`metrics = 0.24.6`、`metrics-exporter-prometheus = 0.18.3`（`eng/00` §2.3 钉住的版本）。导出器关默认 features：不用它自带的 hyper http-listener / push-gateway，`/metrics` 由本仓 axum 在私有监听上自渲染，少引一整条 hyper 服务端依赖。
+- **指标实现**（`crates/app/src/metrics.rs`）：三个核心指标全部从库取（`ops/01` §3.1），经 `app_user` 既有权限 —— `delivery_tasks` 逐租户经 `tenant_tx`（RLS 内）、`tenants` 经 `list_all_active_tenants`、`canonical_events` 是丙类无 RLS。零新增 GRANT / 角色 / 迁移。
+- **监听边界**：`TGM_METRICS_LISTEN_ADDR` 是 control-plane 独有的**可选**项；不设置就不暴露指标（本片不启用生产抓取）。设置则必须回环：配置预检（`native_config` 回环断言）与启动期绑定两处都拦，非回环拒绝启动。采集在独立任务里，失败只记脱敏日志并翻转 `tgm_metrics_collect_success`，不阻塞业务、不改投递语义。
+- **冻结清单**：`tgm_ingest_latency_seconds`（histogram，秒，无 label）、`tgm_delivery_dead_ratio`（gauge，label 仅 `tenant_id`）、`tgm_delivery_queue_depth`（gauge，无 label）、`tgm_metrics_collect_success`（gauge）。租户级序列基数上限 `max_tenants=1000`，超限截断并告警；内容数据（正文/关键词/凭据/源链接）不进 label 与 exposition。
+- **单实例验收**（`bins/tgm/tests/single_instance.rs`，三个场景分开记录，不混为一个判据）：
+  1. 同一 user manager 对同名 unit 连续 start 两次 → 第二次 no-op、MainPID 唯一（本机有 `systemd --user` manager，实测通过；无 manager 环境记为未运行，不冒充通过）。
+  2. unit 外两个直接进程竞争同一事件 → `processed_at` 行锁 + `idem_key` 去重保证恰好一条投递任务，两进程都存活且可优雅停止。
+  3. 真实 `mtproto-worker` 进程在有效租约前拿不到身份（LeaseBusy）；租约过期后接管、fencing token 递增；僵尸的陈旧 token 写不进事件。
+- **判据与反证**：`crates/app/tests/metrics.rs` 覆盖受限角色、水位线不回溯、窗口与分母为零口径、租户消失不出序列、截断上限、exposition 白名单（含 `le`/`quantile` 格式标签的口径说明）与非回环绑定被拒。
+- **未覆盖项**（按提案保留）：Rocky 目标机同名 unit 复验需单独授权（`not-run`）；X1–X5 多实例混沌按单实例决策保持 `deferred/not-run`；生产抓取与告警渠道需各自运维授权。
+
 ```text
 [report]
 task: G5-runtime-metrics-and-single-instance-acceptance
-path: escalated
-gates: not-run
-escalation: docs/plan/proposals/G5-runtime-metrics-and-single-instance-acceptance.md
+path: ok
+gates: pass
+escalation: -
 ```

@@ -17,6 +17,7 @@ pub mod delivery_runtime;
 pub mod lifecycle;
 pub mod media_cleanup;
 pub mod media_relay;
+pub mod metrics;
 pub mod mtproto_session;
 pub mod mtproto_worker;
 pub mod pipeline;

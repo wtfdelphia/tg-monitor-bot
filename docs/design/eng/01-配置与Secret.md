@@ -80,6 +80,7 @@ root/user 身份差异及启动步骤见 `../../../deploy/native/README.md` 的�
 | `TGM_CONTROL_BOT_IDENTITY_ID` | control-plane | 控制 Bot Webhook 使用的 `identities.id` |
 | `TGM_CONTROL_BOT_USERNAME` | control-plane | 控制 Bot 的公开 username，用于生成控制台扫码深链 |
 | `TGM_LISTEN_ADDR` | control-plane | 默认 `127.0.0.1:8080`，见下方 |
+| `TGM_METRICS_LISTEN_ADDR` | control-plane | 可选。设置后在该回环地址起私有 `/metrics` 监听（G5，`../ops/01-上线就绪与运维.md` §三）；不设置就不暴露指标。**必须是回环地址**，过宽配置被拒 |
 | `TGM_DATA_BOT_SECRET_TOKEN` | bot-gateway | 数据 Bot Webhook 的 `secret_token`，只允许 `A-Za-z0-9_-`，长度 1–256 |
 | `TGM_DATA_BOT_IDENTITY_ID` | bot-gateway | 接收该 Webhook 的 `identities.id`，必须指向 `kind='bot'` 的身份 |
 | `TGM_BOT_GATEWAY_LISTEN_ADDR` | bot-gateway | 默认 `127.0.0.1:8081`，只监听反向代理内侧 |

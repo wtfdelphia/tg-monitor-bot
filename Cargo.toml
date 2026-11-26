@@ -59,6 +59,14 @@ aws-types = "=1.6.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
+# 指标（eng/00 §2.3 钉住的版本，不取最新）。门面是 metrics，导出器单独绑私有
+# /metrics 监听（ops/00 §三：不对公网暴露），不与业务 HTTP 混用。
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+# default-features 关掉：不用它自带的 hyper http-listener / push-gateway ——
+# /metrics 由本仓 axum 在私有监听上自渲染（ops/00 §三），只取 recorder 与
+# exposition 渲染，少引一整条 hyper 服务端依赖。
+
 # CLI。eng/00 §二 没有钉 CLI 解析库，但 eng/04 的卡口要求 tgm 有子命令 ——
 # 见 bins/tgm/Cargo.toml 同处的注释。
 clap = { version = "4.6", features = ["derive"] }
