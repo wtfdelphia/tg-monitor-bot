@@ -1,0 +1,97 @@
+# PRE-017 §3.3 的独立下载验证路径：只读拉取指定 prepare run 的精确工件并
+# 复算审批记录与资产链。本工作流与发布阶段完全隔离：顶层只授予三个
+# 只读权限（见 permissions 块），不创建 tag、Release 或签名。检出固定到
+# 被验证 prepare run 的 source commit，复算脚本与生成工件的源码版本一致。
+name: Stable release download verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      prepare_run_id:
+        description: 'Completed prepare run ID produced on main'
+        required: true
+        type: string
+      version:
+        description: 'MAJOR.MINOR.PATCH of the prepared release'
+        required: true
+        type: string
+      source_commit:
+        description: 'Full main commit SHA that the prepare run built'
+        required: true
+        type: string
+      approval_record_sha256:
+        description: 'SHA-256 of APPROVAL.json recorded in the prepare run log'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    name: Download and re-verify prepare artifacts with read-only permissions
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate inputs and prepare run before artifact handling
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREPARE_RUN_ID: ${{ inputs.prepare_run_id }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          APPROVAL_RECORD_SHA256: ${{ inputs.approval_record_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$PREPARE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$APPROVAL_RECORD_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREPARE_RUN_ID")"
+          jq -e --arg sha "$SOURCE_COMMIT" \
+            '.name == "Native binary release" and .path == ".github/workflows/binary-release.yml" and .event == "workflow_dispatch" and .status == "completed" and .conclusion == "success" and .head_branch == "main" and .head_sha == $sha' \
+            <<< "$run" >/dev/null
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_commit }}
+
+      - name: Download prepare artifact by exact run ID
+        uses: actions/download-artifact@v7
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.prepare_run_id }}
+          name: stable-release-approval-v${{ inputs.version }}-run-${{ inputs.prepare_run_id }}
+          path: dist/prepared
+
+      - name: Separate approved record from release payload
+        run: |
+          set -euo pipefail
+          test -d dist/prepared/assets
+          test -d dist/prepared/approval
+          mkdir -p dist/assets dist/approval
+          cp -a dist/prepared/assets/. dist/assets/
+          cp -a dist/prepared/approval/. dist/approval/
+
+      - name: Re-verify approval record and release assets
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          PREPARE_RUN_ID: ${{ inputs.prepare_run_id }}
+          APPROVAL_RECORD_SHA256: ${{ inputs.approval_record_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$APPROVAL_RECORD_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          python3 scripts/stable-release-approval.py verify \
+            --assets dist/assets --record dist/approval/APPROVAL.json \
+            --record-sha256 "$APPROVAL_RECORD_SHA256" --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" --prepare-run-id "$PREPARE_RUN_ID"
+          python3 scripts/stable-release-assets.py verify \
+            --assets dist/assets --version "$VERSION" --source-commit "$SOURCE_COMMIT" \
+            --expected-run-id "$PREPARE_RUN_ID"
+          (cd dist/assets && sha256sum -c SHA256SUMS)
+          echo "stable_release_download_verification=pass run=$PREPARE_RUN_ID version=$VERSION"
