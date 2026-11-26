@@ -21,6 +21,9 @@ pub mod audit;
 pub mod auth_retention;
 /// 身份凭据的信封加密落库（spec/05 §七）。KEK 调用不在事务内。
 pub mod credentials;
+/// G4 生产历史指纹重算：隔离裁剪副本上的裁剪、只读扫描与销毁。
+/// 提案 `docs/plan/proposals/G4-production-fingerprint-readonly-access.md`。
+pub mod g4_fingerprint_scan;
 pub mod lifecycle;
 pub mod media_cleanup;
 pub mod platform_retention;

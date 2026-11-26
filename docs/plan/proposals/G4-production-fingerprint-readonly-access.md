@@ -2,7 +2,18 @@
 
 任务 id：`G4-production-fingerprint-readonly-access`。
 
-状态：提案阶段，等待维护人批准。
+状态：维护人已批准（2026-11-25），§四 审批分界内的非生产实现已完成。
+
+实施记录（2026-11-25）：裁剪、只读扫描与销毁落在
+`crates/db/src/g4_fingerprint_scan.rs`，CLI 为 `tgm g4-fingerprint-scan
+trim|scan|destroy`（`bins/tgm/src/main.rs`）。环境边界
+`TGM_DB_URL_G4_SCAN_SOURCE` / `TGM_DB_URL_G4_SCAN_DEST` 登记在
+`docs/design/eng/01-配置与Secret.md` §一 与 `crates/core/src/config.rs`
+`check_g4_fingerprint_scan`。集成测试
+`crates/db/tests/g4_fingerprint_scan.rs` 覆盖裁剪→扫描→销毁生命周期、
+重复裁剪拒绝、标记缺失拒绝、超级用户拒绝、行数上限收紧与脱敏分类。
+本实现未向生产库添加角色、GRANT、函数、视图或迁移；生产备份读取、
+生产扫描与目标机恢复仍需各自的独立授权，G4 仍为 `partial`。
 
 ## 一、当前缺口
 
@@ -68,7 +79,7 @@ G4 生产历史指纹重算授权模板列出了所需表、字段、关联路�
 ```text
 [report]
 task: G4-production-fingerprint-readonly-access
-path: escalated
-gates: not-run
+path: ok
+gates: pass
 escalation: docs/plan/proposals/G4-production-fingerprint-readonly-access.md
 ```
