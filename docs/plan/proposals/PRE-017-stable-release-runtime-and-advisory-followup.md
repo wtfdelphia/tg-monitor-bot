@@ -2,7 +2,9 @@
 
 任务 id：`PRE-017-stable-release-runtime-and-advisory-followup`。
 
-状态：提案阶段，等待维护人批准。
+状态：维护人于 2026-11-26 批准（「批准提案 开始实施」）。§3.1 已随
+PR #141 合入 `main`（commit `8c10c2c`）；§3.2 的维护人风险裁定与后续
+稳定版本动作仍按 §四 审批分界等待独立批准。
 
 ## 一、背景
 
@@ -118,18 +120,41 @@ maintainer_risk_disposition=pending
 `main` 是独立的精简稳定源码历史，与 `dev` 没有共同祖先。PR #139 只更新了 `dev`。若本提案获批，`main` 上的 workflow 修复应从当前 `main` 基线单独建立受签名保护的 PR，并通过稳定树严格检查；不能把普通 `dev` 合并当作该修复的发布路径。后续稳定版本的 `prepare` 可验收 action 上传/下载和审批材料，不能运行 `publish`。
 
 ```text
-proposal_approved=not-yet
-main_workflow_changes=not-implemented
+proposal_approved=approved-2026-11-26
+main_workflow_changes=merged-8c10c2c-PR-141
 prepare_runtime_acceptance=not-run
 published_url_2_5_8_advisory_review=open
 new_stable_tag=not-authorized
 new_stable_release=not-authorized
 ```
 
+## 七、实施记录（2026-11-26）
+
+批准后按 §四 审批分界实施 §3.1：`main` 的 `binary-release.yml`
+`upload-artifact@v4 → @v6`、`download-artifact@v4 → @v7`（仅两行版本
+变更，输入语义不变）。以受签名提交在独立 PR #141 上从 `main` 基线
+`efab6cd` 单独建立（§6.3 边界），未以 `dev` 合并充当发布路径。
+
+验证（PR #141 合入前后）：
+
+- 合并前：对 `8c10c2c` 与基线 `efab6cd` 各跑一次
+  `scripts/check-stable-tree.py --strict`，两次均通过（437 个文件），
+  证明改动后稳定树清单仍满足严格白名单；`scripts/tests` 中稳定树
+  单测 12 条通过；workflow YAML 可解析。
+- 合并后：`main` 上 `8c10c2c` 的 CI（static、database）成功。
+- `binary-release.yml` 是 `workflow_dispatch` 触发，合入本身不产生
+  发布运行；`prepare` 的 Node 24 运行时验收（§3.3 的上传/下载比对）
+  要等下一次经批准的 `prepare` 运行，保持 `not-run`。
+
+未实施部分及原因：§3.2 的 `v0.1.0` 风险裁定属维护人动作
+（`maintainer_risk_disposition=pending`）；新稳定 `prepare` / `publish`
+与稳定镜像推送按 §四 需要针对精确 source commit 与工件摘要的独立批准，
+本提案不授权。G4 生产扫描授权仍按 G4 提案单独等待。
+
 ```text
 [report]
 task: PRE-017-stable-release-runtime-and-advisory-followup
-path: escalated
-gates: not-run
-escalation: docs/plan/proposals/PRE-017-stable-release-runtime-and-advisory-followup.md
+path: ok
+gates: pass
+escalation: -
 ```
