@@ -2,9 +2,9 @@
 
 任务 id：`G5-runtime-metrics-and-single-instance-acceptance`。
 
-状态：维护人于 2026-11-26 批准实施（「批准提案 开始实施」）。指标与单实例实现已合入，合并后 CI 发现一个固定墙钟时间测试缺陷，修复已完成并待 PR CI 验证；生产抓取、告警渠道与 Rocky 目标机子项不在本片。
+状态：维护人于 2026-11-26 批准实施（「批准提案 开始实施」）。指标与单实例实现及固定墙钟时间测试修复已合入 `dev`，合并后 CI 通过。生产抓取、告警渠道、容量实测与 Rocky 目标机子项仍未完成。
 
-## 一、当前缺口
+## 一、提案起草时缺口（2026-11-25）
 
 `docs/design/ops/01-上线就绪与运维.md` §一要求上线前完成核心指标与告警、容量实测和单实例租约防误双开验证。`docs/design/eng/00-工程约定.md` §2.3 已选择 `metrics`、`metrics-exporter-prometheus` 与 `/metrics`，但当前 `Cargo.lock` 没有这两个依赖，应用源码没有 recorder 注册，Axum 路由没有 `/metrics` handler。
 
@@ -12,7 +12,7 @@
 
 系统级和 user-level systemd 都提供六个角色模板。systemd 对同一 manager 中的同名 unit 提供单一 unit 生命周期，但仓库没有 Rocky 目标机重复启动行为的记录，也没有独立手工进程与 systemd role 进程并存时的专项验证。该缺口应针对首发单实例形态验收。X1–X5 多实例混沌按既有单实例决策保持 `deferred/not-run`。
 
-当前基线：`cloud/dev@994ab82a2f941ec50bc37146fbfb16d5ff6758c1`，CI `45362852128` 成功。
+初始提案基线：`cloud/dev@994ab82a2f941ec50bc37146fbfb16d5ff6758c1`，CI `45362852128` 成功。后续实现与合并后状态见第六至八节。
 
 判据出处：`docs/design/plan/00-里程碑与工期.md` §三 G5；`docs/design/ops/01-上线就绪与运维.md` §一、§三、§四、§六；`docs/design/ops/00-部署与运行时.md` §三、§六；`docs/design/eng/00-工程约定.md` §2.3；`docs/design/eng/04-CI门禁.md`。
 
@@ -107,14 +107,36 @@ run `45766445471` 中，`database` job 的
 
 修复将 `seed_task` 改为通过 `clock_timestamp() - make_interval(...)` 相对
 数据库时钟生成时间，窗口内样本使用 60 秒年龄，窗口外样本使用 7,200 秒年龄。
-当前 `cloud/dev` 仍是未含此修复的 `9ce4f666`。修复提交与新的 PR CI 完成前，
-该合并后失败不应视作已由云端分支消除。
+该修复随 PR #146 合入 `cloud/dev`，合并提交为
+`7cb8e960be60be61105e499f74735650e6c9f945`；合并后 CI `45794935024`
+的 `static` 和 `database` 均通过。
 
 本地验证：`cargo check -p tgm-app --tests` 通过；定向 SQLx 用例通过；
 `cargo test -p tgm-app --test metrics -- --nocapture` 的 5 项均通过；
 `scripts/ai-driver/ai-gates.sh --static-only` 通过。完整门禁运行到
-`offline-build` 时停止，根分区可用空间降至约 6.9 GB；修复分支 PR CI
-负责完整门禁裁决。
+`offline-build` 时停止，根分区可用空间降至约 6.9 GB；PR #146 CI
+完成完整门禁裁决。
+
+## 八、合并后状态更新（2026-11-26）
+
+PR #146 已以 squash 方式合入 `dev`，提交为
+`7cb8e960be60be61105e499f74735650e6c9f945`。合并后 CI `45794935024`
+的 `static` 和 `database` 均成功，修复后的指标窗口测试已通过。
+同一 PR 的 Docker build 与非生产合成验收 job 也成功。
+
+代码实现与 CI 缺陷已收口，G5 总体出口仍为 `not-ready`。Rocky 目标机单实例
+复验仍为 `not-run`；生产指标抓取、告警回执、容量压测和运行容量实测仍缺
+可核验结果。X1–X5 继续按单实例部署决策延期。
+
+```text
+g5_implementation=merged-PR-143
+fixed_window_test=merged-PR-146
+post_merge_ci=45794935024:success
+rocky_single_instance=not-run
+production_metrics_and_alerts=evidence-pending
+capacity_acceptance=not-run
+G5=not-ready
+```
 
 ```text
 [report]

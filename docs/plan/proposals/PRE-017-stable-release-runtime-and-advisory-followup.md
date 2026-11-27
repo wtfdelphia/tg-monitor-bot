@@ -3,8 +3,8 @@
 任务 id：`PRE-017-stable-release-runtime-and-advisory-followup`。
 
 状态：维护人于 2026-11-26 批准（「批准提案 开始实施」）。§3.1 已随
-PR #141 合入 `main`（commit `8c10c2c`）。§3.2 的维护人风险裁定已于
-2026-11-26 记录（`docs/plan/evidence/PRE-017-v010-url公告风险裁定-2026-11-26.md`）；
+PR #141 合入 `main`（commit `8c10c2c`）。§3.2 的维护人风险裁定已记录；
+prepare 和独立下载复核分别由 run `45770352988`、`45801109648` 通过。
 新稳定版本动作仍按 §四 审批分界等待独立批准。
 
 ## 一、背景
@@ -123,8 +123,8 @@ maintainer_risk_disposition=pending
 ```text
 proposal_approved=approved-2026-11-26
 main_workflow_changes=merged-8c10c2c-PR-141
-prepare_runtime_acceptance=prepare-pass-run-45770352988
-download_verify=PR-145-ci-pass-open
+prepare_runtime_acceptance=pass-prepare-45770352988-download-45801109648
+download_verify=pass-run-45801109648
 published_url_2_5_8_advisory_review=disposition-recorded-2026-11-26
 maintainer_risk_disposition=recorded-2026-11-26-accept-residual-risk
 new_stable_tag=not-authorized
@@ -146,10 +146,10 @@ new_stable_release=not-authorized
   单测 12 条通过；workflow YAML 可解析。
 - 合并后：`main` 上 `8c10c2c` 的 CI（static、database）成功。
 - `binary-release.yml` 是 `workflow_dispatch` 触发，合入本身不产生
-  发布运行；`prepare` 的 Node 24 运行时验收（§3.3 的上传/下载比对）
-  要等下一次经批准的 `prepare` 运行，保持 `not-run`。
+  发布运行；截至 PR #141 合入时，`prepare` 的 Node 24 运行时验收
+  （§3.3 的上传/下载比对）尚未执行，后续结果见第九、十节。
 
-未实施部分及原因：§3.2 的 `v0.1.0` 风险裁定属维护人动作
+截至 PR #141 合入时未实施的部分及原因：§3.2 的 `v0.1.0` 风险裁定属维护人动作
 （`maintainer_risk_disposition=pending`）；新稳定 `prepare` / `publish`
 与稳定镜像推送按 §四 需要针对精确 source commit 与工件摘要的独立批准，
 本提案不授权。G4 生产扫描授权仍按 G4 提案单独等待。
@@ -163,7 +163,7 @@ new_stable_release=not-authorized
 当前状态以 §6.3 状态块为准。
 
 本增量不改 `v0.1.0` 的任何已发布材料，不创建新 tag，不运行 `publish`。
-新稳定版本的 `prepare` 运行时验收（§3.3 的上传/下载比对）在批准后另行记录。
+当时尚未执行 prepare 运行时验收，后续结果见第十节。
 
 ## 九、实施记录增量（2026-11-26）：prepare 运行时验收运行
 
@@ -183,10 +183,35 @@ tip），run `45770352988` 成功。观察结果：
 Release，并要求维护人对精确 source commit 与工件摘要审批。本次运行产物
 状态为未签名、未发布。
 
-§3.3 的下载比对需要独立的 `download-artifact@v7` 运行路径，已在
-`main` 基线上以受签名提交建立工作流 `stable-release-verify.yml`
-（PR #145，base `main`）。该 PR 合入并执行一次按精确 run ID 的验证
-运行后，`prepare_runtime_acceptance` 才能记为完整通过。
+独立下载复核工作流见第十节。
+
+## 十、实施记录增量（2026-11-26）：prepare 工件下载复核
+
+PR #145 已于 2026-11-26 合入 `main`，合并提交为
+`69cef4e04e57c20fefeb1efd04957a5248b01cce`。随后运行
+`stable-release-verify.yml`，run `45801109648` 对 prepare run
+`45770352988` 的指定工件完成下载与复核，运行结果为 `success`。
+
+日志确认审批记录有效，`stable_release_assets=pass`，并逐项通过
+`BUILDINFO.json`、源码归档清单、SBOM、二进制归档和源码归档的 SHA-256
+核对，最终输出
+`stable_release_download_verification=pass run=45770352988 version=0.1.0`。
+该独立工作流仅有 `contents`、`actions`、`checks` 只读权限。
+
+```text
+prepare_run=45770352988:success
+download_verification_run=45801109648:success
+approval_record=verified
+release_assets=verified
+checksums=pass
+prepare_runtime_acceptance=pass
+new_stable_tag=not-authorized
+new_stable_release=not-authorized
+```
+
+PRE-017 §3.3 的 prepare 上传和独立下载复核已通过。新稳定 tag、正式
+Release 与 GHCR 稳定发布仍需针对精确版本和制品摘要的独立批准，并继续
+受 G4 和 PRE-013 顺序条件约束。
 
 ```text
 [report]
