@@ -145,3 +145,30 @@ path: ok
 gates: pass
 escalation: -
 ```
+
+## 九、精确候选目标机验收（2026-11-27）
+
+`cloud/dev@0107ba04500e2abf1f7c9a4fd05e9dab5eafaba8` 对应的候选 `candidate-45935022008-a1-0107ba04500e` 已在 Rocky 9.8 目标 `172.20.44.131:22` 完成隔离运行时验收。签名、provenance、二进制、原生预检、六角色运行时和 journal 脱敏均通过。
+
+临时 `rule` user unit 连续两次 start 后 PID 均为 `28507`，满足 §2.2 第 5 项。该结果只覆盖同一 user manager 的同名 unit，不扩大为对 unit 外任意进程的单实例保证。临时 unit、Compose 项目及本轮候选安装副本均已清理，候选材料保留在目标机 `/home/tgmtest/tgm-candidate.45935022008`。
+
+CentOS 7.9 目标 `172.20.44.132:22` 对同一候选的签名、provenance 和二进制检查通过；systemd 219 缺少 `+SECCOMP`，按负向判据拒绝原生预检，未安装候选。该结果满足维护人确认的预期拒绝判据，不改变 CentOS 7 不支持原生服务的结论。
+
+本次没有连接生产数据库、启用生产服务或 timer、清理真实租户、触发 Telegram 外呼。生产指标抓取、告警回执、容量和运行资源实测仍无证据，G5 继续保持 `not-ready`。完整候选来源、摘要和两台目标机边界见 `docs/plan/evidence/G3-G5当前出口复核-2026-11-24.md` §九。
+
+```text
+candidate=candidate-45935022008-a1-0107ba04500e
+rocky_single_instance=pass
+centos7_expected_reject=pass
+production_metrics_and_alerts=evidence-pending
+capacity_acceptance=not-run
+G5=not-ready
+```
+
+```text
+[report]
+task: G5-runtime-metrics-and-single-instance-acceptance-target-refresh
+path: ok
+gates: candidate-target-acceptance
+escalation: -
+```
